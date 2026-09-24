@@ -46,13 +46,18 @@ function decryptData(text) {
   return String(text);
 }
 
-// Автоматическое создание анонимного пользователя при подключении
-app.post('/api/guest', (req, res) => {
+// Регистрация пользователя с именем и уникальным ID
+app.post('/api/register', (req, res) => {
   try {
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'Введите имя' });
+    }
+
     const randomId = 'id' + Math.floor(1000 + Math.random() * 9000);
     const user = {
       id: randomId,
-      name: randomId, // Имени нет, используется сам ID
+      name: name.trim(),
       contacts: []
     };
 
@@ -68,8 +73,8 @@ app.get('/api/users/search', (req, res) => {
   if (!q) return res.json([]);
   
   const results = accounts.filter(u => {
-    return u.id && u.id.toLowerCase().includes(q);
-  }).map(u => ({ id: u.id, name: u.id }));
+    return (u.id && u.id.toLowerCase().includes(q)) || (u.name && u.name.toLowerCase().includes(q));
+  }).map(u => ({ id: u.id, name: u.name }));
 
   res.json(results);
 });
@@ -145,7 +150,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   });
 
   const dialogs = accounts.filter(u => peerIds.has(u.id)).map(u => ({
-    id: u.id, name: u.id
+    id: u.id, name: u.name
   }));
 
   res.json(dialogs);
@@ -171,7 +176,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Мессенджер по ID</title>
+  <title>Мессенджер</title>
   <style>
     :root {
       --bg-app: #0e1621;
@@ -189,8 +194,16 @@ app.get('/', (req, res) => {
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; -webkit-tap-highlight-color: transparent; }
     html, body { height: 100%; width: 100%; background: var(--bg-app); color: var(--text-main); overflow: hidden; }
 
-    .screen { display: flex; height: 100%; width: 100%; position: absolute; top: 0; left: 0; }
+    .screen { display: none; height: 100%; width: 100%; position: absolute; top: 0; left: 0; }
+    .screen.active { display: flex; }
 
+    /* Экран входа */
+    #auth-screen { align-items: center; justify-content: center; background: var(--bg-app); }
+    .auth-card { background: var(--bg-sidebar); padding: 30px; border-radius: 16px; width: 90%; max-width: 360px; display: flex; flex-direction: column; gap: 15px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); text-align: center; }
+    .auth-card h2 { font-size: 22px; color: var(--text-main); }
+    .auth-card input { width: 100%; padding: 12px 16px; border-radius: 12px; border: none; background: var(--bg-input); color: var(--text-main); font-size: 16px; outline: none; text-align: center; }
+
+    /* Интерфейс мессенджера */
     #app-container { display: flex; width: 100%; height: 100%; position: relative; }
     .sidebar { width: 320px; min-width: 260px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
@@ -229,7 +242,7 @@ app.get('/', (req, res) => {
     .input-bar input[type="text"] { flex: 1; padding: 10px 14px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; font-size: 14px; }
     .icon-btn { cursor: pointer; font-size: 18px; border: none; background: transparent; color: var(--text-main); padding: 4px; }
 
-    .action-btn { padding: 8px 14px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; font-size: 16px; cursor: pointer; text-align: center; }
+    .action-btn { padding: 10px 16px; background: var(--accent); color: #fff; border: none; border-radius: 10px; font-weight: bold; font-size: 15px; cursor: pointer; text-align: center; }
     .action-btn:active { opacity: 0.8; }
     .btn-danger { background: #e53935; color: #fff; }
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
@@ -247,16 +260,26 @@ app.get('/', (req, res) => {
 </head>
 <body>
 
-  <div class="screen">
+  <!-- Экран авторизации (Вход по имени) -->
+  <div class="screen active" id="auth-screen">
+    <div class="auth-card">
+      <h2>Вход в мессенджер</h2>
+      <input type="text" id="username-input" placeholder="Введите ваше имя..." onkeydown="if(event.key==='Enter') registerUser()">
+      <button class="action-btn" onclick="registerUser()">Войти</button>
+    </div>
+  </div>
+
+  <!-- Экран мессенджера -->
+  <div class="screen" id="main-screen">
     <div id="app-container">
       <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
           <div>
-            <div style="font-size:12px; color:var(--text-muted);">Ваш ID:</div>
-            <b id="my-display-id" style="font-size:15px; color:var(--accent);">Загрузка...</b>
+            <div style="font-size:12px; color:var(--text-muted);">Имя / ID:</div>
+            <b id="my-display-info" style="font-size:15px; color:var(--accent);">...</b>
           </div>
           <div class="search-box">
-            <input type="text" id="search-input" placeholder="Поиск по ID..." oninput="onSearchInput()">
+            <input type="text" id="search-input" placeholder="Поиск по имени или ID..." oninput="onSearchInput()">
           </div>
         </div>
         <div class="section-title">Чаты</div>
@@ -289,7 +312,7 @@ app.get('/', (req, res) => {
             
             <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
             <input type="text" id="msg-input" placeholder="Сообщение..." oninput="onInputTyping()" onkeydown="if(event.key==='Enter') sendMsg()">
-            <button class="action-btn" style="width:auto;" onclick="sendMsg()">➤</button>
+            <button class="action-btn" style="width:auto; padding: 8px 14px;" onclick="sendMsg()">➤</button>
           </div>
         </div>
       </div>
@@ -306,6 +329,7 @@ app.get('/', (req, res) => {
     var activePeer = null;
     var selectedFile = null;
     var isSending = false;
+    var isPolling = false;
 
     var mediaRecorder = null;
     var audioChunks = [];
@@ -316,42 +340,58 @@ app.get('/', (req, res) => {
     var typingTimer = null;
     var globalInterval = null;
 
-    // Автоматическая регистрация при загрузке страницы
-    async function initApp() {
+    async function registerUser() {
+      var nameInput = document.getElementById('username-input');
+      var name = nameInput.value.trim();
+      if (!name) {
+        alert('Пожалуйста, введите имя');
+        return;
+      }
+
       try {
-        var response = await fetch('/api/guest', {
+        var response = await fetch('/api/register', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({})
+          body: JSON.stringify({ name: name })
         });
         var data = await response.json();
         
         if (data && data.success && data.user) {
           currentUser = data.user;
-          document.getElementById('my-display-id').innerText = currentUser.id;
+          document.getElementById('my-display-info').innerText = currentUser.name + ' (' + currentUser.id + ')';
           
-          loadDialogs();
+          document.getElementById('auth-screen').classList.remove('active');
+          document.getElementById('main-screen').classList.add('active');
+          
+          await loadDialogs();
+          
           if (globalInterval) clearInterval(globalInterval);
-          globalInterval = setInterval(function() {
-            if (currentUser && !isRecording) {
-              loadDialogs();
-              if (activePeer) {
-                loadMessages();
-                loadPeerStatus();
-              }
-            }
-          }, 1500);
+          globalInterval = setInterval(pollServer, 2000);
         } else {
-          alert('Ошибка инициализации');
+          alert(data.error || 'Ошибка входа');
         }
       } catch (err) {
         alert('Ошибка соединения с сервером');
       }
     }
 
-    window.addEventListener('DOMContentLoaded', function() {
-      initApp();
-    });
+    async function pollServer() {
+      if (!currentUser || isRecording || isPolling) return;
+      isPolling = true;
+      try {
+        var q = document.getElementById('search-input').value.trim();
+        if (!q) {
+          await loadDialogs();
+        }
+        if (activePeer) {
+          await loadMessages();
+          await loadPeerStatus();
+        }
+      } catch (e) {
+      } finally {
+        isPolling = false;
+      }
+    }
 
     async function loadDialogs() {
       if (!currentUser) return;
@@ -380,22 +420,31 @@ app.get('/', (req, res) => {
       if (!container) return;
       
       var currentActiveId = activePeer ? activePeer.id : null;
-      container.innerHTML = '';
-      if (!list || list.length === 0) return;
+      
+      var html = '';
+      if (list && list.length > 0) {
+        list.forEach(function(item) {
+          var isActive = (currentActiveId === item.id) ? ' active' : '';
+          var initials = item.name ? item.name.slice(0, 2).toUpperCase() : item.id.slice(-2).toUpperCase();
+          html += '<div class="chat-item' + isActive + '" onclick="openChatById(\'' + item.id + '\', \'' + (item.name || item.id) + '\')">' +
+            '<div class="avatar">' + initials + '</div>' +
+            '<div style="overflow:hidden;"><b>' + (item.name || item.id) + '</b><div style="font-size:11px; color:var(--text-muted);">ID: ' + item.id + '</div></div>' +
+            '</div>';
+        });
+      }
+      if (container.dataset.lastHtml !== html) {
+        container.dataset.lastHtml = html;
+        container.innerHTML = html;
+      }
+    }
 
-      list.forEach(function(item) {
-        var div = document.createElement('div');
-        div.className = 'chat-item' + (currentActiveId === item.id ? ' active' : '');
-        div.onclick = function() { openChat(item); };
-        div.innerHTML = '<div class="avatar">' + item.id.slice(-2).toUpperCase() + '</div>' +
-          '<div style="overflow:hidden;"><b>' + item.id + '</b><div style="font-size:11px; color:var(--text-muted);">Чат по ID</div></div>';
-        container.appendChild(div);
-      });
+    function openChatById(peerId, peerName) {
+      openChat({ id: peerId, name: peerName });
     }
 
     function openChat(peer) {
       activePeer = peer;
-      document.getElementById('active-peer-name').innerText = 'ID: ' + peer.id;
+      document.getElementById('active-peer-name').innerText = peer.name + ' (ID: ' + peer.id + ')';
       document.getElementById('input-bar-container').style.display = 'flex';
       
       if (window.innerWidth <= 600) {
@@ -420,39 +469,53 @@ app.get('/', (req, res) => {
         var container = document.getElementById('messages-container');
         var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
 
-        container.innerHTML = '';
+        var html = '';
         messages.forEach(function(m) {
-          var div = document.createElement('div');
-          div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
-
-          div.oncontextmenu = function(e) { e.preventDefault(); openMsgActions(m.id); };
-          div.ontouchstart = function() { longTouchTimer = setTimeout(function() { openMsgActions(m.id); }, 500); };
-          div.ontouchend = function() { clearTimeout(longTouchTimer); };
-          div.ontouchmove = function() { clearTimeout(longTouchTimer); };
-
-          var html = m.text ? '<div>' + m.text + '</div>' : '';
+          var isMy = m.senderId === currentUser.id ? 'my' : '';
+          var msgContent = m.text ? '<div>' + m.text + '</div>' : '';
           var fileType = m.fileType || '';
+          
           if (m.fileData) {
             if (fileType.startsWith('image/')) {
-              html += '<img src="' + m.fileData + '" class="media-preview" loading="lazy" onclick="window.open(\'' + m.fileData + '\')">';
+              msgContent += '<img src="' + m.fileData + '" class="media-preview" loading="lazy" onclick="window.open(\'' + m.fileData + '\')">';
             } else if (fileType.startsWith('video/')) {
-              html += '<video src="' + m.fileData + '" controls class="video-preview" preload="metadata"></video>';
+              msgContent += '<video src="' + m.fileData + '" controls class="video-preview" preload="metadata"></video>';
             } else if (fileType.startsWith('audio/')) {
-              html += '<audio src="' + m.fileData + '" controls style="margin-top:5px; max-width:100%;" preload="metadata"></audio>';
+              msgContent += '<audio src="' + m.fileData + '" controls style="margin-top:5px; max-width:100%;" preload="metadata"></audio>';
             } else {
-              html += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
+              msgContent += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
             }
           }
 
-          html += '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">' + (m.timestamp || '') + '</div>';
-          div.innerHTML = html;
-          container.appendChild(div);
+          msgContent += '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">' + (m.timestamp || '') + '</div>';
+          
+          html += '<div class="msg ' + isMy + '" ' +
+            'oncontextmenu="event.preventDefault(); openMsgActions(\'' + m.id + '\');" ' +
+            'ontouchstart="startTouchTimer(\'' + m.id + '\')" ' +
+            'ontouchend="clearTouchTimer()" ' +
+            'ontouchmove="clearTouchTimer()">' + msgContent + '</div>';
         });
 
-        if (isScrolledToBottom) {
-          container.scrollTop = container.scrollHeight;
+        if (container.dataset.lastHtml !== html) {
+          container.dataset.lastHtml = html;
+          container.innerHTML = html;
+          if (isScrolledToBottom) {
+            container.scrollTop = container.scrollHeight;
+          }
         }
       } catch (e) {}
+    }
+
+    function startTouchTimer(msgId) {
+      clearTouchTimer();
+      longTouchTimer = setTimeout(function() { openMsgActions(msgId); }, 500);
+    }
+
+    function clearTouchTimer() {
+      if (longTouchTimer) {
+        clearTimeout(longTouchTimer);
+        longTouchTimer = null;
+      }
     }
 
     async function loadPeerStatus() {
@@ -611,8 +674,8 @@ app.get('/', (req, res) => {
           body: JSON.stringify(body)
         });
 
-        loadMessages();
-        loadDialogs();
+        await loadMessages();
+        await loadDialogs();
       } catch(e) {} finally {
         isSending = false;
       }
