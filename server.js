@@ -1,5 +1,4 @@
 const express = require('express');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -13,10 +12,9 @@ process.on('unhandledRejection', (reason) => {
   console.error('[ОШИБКА ПРОМИСА]:', reason);
 });
 
-// Хранилища в памяти для безотказной работы
+// Хранилища в памяти
 const accounts = [];
 const messages = [];
-
 const SECRET_SHIFT = 7;
 
 function encryptData(text) {
@@ -48,7 +46,8 @@ function decryptData(text) {
   return String(text);
 }
 
-// Быстрый вход по имени
+// --- API МАРШРУТЫ ---
+
 app.post('/api/guest', (req, res) => {
   try {
     const rawName = req.body && req.body.name ? String(req.body.name).trim() : '';
@@ -67,7 +66,6 @@ app.post('/api/guest', (req, res) => {
   }
 });
 
-// Поиск пользователей
 app.get('/api/users/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
   if (!q) return res.json([]);
@@ -81,7 +79,6 @@ app.get('/api/users/search', (req, res) => {
   res.json(results);
 });
 
-// Отправка сообщений
 app.post('/api/messages/send', (req, res) => {
   const { senderId, receiverId, text, fileData, fileName, fileType } = req.body;
 
@@ -113,7 +110,6 @@ app.post('/api/messages/send', (req, res) => {
   res.json({ success: true });
 });
 
-// Удаление сообщения
 app.delete('/api/messages/:msgId', (req, res) => {
   const { msgId } = req.params;
   const idx = messages.findIndex(m => m.id === msgId);
@@ -123,7 +119,6 @@ app.delete('/api/messages/:msgId', (req, res) => {
   res.json({ success: true });
 });
 
-// Получение сообщений
 app.get('/api/messages/:userId/:peerId', (req, res) => {
   const { userId, peerId } = req.params;
   
@@ -140,7 +135,6 @@ app.get('/api/messages/:userId/:peerId', (req, res) => {
   res.json(chatMsgs);
 });
 
-// Список диалогов
 app.get('/api/dialogs/:userId', (req, res) => {
   const userId = req.params.userId;
   const currentUser = accounts.find(u => u.id === userId);
@@ -158,8 +152,8 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
-// Веб-интерфейс
-app.get('*', (req, res) => {
+// --- ВЕБ-ИНТЕРФЕЙС (теперь срабатывает строго для корневого пути '/') ---
+app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
 <html lang="ru">
@@ -181,13 +175,10 @@ app.get('*', (req, res) => {
       --border: #0e1621;
       --modal-bg: #17212b;
     }
-
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
     html, body { height: 100%; width: 100%; background: var(--bg-app); color: var(--text-main); overflow: hidden; }
-
     .screen { display: none; height: 100%; width: 100%; position: absolute; top: 0; left: 0; }
     .active { display: flex; }
-
     .auth-container { margin: auto; width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; }
     .auth-container h2 { margin-bottom: 20px; text-align: center; color: var(--accent); }
     .input-group { margin-bottom: 15px; }
@@ -196,69 +187,30 @@ app.get('*', (req, res) => {
     .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
     .btn-danger { background: #e53935; color: #fff; }
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
-
     #app-container { display: flex; width: 100%; height: 100%; }
     .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
-
-    .search-box { position: relative; }
     .search-box input { width: 100%; padding: 10px 12px; border-radius: 18px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; }
-
     .chat-list { flex: 1; overflow-y: auto; }
     .chat-item { display: flex; align-items: center; gap: 12px; padding: 12px; cursor: pointer; border-bottom: 1px solid var(--border); }
     .chat-item:hover, .chat-item.active { background: var(--bg-active); }
     .avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: bold; }
-
     .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); }
     .chat-header { background: var(--bg-sidebar); padding: 12px; border-bottom: 1px solid var(--border); height: 60px; display: flex; align-items: center; justify-content: space-between; }
     .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; }
-    
     .msg { max-width: 75%; padding: 10px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
-
-    /* Единый фиксированный размер фото */
-    .media-preview {
-      width: 260px;
-      height: 180px;
-      object-fit: cover;
-      border-radius: 8px;
-      margin-top: 6px;
-      display: block;
-      cursor: pointer;
-      background: #000;
-    }
-
-    .video-preview {
-      width: 260px;
-      max-width: 100%;
-      border-radius: 8px;
-      margin-top: 6px;
-      display: block;
-    }
-
-    .file-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 12px;
-      background: var(--bg-input);
-      border-radius: 6px;
-      color: var(--accent);
-      text-decoration: none;
-      margin-top: 5px;
-      font-size: 13px;
-    }
-
+    .media-preview { width: 260px; height: 180px; object-fit: cover; border-radius: 8px; margin-top: 6px; display: block; cursor: pointer; background: #000; }
+    .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; }
+    .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
     .input-bar { background: var(--bg-sidebar); padding: 10px; display: flex; gap: 10px; align-items: center; }
     .input-bar input[type="text"] { flex: 1; padding: 12px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; }
     .icon-btn { cursor: pointer; font-size: 20px; border: none; background: transparent; color: var(--text-main); }
-
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--modal-bg); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
   </style>
 </head>
 <body>
-
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход</h2>
@@ -266,7 +218,7 @@ app.get('*', (req, res) => {
         <label>Имя</label>
         <input type="text" id="auth-name" placeholder="Имя">
       </div>
-      <button class="btn" id="login-btn" onclick="handleGuestLogin()">Войти</button>
+      <button class="btn" onclick="handleGuestLogin()">Войти</button>
     </div>
   </div>
 
@@ -284,7 +236,6 @@ app.get('*', (req, res) => {
         </div>
         <div class="chat-list" id="chat-list"></div>
       </div>
-
       <div class="main-chat">
         <div class="chat-header">
           <div id="active-peer-name">Выберите чат</div>
@@ -293,7 +244,6 @@ app.get('*', (req, res) => {
         <div class="input-bar" id="input-bar" style="display:none;">
           <button class="icon-btn" onclick="triggerFileInput()">📎</button>
           <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
-          
           <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
           <input type="text" id="msg-input" placeholder="Сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" style="width:auto; padding:10px 18px;" onclick="sendMsg()">➤</button>
@@ -308,21 +258,12 @@ app.get('*', (req, res) => {
   </div>
 
   <script>
-    var currentUser = null;
-    var activePeer = null;
-    var selectedFile = null;
-
-    var mediaRecorder = null;
-    var audioChunks = [];
-    var isRecording = false;
-
-    var selectedMsgId = null;
-    var longTouchTimer = null;
+    var currentUser = null, activePeer = null, selectedFile = null;
+    var mediaRecorder = null, audioChunks = [], isRecording = false;
+    var selectedMsgId = null, longTouchTimer = null;
 
     async function handleGuestLogin() {
-      var inputEl = document.getElementById('auth-name');
-      var val = inputEl ? inputEl.value.trim() : '';
-
+      var val = document.getElementById('auth-name').value.trim();
       try {
         var res = await fetch('/api/guest', {
           method: 'POST',
@@ -330,45 +271,28 @@ app.get('*', (req, res) => {
           body: JSON.stringify({ name: val })
         });
         var data = await res.json();
-
         if (data && data.user) {
           currentUser = data.user;
           document.getElementById('auth-screen').classList.remove('active');
           document.getElementById('app-screen').classList.add('active');
           document.getElementById('my-display-name').innerText = currentUser.name;
           document.getElementById('my-display-id').innerText = 'Мой ID: ' + currentUser.id;
-          
           loadDialogs();
-          setInterval(function() {
+          setInterval(() => {
             if (currentUser && !isRecording) {
               loadDialogs();
               if (activePeer) loadMessages();
             }
           }, 1500);
         }
-      } catch (e) {
-        alert('Не удалось войти. Попробуйте еще раз.');
-      }
+      } catch (e) { alert('Ошибка входа'); }
     }
 
-    document.addEventListener('DOMContentLoaded', function() {
-      var inputEl = document.getElementById('auth-name');
-      if (inputEl) {
-        inputEl.addEventListener('keydown', function(e) {
-          if (e.key === 'Enter') handleGuestLogin();
-        });
-      }
-    });
-
     async function loadDialogs() {
-      if (!currentUser) return;
-      var q = document.getElementById('search-input').value.trim();
-      if (q) return;
-
+      if (!currentUser || document.getElementById('search-input').value.trim()) return;
       try {
         var res = await fetch('/api/dialogs/' + currentUser.id);
-        var dialogs = await res.json();
-        renderChatList(dialogs);
+        renderChatList(await res.json());
       } catch (e) {}
     }
 
@@ -378,19 +302,17 @@ app.get('*', (req, res) => {
       try {
         var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
         var users = await res.json();
-        renderChatList(users.filter(function(u) { return u.id !== currentUser.id; }));
+        renderChatList(users.filter(u => u.id !== currentUser.id));
       } catch (e) {}
     }
 
     function renderChatList(list) {
       var container = document.getElementById('chat-list');
       container.innerHTML = '';
-      if (!list || list.length === 0) return;
-
-      list.forEach(function(item) {
+      (list || []).forEach(item => {
         var div = document.createElement('div');
         div.className = 'chat-item' + (activePeer && activePeer.id === item.id ? ' active' : '');
-        div.onclick = function() { openChat(item); };
+        div.onclick = () => openChat(item);
         div.innerHTML = '<div class="avatar">' + (item.name[0] || 'U').toUpperCase() + '</div>' +
           '<div><b>' + item.name + '</b><div style="font-size:11px; color:var(--text-muted);">ID: ' + item.id + '</div></div>';
         container.appendChild(div);
@@ -410,47 +332,28 @@ app.get('*', (req, res) => {
         var res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
         var messages = await res.json();
         var container = document.getElementById('messages-container');
-        var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
+        var isBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
 
         container.innerHTML = '';
-        messages.forEach(function(m) {
+        messages.forEach(m => {
           var div = document.createElement('div');
           div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
+          div.oncontextmenu = (e) => { e.preventDefault(); openMsgActions(m.id); };
+          div.ontouchstart = () => { longTouchTimer = setTimeout(() => openMsgActions(m.id), 500); };
+          div.ontouchend = () => clearTimeout(longTouchTimer);
 
-          div.oncontextmenu = function(e) {
-            e.preventDefault();
-            openMsgActions(m.id);
-          };
-          div.ontouchstart = function() {
-            longTouchTimer = setTimeout(function() { openMsgActions(m.id); }, 500);
-          };
-          div.ontouchend = function() { clearTimeout(longTouchTimer); };
-          div.ontouchmove = function() { clearTimeout(longTouchTimer); };
-
-          var html = '';
-          if (m.text) html += '<div>' + m.text + '</div>';
-
-          var fileType = m.fileType || '';
+          var html = m.text ? '<div>' + m.text + '</div>' : '';
           if (m.fileData) {
-            if (fileType.startsWith('image/')) {
-              html += '<img src="' + m.fileData + '" class="media-preview" onclick="window.open(\'' + m.fileData + '\')">';
-            } else if (fileType.startsWith('video/')) {
-              html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
-            } else if (fileType.startsWith('audio/')) {
-              html += '<audio src="' + m.fileData + '" controls style="margin-top:5px; max-width:100%;"></audio>';
-            } else {
-              html += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
-            }
+            if (m.fileType.startsWith('image/')) html += '<img src="' + m.fileData + '" class="media-preview" onclick="window.open(\\'' + m.fileData + '\\')">';
+            else if (m.fileType.startsWith('video/')) html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
+            else if (m.fileType.startsWith('audio/')) html += '<audio src="' + m.fileData + '" controls style="margin-top:5px; max-width:100%;"></audio>';
+            else html += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
           }
-
           html += '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">' + (m.timestamp || '') + '</div>';
           div.innerHTML = html;
           container.appendChild(div);
         });
-
-        if (isScrolledToBottom) {
-          container.scrollTop = container.scrollHeight;
-        }
+        if (isBottom) container.scrollTop = container.scrollHeight;
       } catch (e) {}
     }
 
@@ -467,24 +370,19 @@ app.get('*', (req, res) => {
     async function deleteSelectedMessage() {
       if (!selectedMsgId) return;
       try {
-        var res = await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
-        var data = await res.json();
-        if (data.success) {
-          closeMsgActions();
-          loadMessages();
-        }
+        await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
+        closeMsgActions();
+        loadMessages();
       } catch(e) {}
     }
 
-    function triggerFileInput() {
-      document.getElementById('file-input').click();
-    }
+    function triggerFileInput() { document.getElementById('file-input').click(); }
 
     function handleFileSelect(e) {
       var file = e.target.files[0];
       if (!file) return;
       var reader = new FileReader();
-      reader.onload = function(evt) {
+      reader.onload = (evt) => {
         selectedFile = { data: evt.target.result, name: file.name, type: file.type };
         alert('Файл выбран: ' + file.name);
       };
@@ -498,33 +396,23 @@ app.get('*', (req, res) => {
           var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           mediaRecorder = new MediaRecorder(stream);
           audioChunks = [];
-
-          mediaRecorder.ondataavailable = function(e) {
-            if (e.data.size > 0) audioChunks.push(e.data);
-          };
-
-          mediaRecorder.onstop = async function() {
-            var actualType = mediaRecorder.mimeType || 'audio/webm';
-            var audioBlob = new Blob(audioChunks, { type: actualType });
+          mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+          mediaRecorder.onstop = () => {
+            var blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
             var reader = new FileReader();
-            reader.onload = function(evt) {
-              selectedFile = { data: evt.target.result, name: 'голосовое_сообщение', type: actualType };
+            reader.onload = evt => {
+              selectedFile = { data: evt.target.result, name: 'voice.webm', type: blob.type };
               sendMsg();
             };
-            reader.readAsDataURL(audioBlob);
-            stream.getTracks().forEach(function(track) { track.stop(); });
+            reader.readAsDataURL(blob);
+            stream.getTracks().forEach(t => t.stop());
           };
-
           mediaRecorder.start();
           isRecording = true;
           micBtn.innerText = '🔴';
-        } catch (e) {
-          alert('Нет доступа к микрофону.');
-        }
+        } catch (e) { alert('Нет доступа к микрофону'); }
       } else {
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-          mediaRecorder.stop();
-        }
+        if (mediaRecorder) mediaRecorder.stop();
         isRecording = false;
         micBtn.innerText = '🎙️';
       }
@@ -535,22 +423,19 @@ app.get('*', (req, res) => {
       var text = input.value.trim();
       if ((!text && !selectedFile) || !activePeer) return;
 
-      var body = {
-        senderId: currentUser.id,
-        receiverId: activePeer.id,
-        text: text,
-        fileData: selectedFile ? selectedFile.data : '',
-        fileName: selectedFile ? selectedFile.name : '',
-        fileType: selectedFile ? selectedFile.type : ''
-      };
-
       try {
         await fetch('/api/messages/send', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(body)
+          body: JSON.stringify({
+            senderId: currentUser.id,
+            receiverId: activePeer.id,
+            text,
+            fileData: selectedFile ? selectedFile.data : '',
+            fileName: selectedFile ? selectedFile.name : '',
+            fileType: selectedFile ? selectedFile.type : ''
+          })
         });
-
         input.value = '';
         selectedFile = null;
         document.getElementById('file-input').value = '';
