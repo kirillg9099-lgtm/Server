@@ -107,8 +107,9 @@ function decryptData(text) {
 
 // Быстрый вход по имени
 app.post('/api/guest', (req, res) => {
-  const { name } = req.body;
-  const guestName = (name && name.trim()) ? name.trim() : ('Пользователь_' + Math.floor(Math.random() * 1000));
+  const name = req.body && req.body.name ? String(req.body.name).trim() : '';
+  const guestName = name || ('Пользователь_' + Math.floor(Math.random() * 1000));
+  
   const accounts = readAccounts();
 
   const user = {
@@ -330,10 +331,10 @@ app.get('*', (req, res) => {
     <div class="auth-container">
       <h2>Вход в чат</h2>
       <div class="input-group">
-        <label>Введите ваше имя</label>
-        <input type="text" id="auth-name" placeholder="Например: Иван" onkeydown="if(event.key==='Enter') handleGuestLogin()">
+        <label>Имя</label>
+        <input type="text" id="auth-name" placeholder="Имя">
       </div>
-      <button class="btn" onclick="handleGuestLogin()">Войти</button>
+      <button class="btn" id="login-btn" onclick="handleGuestLogin()">Войти</button>
     </div>
   </div>
 
@@ -406,8 +407,8 @@ app.get('*', (req, res) => {
     var longTouchTimer = null;
 
     async function handleGuestLogin() {
-      var name = document.getElementById('auth-name').value.trim();
-      if (!name) return alert('Пожалуйста, введите ваше имя');
+      var inputEl = document.getElementById('auth-name');
+      var name = inputEl ? inputEl.value.trim() : '';
 
       try {
         var res = await fetch('/api/guest', { 
@@ -416,12 +417,25 @@ app.get('*', (req, res) => {
           body: JSON.stringify({ name: name })
         });
         var data = await res.json();
-        currentUser = data.user;
-        startApp();
+        if (data && data.user) {
+          currentUser = data.user;
+          startApp();
+        } else {
+          alert('Ошибка при входе');
+        }
       } catch(e) {
-        alert('Ошибка при входе.');
+        alert('Ошибка подключения к серверу');
       }
     }
+
+    document.addEventListener('DOMContentLoaded', function() {
+      var inputEl = document.getElementById('auth-name');
+      if (inputEl) {
+        inputEl.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') handleGuestLogin();
+        });
+      }
+    });
 
     function startApp() {
       document.getElementById('auth-screen').classList.remove('active');
