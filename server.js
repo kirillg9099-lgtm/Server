@@ -44,78 +44,40 @@ function safeReadJSON(filePath, fallback = []) {
 
 function safeWriteJSON(filePath, data) {
   const tmpPath = filePath + '.tmp';
-  const bakPath = filePath + '.bak';
   try {
-    const str = JSON.stringify(data, null, 2);
+    const str = JSON.stringify(data);
     fs.writeFileSync(tmpPath, str, 'utf8');
-    if (fs.existsSync(filePath)) {
-      fs.copyFileSync(filePath, bakPath);
-    }
     fs.renameSync(tmpPath, filePath);
   } catch (e) {
-    console.error(`[ОШИБКА ЗАПИСИ] Не удалось сохранить ${filePath}:`, e);
+    console.error(`[ОШИБКА ЗАПИСИ]:`, e);
   }
 }
-
-function autoMigrateAndCleanup() {
-  let migratedAccounts = safeReadJSON(ACCOUNTS_FILE, []);
-  let migratedMessages = safeReadJSON(MESSAGES_FILE, []);
-
-  safeWriteJSON(ACCOUNTS_FILE, migratedAccounts);
-  safeWriteJSON(MESSAGES_FILE, migratedMessages);
-}
-
-autoMigrateAndCleanup();
 
 function readAccounts() { return safeReadJSON(ACCOUNTS_FILE, []); }
 function writeAccounts(data) { safeWriteJSON(ACCOUNTS_FILE, data); }
-
 function readMessages() { return safeReadJSON(MESSAGES_FILE, []); }
 function writeMessages(data) { safeWriteJSON(MESSAGES_FILE, data); }
 
-const SECRET_SHIFT = 7;
-const XOR_KEY = 0x5A;
-
-function encryptData(text) {
+// Быстрое шифрование только текста (файлы не шифруем, чтобы они не весили больше и отправлялись мгновенно)
+function encryptText(text) {
   if (!text) return '';
   try {
-    let base64 = Buffer.from(String(text), 'utf8').toString('base64');
-    let result = '';
-    for (let i = 0; i < base64.length; i++) {
-      result += String.fromCharCode(base64.charCodeAt(i) + SECRET_SHIFT);
-    }
-    return result;
+    return Buffer.from(String(text), 'utf8').toString('base64');
   } catch (e) {
-    return String(text || '');
+    return text;
   }
 }
 
-function decryptData(text) {
+function decryptText(text) {
   if (!text) return '';
   try {
-    let base64 = '';
-    for (let i = 0; i < text.length; i++) {
-      base64 += String.fromCharCode(text.charCodeAt(i) - SECRET_SHIFT);
-    }
-    let decoded = Buffer.from(base64, 'base64').toString('utf8');
-    if (decoded && !decoded.includes('\uFFFD')) {
-      return decoded;
-    }
+    const decoded = Buffer.from(text, 'base64').toString('utf8');
+    if (decoded && !decoded.includes('\uFFFD')) return decoded;
   } catch (e) {}
-
-  try {
-    const buf = Buffer.from(text, 'hex');
-    if (buf.length > 0) {
-      for (let i = 0; i < buf.length; i++) buf[i] ^= XOR_KEY;
-      let decoded = buf.toString('utf8');
-      if (decoded && !decoded.includes('\uFFFD')) return decoded;
-    }
-  } catch (e) {}
-
-  return String(text);
+  return text;
 }
 
-// Регистрация только по имени
+// Регистрация
 app.post('/api/register', (req, res) => {
   const { name } = req.body;
   if (!name || !name.trim()) {
@@ -143,10 +105,7 @@ app.get('/api/users/search', (req, res) => {
   const accounts = readAccounts();
   const results = accounts.filter(u => {
     return (u.id && u.id.toLowerCase().includes(q)) || (u.name && u.name.toLowerCase().includes(q));
-  }).map(u => ({ 
-    id: u.id, 
-    name: u.name 
-  }));
+  }).map(u => ({ id: u.id, name: u.name }));
 
   res.json(results);
 });
@@ -162,9 +121,9 @@ app.post('/api/messages/send', (req, res) => {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
     senderId,
     receiverId,
-    text: encryptData(text || ''),
-    fileData: encryptData(fileData || ''),
-    fileName: encryptData(fileName || ''),
+    text: encryptText(text || ''),
+    fileData: fileData || '', // Файлы храним напрямую для максимальной скорости
+    fileName: fileName || '',
     fileType: fileType || '',
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   };
@@ -190,7 +149,7 @@ app.post('/api/messages/send', (req, res) => {
   }
   if (updated) writeAccounts(accounts);
 
-  res.json({ success: true, msgId: newMsg.id });
+  res.json({ success: true });
 });
 
 // Удаление сообщения
@@ -212,9 +171,7 @@ app.get('/api/messages/:userId/:peerId', (req, res) => {
     (m.senderId === peerId && m.receiverId === userId)
   ).map(m => ({
     ...m,
-    text: decryptData(m.text),
-    fileData: decryptData(m.fileData),
-    fileName: decryptData(m.fileName)
+    text: decryptText(m.text)
   }));
 
   res.json(chatMsgs);
@@ -321,7 +278,6 @@ app.get('*', (req, res) => {
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
-    /* Превью прикрепленного файла перед отправкой (как в ТГ) */
     .attachment-preview-container { background: var(--bg-sidebar); padding: 10px 15px; border-top: 1px solid var(--border); display: none; align-items: center; gap: 12px; }
     .attachment-preview-container.active { display: flex; }
     .attachment-thumb { width: 45px; height: 45px; border-radius: 6px; object-fit: cover; background: #000; }
@@ -352,21 +308,17 @@ app.get('*', (req, res) => {
 </head>
 <body>
 
-  <!-- Экран входа -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Введите имя</h2>
       <div id="auth-error" class="error-msg"></div>
-      
       <div class="input-group">
         <input type="text" id="auth-name" placeholder="Ваше имя..." onkeydown="if(event.key==='Enter') registerUser()">
       </div>
-
       <button class="btn" onclick="registerUser()">Войти</button>
     </div>
   </div>
 
-  <!-- Основной экран мессенджера -->
   <div id="app-screen" class="screen">
     <div id="app-container">
       
@@ -400,7 +352,6 @@ app.get('*', (req, res) => {
           <div class="empty-state">Выберите диалог слева или найдите пользователя в поиске</div>
         </div>
 
-        <!-- Блок предпросмотра прикрепленного файла -->
         <div class="attachment-preview-container" id="attachment-preview-container">
           <img id="attachment-thumb-img" class="attachment-thumb" src="" alt="">
           <div class="attachment-info">
@@ -423,7 +374,6 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Меню действий с сообщением -->
   <div class="msg-actions-sheet" id="msg-actions-sheet">
     <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
@@ -444,7 +394,6 @@ app.get('*', (req, res) => {
     let selectedMsgId = null;
     let longTouchTimer = null;
 
-    // Управление темой
     const savedTheme = localStorage.getItem('app_theme') || 'dark';
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
@@ -501,12 +450,13 @@ app.get('*', (req, res) => {
 
       loadDialogs();
       
+      // Оптимизированный интервал опроса (2 секунды) для плавной работы
       setInterval(() => {
         if (currentUser && !isRecording) {
           loadDialogsQuiet();
           if (activePeer) loadMessagesQuiet();
         }
-      }, 1500);
+      }, 2000);
     }
 
     async function loadDialogs() {
@@ -526,7 +476,7 @@ app.get('*', (req, res) => {
         const res = await fetch('/api/dialogs/' + currentUser.id);
         const dialogs = await res.json();
         
-        const currentHash = JSON.stringify(dialogs.map(d => d.id + d.name));
+        const currentHash = JSON.stringify(dialogs);
         if (currentHash !== lastDialogsHash) {
           lastDialogsHash = currentHash;
           renderChatList(dialogs);
@@ -619,7 +569,7 @@ app.get('*', (req, res) => {
         const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
         
-        const currentHash = JSON.stringify(messages.map(m => m.id + (m.text || '')));
+        const currentHash = JSON.stringify(messages.map(m => m.id));
         if (currentHash !== lastMessagesHash) {
           lastMessagesHash = currentHash;
           renderMessagesContainer(messages);
@@ -698,7 +648,6 @@ app.get('*', (req, res) => {
       reader.onload = function(evt) {
         selectedFile = { data: evt.target.result, name: file.name, type: file.type };
         
-        // Показываем превью над инпутом в стиле Telegram
         const previewContainer = document.getElementById('attachment-preview-container');
         const thumbImg = document.getElementById('attachment-thumb-img');
         const nameLabel = document.getElementById('attachment-name-label');
@@ -730,13 +679,7 @@ app.get('*', (req, res) => {
     }
 
     function getSupportedMimeType() {
-      const types = [
-        'audio/webm;codecs=opus',
-        'audio/mp4',
-        'audio/aac',
-        'audio/webm',
-        'audio/ogg;codecs=opus'
-      ];
+      const types = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/aac', 'audio/webm'];
       for (let t of types) {
         if (MediaRecorder.isTypeSupported(t)) return t;
       }
@@ -766,7 +709,6 @@ app.get('*', (req, res) => {
               sendMsg();
             };
             reader.readAsDataURL(audioBlob);
-            
             stream.getTracks().forEach(track => track.stop());
           };
 
@@ -791,7 +733,6 @@ app.get('*', (req, res) => {
 
       if (!text && !fileToSend) return;
 
-      // Сразу очищаем поле ввода и закрываем превью, чтобы пользователь мог отправлять дальше
       input.value = '';
       cancelAttachment();
 
@@ -800,7 +741,6 @@ app.get('*', (req, res) => {
       
       let tempDiv = null;
       if (isVideo) {
-        // Создаем временный блок "Загрузка видео..."
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
         tempDiv.innerHTML = \`
