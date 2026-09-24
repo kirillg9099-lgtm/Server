@@ -6,7 +6,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
-// Хранилища в памяти (чтобы хостинг не блокировал запись в файлы)
 const accounts = [];
 const messages = [];
 
@@ -41,7 +40,7 @@ function decryptData(text) {
   return String(text);
 }
 
-// Вход (работает всегда)
+// Вход
 app.post('/api/guest', (req, res) => {
   const rawName = req.body && req.body.name ? String(req.body.name).trim() : '';
   const guestName = rawName || ('Пользователь_' + Math.floor(Math.random() * 1000));
@@ -102,16 +101,6 @@ app.post('/api/messages/send', (req, res) => {
   res.json({ success: true });
 });
 
-// Удаление сообщения
-app.delete('/api/messages/:msgId', (req, res) => {
-  const { msgId } = req.params;
-  const idx = messages.findIndex(m => m.id === msgId);
-  if (idx !== -1) {
-    messages.splice(idx, 1);
-  }
-  res.json({ success: true });
-});
-
 // Получение сообщений
 app.get('/api/messages/:userId/:peerId', (req, res) => {
   const { userId, peerId } = req.params;
@@ -161,7 +150,6 @@ app.get('*', (req, res) => {
       --bg-app: #0e1621;
       --bg-sidebar: #17212b;
       --bg-input: #242f3d;
-      --bg-hover: #202b36;
       --bg-active: #2b5278;
       --bg-msg-peer: #182533;
       --bg-msg-my: #2b5278;
@@ -203,8 +191,42 @@ app.get('*', (req, res) => {
     .msg { max-width: 75%; padding: 10px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
 
+    /* Строгий единый размер для всех картинок */
+    .media-preview {
+      width: 260px;
+      height: 180px;
+      object-fit: cover;
+      border-radius: 8px;
+      margin-top: 6px;
+      display: block;
+      cursor: pointer;
+      background: #000;
+    }
+
+    .video-preview {
+      width: 260px;
+      max-width: 100%;
+      border-radius: 8px;
+      margin-top: 6px;
+      display: block;
+    }
+
+    .file-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: var(--bg-input);
+      border-radius: 6px;
+      color: var(--accent);
+      text-decoration: none;
+      margin-top: 5px;
+      font-size: 13px;
+    }
+
     .input-bar { background: var(--bg-sidebar); padding: 10px; display: flex; gap: 10px; align-items: center; }
     .input-bar input[type="text"] { flex: 1; padding: 12px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; }
+    .icon-btn { cursor: pointer; font-size: 20px; border: none; background: transparent; color: var(--text-main); }
   </style>
 </head>
 <body>
@@ -241,6 +263,9 @@ app.get('*', (req, res) => {
         </div>
         <div class="messages-container" id="messages-container"></div>
         <div class="input-bar" id="input-bar" style="display:none;">
+          <button class="icon-btn" onclick="triggerFileInput()">📎</button>
+          <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
+          
           <input type="text" id="msg-input" placeholder="Сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" style="width:auto; padding:10px 18px;" onclick="sendMsg()">➤</button>
         </div>
@@ -251,6 +276,7 @@ app.get('*', (req, res) => {
   <script>
     var currentUser = null;
     var activePeer = null;
+    var selectedFile = null;
 
     async function handleGuestLogin() {
       var val = document.getElementById('auth-name').value;
@@ -320,27 +346,65 @@ app.get('*', (req, res) => {
       messages.forEach(function(m) {
         var div = document.createElement('div');
         div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
-        div.innerText = m.text;
+        
+        var html = '';
+        if (m.text) html += '<div>' + m.text + '</div>';
+
+        var fileType = m.fileType || '';
+        if (m.fileData) {
+          if (fileType.startsWith('image/')) {
+            html += '<img src="' + m.fileData + '" class="media-preview" onclick="window.open(\'' + m.fileData + '\')">';
+          } else if (fileType.startsWith('video/')) {
+            html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
+          } else {
+            html += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
+          }
+        }
+
+        html += '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">' + (m.timestamp || '') + '</div>';
+        div.innerHTML = html;
         container.appendChild(div);
       });
+    }
+
+    function triggerFileInput() {
+      document.getElementById('file-input').click();
+    }
+
+    function handleFileSelect(e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(evt) {
+        selectedFile = { data: evt.target.result, name: file.name, type: file.type };
+        alert('Файл выбран: ' + file.name);
+      };
+      reader.readAsDataURL(file);
     }
 
     async function sendMsg() {
       var input = document.getElementById('msg-input');
       var text = input.value.trim();
-      if (!text || !activePeer) return;
+      if ((!text && !selectedFile) || !activePeer) return;
+
+      var body = {
+        senderId: currentUser.id,
+        receiverId: activePeer.id,
+        text: text,
+        fileData: selectedFile ? selectedFile.data : '',
+        fileName: selectedFile ? selectedFile.name : '',
+        fileType: selectedFile ? selectedFile.type : ''
+      };
 
       await fetch('/api/messages/send', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          senderId: currentUser.id,
-          receiverId: activePeer.id,
-          text: text
-        })
+        body: JSON.stringify(body)
       });
 
       input.value = '';
+      selectedFile = null;
+      document.getElementById('file-input').value = '';
       loadMessages();
     }
   </script>
