@@ -6,6 +6,14 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
+process.on('uncaughtException', (err) => {
+  console.error('[ОШИБКА СЕРВЕРА]:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[ОШИБКА ПРОМИСА]:', reason);
+});
+
+// Хранилища в памяти для безотказной работы
 const accounts = [];
 const messages = [];
 
@@ -40,22 +48,26 @@ function decryptData(text) {
   return String(text);
 }
 
-// Вход
+// Быстрый вход по имени
 app.post('/api/guest', (req, res) => {
-  const rawName = req.body && req.body.name ? String(req.body.name).trim() : '';
-  const guestName = rawName || ('Пользователь_' + Math.floor(Math.random() * 1000));
+  try {
+    const rawName = req.body && req.body.name ? String(req.body.name).trim() : '';
+    const guestName = rawName || ('Пользователь_' + Math.floor(Math.random() * 1000));
 
-  const user = {
-    id: 'id' + Math.floor(1000 + Math.random() * 9000),
-    name: guestName,
-    contacts: []
-  };
+    const user = {
+      id: 'id' + Math.floor(1000 + Math.random() * 9000),
+      name: guestName,
+      contacts: []
+    };
 
-  accounts.push(user);
-  res.json({ success: true, user: user });
+    accounts.push(user);
+    return res.json({ success: true, user });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Ошибка сервера' });
+  }
 });
 
-// Поиск
+// Поиск пользователей
 app.get('/api/users/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
   if (!q) return res.json([]);
@@ -101,6 +113,16 @@ app.post('/api/messages/send', (req, res) => {
   res.json({ success: true });
 });
 
+// Удаление сообщения
+app.delete('/api/messages/:msgId', (req, res) => {
+  const { msgId } = req.params;
+  const idx = messages.findIndex(m => m.id === msgId);
+  if (idx !== -1) {
+    messages.splice(idx, 1);
+  }
+  res.json({ success: true });
+});
+
 // Получение сообщений
 app.get('/api/messages/:userId/:peerId', (req, res) => {
   const { userId, peerId } = req.params;
@@ -136,7 +158,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
-// Интерфейс
+// Веб-интерфейс
 app.get('*', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -157,6 +179,7 @@ app.get('*', (req, res) => {
       --text-muted: #7f91a4;
       --accent: #5288c1;
       --border: #0e1621;
+      --modal-bg: #17212b;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
@@ -171,6 +194,8 @@ app.get('*', (req, res) => {
     .input-group label { display: block; margin-bottom: 5px; font-size: 13px; color: var(--text-muted); }
     .input-group input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; }
     .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
+    .btn-danger { background: #e53935; color: #fff; }
+    .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
 
     #app-container { display: flex; width: 100%; height: 100%; }
     .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
@@ -185,13 +210,13 @@ app.get('*', (req, res) => {
     .avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: bold; }
 
     .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); }
-    .chat-header { background: var(--bg-sidebar); padding: 12px; border-bottom: 1px solid var(--border); height: 60px; display: flex; align-items: center; }
+    .chat-header { background: var(--bg-sidebar); padding: 12px; border-bottom: 1px solid var(--border); height: 60px; display: flex; align-items: center; justify-content: space-between; }
     .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; }
     
     .msg { max-width: 75%; padding: 10px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
 
-    /* Строгий единый размер для всех картинок */
+    /* Единый фиксированный размер фото */
     .media-preview {
       width: 260px;
       height: 180px;
@@ -227,6 +252,9 @@ app.get('*', (req, res) => {
     .input-bar { background: var(--bg-sidebar); padding: 10px; display: flex; gap: 10px; align-items: center; }
     .input-bar input[type="text"] { flex: 1; padding: 12px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; }
     .icon-btn { cursor: pointer; font-size: 20px; border: none; background: transparent; color: var(--text-main); }
+
+    .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--modal-bg); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
+    .msg-actions-sheet.active { display: flex; }
   </style>
 </head>
 <body>
@@ -238,7 +266,7 @@ app.get('*', (req, res) => {
         <label>Имя</label>
         <input type="text" id="auth-name" placeholder="Имя">
       </div>
-      <button class="btn" onclick="handleGuestLogin()">Войти</button>
+      <button class="btn" id="login-btn" onclick="handleGuestLogin()">Войти</button>
     </div>
   </div>
 
@@ -266,6 +294,7 @@ app.get('*', (req, res) => {
           <button class="icon-btn" onclick="triggerFileInput()">📎</button>
           <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
           
+          <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
           <input type="text" id="msg-input" placeholder="Сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" style="width:auto; padding:10px 18px;" onclick="sendMsg()">➤</button>
         </div>
@@ -273,59 +302,97 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
+  <div class="msg-actions-sheet" id="msg-actions-sheet">
+    <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
+    <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
+  </div>
+
   <script>
     var currentUser = null;
     var activePeer = null;
     var selectedFile = null;
 
+    var mediaRecorder = null;
+    var audioChunks = [];
+    var isRecording = false;
+
+    var selectedMsgId = null;
+    var longTouchTimer = null;
+
     async function handleGuestLogin() {
-      var val = document.getElementById('auth-name').value;
-      
-      var res = await fetch('/api/guest', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ name: val })
-      });
-      var data = await res.json();
-      
-      if (data && data.user) {
-        currentUser = data.user;
-        document.getElementById('auth-screen').classList.remove('active');
-        document.getElementById('app-screen').classList.add('active');
-        document.getElementById('my-display-name').innerText = currentUser.name;
-        document.getElementById('my-display-id').innerText = 'Мой ID: ' + currentUser.id;
-        loadDialogs();
-        setInterval(function() {
+      var inputEl = document.getElementById('auth-name');
+      var val = inputEl ? inputEl.value.trim() : '';
+
+      try {
+        var res = await fetch('/api/guest', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ name: val })
+        });
+        var data = await res.json();
+
+        if (data && data.user) {
+          currentUser = data.user;
+          document.getElementById('auth-screen').classList.remove('active');
+          document.getElementById('app-screen').classList.add('active');
+          document.getElementById('my-display-name').innerText = currentUser.name;
+          document.getElementById('my-display-id').innerText = 'Мой ID: ' + currentUser.id;
+          
           loadDialogs();
-          if (activePeer) loadMessages();
-        }, 2000);
+          setInterval(function() {
+            if (currentUser && !isRecording) {
+              loadDialogs();
+              if (activePeer) loadMessages();
+            }
+          }, 1500);
+        }
+      } catch (e) {
+        alert('Не удалось войти. Попробуйте еще раз.');
       }
     }
 
+    document.addEventListener('DOMContentLoaded', function() {
+      var inputEl = document.getElementById('auth-name');
+      if (inputEl) {
+        inputEl.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') handleGuestLogin();
+        });
+      }
+    });
+
     async function loadDialogs() {
       if (!currentUser) return;
-      var res = await fetch('/api/dialogs/' + currentUser.id);
-      var dialogs = await res.json();
-      renderChatList(dialogs);
+      var q = document.getElementById('search-input').value.trim();
+      if (q) return;
+
+      try {
+        var res = await fetch('/api/dialogs/' + currentUser.id);
+        var dialogs = await res.json();
+        renderChatList(dialogs);
+      } catch (e) {}
     }
 
     async function onSearchInput() {
       var q = document.getElementById('search-input').value.trim();
       if (!q) { loadDialogs(); return; }
-      var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
-      var users = await res.json();
-      renderChatList(users.filter(function(u) { return u.id !== currentUser.id; }));
+      try {
+        var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
+        var users = await res.json();
+        renderChatList(users.filter(function(u) { return u.id !== currentUser.id; }));
+      } catch (e) {}
     }
 
     function renderChatList(list) {
       var container = document.getElementById('chat-list');
       container.innerHTML = '';
+      if (!list || list.length === 0) return;
+
       list.forEach(function(item) {
         var div = document.createElement('div');
-        div.className = 'chat-item';
+        div.className = 'chat-item' + (activePeer && activePeer.id === item.id ? ' active' : '');
         div.onclick = function() { openChat(item); };
         div.innerHTML = '<div class="avatar">' + (item.name[0] || 'U').toUpperCase() + '</div>' +
-          '<div><b>' + item.name + '</b><div style="font-size:11px;">ID: ' + item.id + '</div></div>';
+          '<div><b>' + item.name + '</b><div style="font-size:11px; color:var(--text-muted);">ID: ' + item.id + '</div></div>';
         container.appendChild(div);
       });
     }
@@ -338,33 +405,75 @@ app.get('*', (req, res) => {
     }
 
     async function loadMessages() {
-      if (!activePeer) return;
-      var res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
-      var messages = await res.json();
-      var container = document.getElementById('messages-container');
-      container.innerHTML = '';
-      messages.forEach(function(m) {
-        var div = document.createElement('div');
-        div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
-        
-        var html = '';
-        if (m.text) html += '<div>' + m.text + '</div>';
+      if (!activePeer || !currentUser) return;
+      try {
+        var res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
+        var messages = await res.json();
+        var container = document.getElementById('messages-container');
+        var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
 
-        var fileType = m.fileType || '';
-        if (m.fileData) {
-          if (fileType.startsWith('image/')) {
-            html += '<img src="' + m.fileData + '" class="media-preview" onclick="window.open(\'' + m.fileData + '\')">';
-          } else if (fileType.startsWith('video/')) {
-            html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
-          } else {
-            html += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
+        container.innerHTML = '';
+        messages.forEach(function(m) {
+          var div = document.createElement('div');
+          div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
+
+          div.oncontextmenu = function(e) {
+            e.preventDefault();
+            openMsgActions(m.id);
+          };
+          div.ontouchstart = function() {
+            longTouchTimer = setTimeout(function() { openMsgActions(m.id); }, 500);
+          };
+          div.ontouchend = function() { clearTimeout(longTouchTimer); };
+          div.ontouchmove = function() { clearTimeout(longTouchTimer); };
+
+          var html = '';
+          if (m.text) html += '<div>' + m.text + '</div>';
+
+          var fileType = m.fileType || '';
+          if (m.fileData) {
+            if (fileType.startsWith('image/')) {
+              html += '<img src="' + m.fileData + '" class="media-preview" onclick="window.open(\'' + m.fileData + '\')">';
+            } else if (fileType.startsWith('video/')) {
+              html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
+            } else if (fileType.startsWith('audio/')) {
+              html += '<audio src="' + m.fileData + '" controls style="margin-top:5px; max-width:100%;"></audio>';
+            } else {
+              html += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
+            }
           }
-        }
 
-        html += '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">' + (m.timestamp || '') + '</div>';
-        div.innerHTML = html;
-        container.appendChild(div);
-      });
+          html += '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">' + (m.timestamp || '') + '</div>';
+          div.innerHTML = html;
+          container.appendChild(div);
+        });
+
+        if (isScrolledToBottom) {
+          container.scrollTop = container.scrollHeight;
+        }
+      } catch (e) {}
+    }
+
+    function openMsgActions(msgId) {
+      selectedMsgId = msgId;
+      document.getElementById('msg-actions-sheet').classList.add('active');
+    }
+
+    function closeMsgActions() {
+      selectedMsgId = null;
+      document.getElementById('msg-actions-sheet').classList.remove('active');
+    }
+
+    async function deleteSelectedMessage() {
+      if (!selectedMsgId) return;
+      try {
+        var res = await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
+        var data = await res.json();
+        if (data.success) {
+          closeMsgActions();
+          loadMessages();
+        }
+      } catch(e) {}
     }
 
     function triggerFileInput() {
@@ -382,6 +491,45 @@ app.get('*', (req, res) => {
       reader.readAsDataURL(file);
     }
 
+    async function toggleVoiceRecord() {
+      var micBtn = document.getElementById('mic-btn');
+      if (!isRecording) {
+        try {
+          var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(stream);
+          audioChunks = [];
+
+          mediaRecorder.ondataavailable = function(e) {
+            if (e.data.size > 0) audioChunks.push(e.data);
+          };
+
+          mediaRecorder.onstop = async function() {
+            var actualType = mediaRecorder.mimeType || 'audio/webm';
+            var audioBlob = new Blob(audioChunks, { type: actualType });
+            var reader = new FileReader();
+            reader.onload = function(evt) {
+              selectedFile = { data: evt.target.result, name: 'голосовое_сообщение', type: actualType };
+              sendMsg();
+            };
+            reader.readAsDataURL(audioBlob);
+            stream.getTracks().forEach(function(track) { track.stop(); });
+          };
+
+          mediaRecorder.start();
+          isRecording = true;
+          micBtn.innerText = '🔴';
+        } catch (e) {
+          alert('Нет доступа к микрофону.');
+        }
+      } else {
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+        isRecording = false;
+        micBtn.innerText = '🎙️';
+      }
+    }
+
     async function sendMsg() {
       var input = document.getElementById('msg-input');
       var text = input.value.trim();
@@ -396,16 +544,19 @@ app.get('*', (req, res) => {
         fileType: selectedFile ? selectedFile.type : ''
       };
 
-      await fetch('/api/messages/send', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(body)
-      });
+      try {
+        await fetch('/api/messages/send', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body)
+        });
 
-      input.value = '';
-      selectedFile = null;
-      document.getElementById('file-input').value = '';
-      loadMessages();
+        input.value = '';
+        selectedFile = null;
+        document.getElementById('file-input').value = '';
+        loadMessages();
+        loadDialogs();
+      } catch(e) {}
     }
   </script>
 </body>
