@@ -8,7 +8,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
-// Защита консоли Windows от вылетов при непредвиденных ошибках
 process.on('uncaughtException', (err) => {
   console.error('[ОШИБКА СЕРВЕРА]:', err);
 });
@@ -16,7 +15,6 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('[ОШИБКА ПРОМИСА]:', reason);
 });
 
-// Пути к папкам и файлам
 const SERV_DIR = __dirname;
 const ARXIV_DIR = path.join(SERV_DIR, 'arxiv');
 const ACCOUNTS_DIR = path.join(ARXIV_DIR, 'accounts');
@@ -29,7 +27,6 @@ const MESSAGES_DIR = path.join(ARXIV_DIR, 'messages');
 const ACCOUNTS_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
 const MESSAGES_FILE = path.join(MESSAGES_DIR, 'messages.json');
 
-// Безопасное чтение JSON
 function safeReadJSON(filePath, fallback = []) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -45,7 +42,6 @@ function safeReadJSON(filePath, fallback = []) {
   }
 }
 
-// Атомарная запись в файл
 function safeWriteJSON(filePath, data) {
   const tmpPath = filePath + '.tmp';
   const bakPath = filePath + '.bak';
@@ -67,7 +63,6 @@ function writeAccounts(data) { safeWriteJSON(ACCOUNTS_FILE, data); }
 function readMessages() { return safeReadJSON(MESSAGES_FILE, []); }
 function writeMessages(data) { safeWriteJSON(MESSAGES_FILE, data); }
 
-// Шифрование и расшифровка
 const SECRET_SHIFT = 7;
 const XOR_KEY = 0x5A;
 
@@ -133,7 +128,7 @@ app.post('/api/guest', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Поиск пользователей
+// Поиск
 app.get('/api/users/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
   if (!q) return res.json([]);
@@ -208,7 +203,7 @@ app.delete('/api/messages/:msgId', (req, res) => {
   res.json({ success: true });
 });
 
-// Получение сообщений чата
+// Получение сообщений
 app.get('/api/messages/:userId/:peerId', (req, res) => {
   const { userId, peerId } = req.params;
   const messages = readMessages();
@@ -396,31 +391,31 @@ app.get('*', (req, res) => {
   </div>
 
   <script>
-    let currentUser = null;
-    let activePeer = null;
-    let selectedFile = null;
+    var currentUser = null;
+    var activePeer = null;
+    var selectedFile = null;
     
-    let mediaRecorder = null;
-    let audioChunks = [];
-    let isRecording = false;
+    var mediaRecorder = null;
+    var audioChunks = [];
+    var isRecording = false;
 
-    let lastDialogsHash = '';
-    let lastMessagesHash = '';
+    var lastDialogsHash = '';
+    var lastMessagesHash = '';
 
-    let selectedMsgId = null;
-    let longTouchTimer = null;
+    var selectedMsgId = null;
+    var longTouchTimer = null;
 
     async function handleGuestLogin() {
-      const name = document.getElementById('auth-name').value.trim();
+      var name = document.getElementById('auth-name').value.trim();
       if (!name) return alert('Пожалуйста, введите ваше имя');
 
       try {
-        const res = await fetch('/api/guest', { 
+        var res = await fetch('/api/guest', { 
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ name })
+          body: JSON.stringify({ name: name })
         });
-        const data = await res.json();
+        var data = await res.json();
         currentUser = data.user;
         startApp();
       } catch(e) {
@@ -435,7 +430,7 @@ app.get('*', (req, res) => {
       updateMyProfileUI();
       loadDialogs();
       
-      setInterval(() => {
+      setInterval(function() {
         if (currentUser && !isRecording) {
           loadDialogsQuiet();
           if (activePeer) loadMessagesQuiet();
@@ -450,23 +445,23 @@ app.get('*', (req, res) => {
     }
 
     async function loadDialogs() {
-      const searchVal = document.getElementById('search-input').value.trim();
+      var searchVal = document.getElementById('search-input').value.trim();
       if (searchVal) return;
       try {
-        const res = await fetch('/api/dialogs/' + currentUser.id);
-        const dialogs = await res.json();
+        var res = await fetch('/api/dialogs/' + currentUser.id);
+        var dialogs = await res.json();
         renderChatList(dialogs);
       } catch(e) {}
     }
 
     async function loadDialogsQuiet() {
-      const searchVal = document.getElementById('search-input').value.trim();
+      var searchVal = document.getElementById('search-input').value.trim();
       if (searchVal) return;
       try {
-        const res = await fetch('/api/dialogs/' + currentUser.id);
-        const dialogs = await res.json();
+        var res = await fetch('/api/dialogs/' + currentUser.id);
+        var dialogs = await res.json();
         
-        const currentHash = JSON.stringify(dialogs.map(d => d.id + d.name));
+        var currentHash = JSON.stringify(dialogs.map(function(d) { return d.id + d.name; }));
         if (currentHash !== lastDialogsHash) {
           lastDialogsHash = currentHash;
           renderChatList(dialogs);
@@ -475,8 +470,8 @@ app.get('*', (req, res) => {
     }
 
     async function onSearchInput() {
-      const q = document.getElementById('search-input').value.trim();
-      const clearBtn = document.getElementById('clear-search-btn');
+      var q = document.getElementById('search-input').value.trim();
+      var clearBtn = document.getElementById('clear-search-btn');
 
       if (!q) {
         clearBtn.style.display = 'none';
@@ -486,9 +481,9 @@ app.get('*', (req, res) => {
 
       clearBtn.style.display = 'block';
       try {
-        const res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
-        const users = await res.json();
-        renderChatList(users.filter(u => u.id !== currentUser.id));
+        var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
+        var users = await res.json();
+        renderChatList(users.filter(function(u) { return u.id !== currentUser.id; }));
       } catch(e) {}
     }
 
@@ -499,8 +494,8 @@ app.get('*', (req, res) => {
     }
 
     function renderChatList(list) {
-      const container = document.getElementById('chat-list');
-      const currentActiveId = activePeer ? activePeer.id : null;
+      var container = document.getElementById('chat-list');
+      var currentActiveId = activePeer ? activePeer.id : null;
       container.innerHTML = '';
 
       if (!list || list.length === 0) {
@@ -508,20 +503,18 @@ app.get('*', (req, res) => {
         return;
       }
 
-      list.forEach(item => {
-        const div = document.createElement('div');
+      list.forEach(function(item) {
+        var div = document.createElement('div');
         div.className = 'chat-item ' + (currentActiveId === item.id ? 'active' : '');
-        div.onclick = () => openChat(item);
+        div.onclick = function() { openChat(item); };
         
-        const avatarContent = (item.name || 'U')[0].toUpperCase();
+        var avatarContent = (item.name || 'U')[0].toUpperCase();
 
-        div.innerHTML = `
-          <div class="avatar">${avatarContent}</div>
-          <div>
-            <div style="font-weight:bold;">${item.name}</div>
-            <div style="font-size:11px; color:var(--text-muted);">ID: ${item.id}</div>
-          </div>
-        `;
+        div.innerHTML = '<div class="avatar">' + avatarContent + '</div>' +
+          '<div>' +
+            '<div style="font-weight:bold;">' + item.name + '</div>' +
+            '<div style="font-size:11px; color:var(--text-muted);">ID: ' + item.id + '</div>' +
+          '</div>';
         container.appendChild(div);
       });
     }
@@ -532,8 +525,8 @@ app.get('*', (req, res) => {
       document.getElementById('active-peer-name').innerText = peer.name + ' (ID: ' + peer.id + ')';
       document.getElementById('input-bar').style.display = 'flex';
       
-      const chatItems = document.querySelectorAll('.chat-item');
-      chatItems.forEach(el => el.classList.remove('active'));
+      var chatItems = document.querySelectorAll('.chat-item');
+      chatItems.forEach(function(el) { el.classList.remove('active'); });
       
       if (window.innerWidth <= 600) {
         document.getElementById('app-screen').classList.add('app-mobile-chat');
@@ -550,8 +543,8 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
-        const messages = await res.json();
+        var res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
+        var messages = await res.json();
         renderMessagesContainer(messages);
       } catch(e) {}
     }
@@ -559,10 +552,10 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
-        const messages = await res.json();
+        var res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
+        var messages = await res.json();
         
-        const currentHash = JSON.stringify(messages.map(m => m.id + (m.text || '')));
+        var currentHash = JSON.stringify(messages.map(function(m) { return m.id + (m.text || ''); }));
         if (currentHash !== lastMessagesHash) {
           lastMessagesHash = currentHash;
           renderMessagesContainer(messages);
@@ -571,8 +564,8 @@ app.get('*', (req, res) => {
     }
 
     function renderMessagesContainer(messages) {
-      const container = document.getElementById('messages-container');
-      const isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
+      var container = document.getElementById('messages-container');
+      var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
       
       container.innerHTML = '';
       if (!messages || messages.length === 0) {
@@ -580,37 +573,37 @@ app.get('*', (req, res) => {
         return;
       }
 
-      messages.forEach(m => {
-        const div = document.createElement('div');
+      messages.forEach(function(m) {
+        var div = document.createElement('div');
         div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
 
-        div.oncontextmenu = (e) => {
+        div.oncontextmenu = function(e) {
           e.preventDefault();
           openMsgActions(m.id);
         };
-        div.ontouchstart = () => {
-          longTouchTimer = setTimeout(() => openMsgActions(m.id), 500);
+        div.ontouchstart = function() {
+          longTouchTimer = setTimeout(function() { openMsgActions(m.id); }, 500);
         };
-        div.ontouchend = () => clearTimeout(longTouchTimer);
-        div.ontouchmove = () => clearTimeout(longTouchTimer);
+        div.ontouchend = function() { clearTimeout(longTouchTimer); };
+        div.ontouchmove = function() { clearTimeout(longTouchTimer); };
 
-        let html = '';
-        if (m.text) html += `<div>${m.text}</div>`;
+        var html = '';
+        if (m.text) html += '<div>' + m.text + '</div>';
 
-        const fileType = m.fileType || '';
+        var fileType = m.fileType || '';
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
-            html += `<img src="${m.fileData}" class="media-preview" onclick="window.open('${m.fileData}')">`;
+            html += '<img src="' + m.fileData + '" class="media-preview" onclick="window.open(\'' + m.fileData + '\')">';
           } else if (fileType.startsWith('video/')) {
-            html += `<video src="${m.fileData}" controls class="video-preview"></video>`;
+            html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
           } else if (fileType.startsWith('audio/')) {
-            html += `<audio src="${m.fileData}" controls style="margin-top:5px; max-width:100%;"></audio>`;
+            html += '<audio src="' + m.fileData + '" controls style="margin-top:5px; max-width:100%;"></audio>';
           } else {
-            html += `<a class="file-link" href="${m.fileData}" download="${m.fileName \vert{}\vert{} 'file'}">📁 ${m.fileName || 'Файл'}</a>`;
+            html += '<a class="file-link" href="' + m.fileData + '" download="' + (m.fileName || 'file') + '">📁 ' + (m.fileName || 'Файл') + '</a>';
           }
         }
 
-        html += `<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">${m.timestamp || ''}</div>`;
+        html += '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">' + (m.timestamp || '') + '</div>';
         div.innerHTML = html;
         container.appendChild(div);
       });
@@ -633,8 +626,8 @@ app.get('*', (req, res) => {
     async function deleteSelectedMessage() {
       if (!selectedMsgId) return;
       try {
-        const res = await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
-        const data = await res.json();
+        var res = await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
+        var data = await res.json();
         if (data.success) {
           closeMsgActions();
           lastMessagesHash = '';
@@ -652,9 +645,9 @@ app.get('*', (req, res) => {
     }
 
     function handleFileSelect(e) {
-      const file = e.target.files[0];
+      var file = e.target.files[0];
       if (!file) return;
-      const reader = new FileReader();
+      var reader = new FileReader();
       reader.onload = function(evt) {
         selectedFile = { data: evt.target.result, name: file.name, type: file.type };
         alert('Файл прикреплен: ' + file.name);
@@ -663,44 +656,44 @@ app.get('*', (req, res) => {
     }
 
     function getSupportedMimeType() {
-      const types = [
+      var types = [
         'audio/webm;codecs=opus',
         'audio/mp4',
         'audio/aac',
         'audio/webm',
         'audio/ogg;codecs=opus'
       ];
-      for (let t of types) {
-        if (MediaRecorder.isTypeSupported(t)) return t;
+      for (var i = 0; i < types.length; i++) {
+        if (MediaRecorder.isTypeSupported(types[i])) return types[i];
       }
       return '';
     }
 
     async function toggleVoiceRecord() {
-      const micBtn = document.getElementById('mic-btn');
+      var micBtn = document.getElementById('mic-btn');
       if (!isRecording) {
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          const mimeType = getSupportedMimeType();
+          var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          var mimeType = getSupportedMimeType();
           
-          mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+          mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType: mimeType }) : new MediaRecorder(stream);
           audioChunks = [];
 
-          mediaRecorder.ondataavailable = e => {
+          mediaRecorder.ondataavailable = function(e) {
             if (e.data.size > 0) audioChunks.push(e.data);
           };
 
-          mediaRecorder.onstop = async () => {
-            const actualType = mediaRecorder.mimeType || 'audio/mp4';
-            const audioBlob = new Blob(audioChunks, { type: actualType });
-            const reader = new FileReader();
+          mediaRecorder.onstop = async function() {
+            var actualType = mediaRecorder.mimeType || 'audio/mp4';
+            var audioBlob = new Blob(audioChunks, { type: actualType });
+            var reader = new FileReader();
             reader.onload = function(evt) {
               selectedFile = { data: evt.target.result, name: 'голосовое_сообщение', type: actualType };
               sendMsg();
             };
             reader.readAsDataURL(audioBlob);
             
-            stream.getTracks().forEach(track => track.stop());
+            stream.getTracks().forEach(function(track) { track.stop(); });
           };
 
           mediaRecorder.start();
@@ -718,11 +711,11 @@ app.get('*', (req, res) => {
 
     async function sendMsg() {
       if (!activePeer) return;
-      const input = document.getElementById('msg-input');
-      const text = input.value.trim();
+      var input = document.getElementById('msg-input');
+      var text = input.value.trim();
       if (!text && !selectedFile) return;
 
-      const body = {
+      var body = {
         senderId: currentUser.id,
         receiverId: activePeer.id,
         text: text,
