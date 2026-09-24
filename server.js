@@ -8,7 +8,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
-// Защита консоли от вылетов
 process.on('uncaughtException', (err) => {
   console.error('[ОШИБКА СЕРВЕРА]:', err);
 });
@@ -16,7 +15,6 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('[ОШИБКА ПРОМИСА]:', reason);
 });
 
-// Пути к папкам и файлам
 const SERV_DIR = __dirname;
 const ARXIV_DIR = path.join(SERV_DIR, 'arxiv');
 const ACCOUNTS_DIR = path.join(ARXIV_DIR, 'accounts');
@@ -117,7 +115,7 @@ function decryptData(text) {
   return String(text);
 }
 
-// Регистрация только по имени с генерацией ID
+// Регистрация только по имени
 app.post('/api/register', (req, res) => {
   const { name } = req.body;
   if (!name || !name.trim()) {
@@ -128,7 +126,6 @@ app.post('/api/register', (req, res) => {
   const newAccount = {
     id: 'id_' + Math.random().toString(36).substr(2, 9),
     name: name.trim(),
-    avatar: '',
     contacts: [],
     updatedAt: Date.now()
   };
@@ -136,22 +133,6 @@ app.post('/api/register', (req, res) => {
   accounts.push(newAccount);
   writeAccounts(accounts);
   res.json({ success: true, user: newAccount });
-});
-
-// Обновление профиля
-app.post('/api/user/profile', (req, res) => {
-  const { userId, name, avatar } = req.body;
-  const accounts = readAccounts();
-  const userIndex = accounts.findIndex(u => u.id === userId);
-
-  if (userIndex === -1) return res.status(404).json({ error: 'Пользователь не найден.' });
-
-  if (name && name.trim()) accounts[userIndex].name = name.trim();
-  if (avatar !== undefined) accounts[userIndex].avatar = avatar;
-  accounts[userIndex].updatedAt = Date.now();
-
-  writeAccounts(accounts);
-  res.json({ success: true, user: accounts[userIndex] });
 });
 
 // Поиск аккаунтов
@@ -164,8 +145,7 @@ app.get('/api/users/search', (req, res) => {
     return (u.id && u.id.toLowerCase().includes(q)) || (u.name && u.name.toLowerCase().includes(q));
   }).map(u => ({ 
     id: u.id, 
-    name: u.name, 
-    avatar: u.avatar 
+    name: u.name 
   }));
 
   res.json(results);
@@ -254,7 +234,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   });
 
   const dialogs = accounts.filter(u => peerIds.has(u.id)).map(u => ({
-    id: u.id, name: u.name, avatar: u.avatar
+    id: u.id, name: u.name
   }));
 
   res.json(dialogs);
@@ -282,7 +262,6 @@ app.get('*', (req, res) => {
       --text-muted: #7f91a4;
       --accent: #5288c1;
       --border: #0e1621;
-      --modal-bg: #17212b;
     }
 
     :root[data-theme="light"] {
@@ -297,7 +276,6 @@ app.get('*', (req, res) => {
       --text-muted: #707579;
       --accent: #3390ec;
       --border: #e6ebee;
-      --modal-bg: #ffffff;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
@@ -309,8 +287,7 @@ app.get('*', (req, res) => {
     .auth-container { margin: auto; width: 90%; max-width: 360px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); text-align: center; }
     .auth-container h2 { margin-bottom: 20px; color: var(--accent); }
     .input-group { margin-bottom: 15px; text-align: left; }
-    .input-group label { display: block; margin-bottom: 5px; font-size: 13px; color: var(--text-muted); }
-    .input-group input, .input-group select { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; }
+    .input-group input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; }
     .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top: 10px; }
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
     .btn-danger { background: #e53935; color: #fff; }
@@ -319,9 +296,11 @@ app.get('*', (req, res) => {
     #app-container { display: flex; width: 100%; height: 100%; }
     .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
-    .user-profile-bar { display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 4px; border-radius: 8px; }
-    .user-profile-bar:hover { background: var(--bg-hover); }
-    .user-info-brief { display: flex; align-items: center; gap: 10px; overflow: hidden; }
+    
+    .user-profile-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px; }
+    .user-info-brief { display: flex; flex-direction: column; overflow: hidden; }
+
+    .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
 
     .search-box { position: relative; }
     .search-box input { width: 100%; padding: 10px 12px; border-radius: 18px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; font-size: 14px; }
@@ -330,8 +309,6 @@ app.get('*', (req, res) => {
     .chat-list { flex: 1; overflow-y: auto; }
     .chat-item { display: flex; align-items: center; gap: 12px; padding: 12px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background 0.2s; }
     .chat-item:hover, .chat-item.active { background: var(--bg-active); }
-    .avatar { width: 42px; height: 42px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: bold; color: #fff; overflow: hidden; object-fit: cover; flex-shrink: 0; }
-    .avatar img { width: 100%; height: 100%; object-fit: cover; }
 
     .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); position: relative; }
     .chat-header { background: var(--bg-sidebar); padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
@@ -350,15 +327,7 @@ app.get('*', (req, res) => {
 
     .empty-state { margin: auto; text-align: center; color: var(--text-muted); font-size: 14px; }
 
-    .modal-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 1000; }
-    .modal-overlay.active { display: flex; }
-    .modal-card { background: var(--modal-bg); width: 90%; max-width: 380px; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
-    .modal-card h3 { margin-bottom: 15px; color: var(--text-main); text-align: center; }
-
-    .profile-avatar-picker { width: 90px; height: 90px; border-radius: 50%; margin: 0 auto 15px; position: relative; overflow: hidden; cursor: pointer; background: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 32px; color: #fff; }
-    .profile-avatar-picker img { width: 100%; height: 100%; object-fit: cover; }
-
-    .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--modal-bg); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
+    .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
 
     @media (max-width: 600px) {
@@ -371,7 +340,7 @@ app.get('*', (req, res) => {
 </head>
 <body>
 
-  <!-- Экран входа: только ввод имени -->
+  <!-- Экран входа -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Введите имя</h2>
@@ -391,15 +360,12 @@ app.get('*', (req, res) => {
       
       <div class="sidebar">
         <div class="sidebar-header">
-          <div class="user-profile-bar" onclick="openProfileModal()">
+          <div class="user-profile-bar">
             <div class="user-info-brief">
-              <div class="avatar" id="my-avatar-icon">U</div>
-              <div>
-                <b id="my-display-name">Имя</b>
-                <div style="font-size:11px; color:var(--accent);" id="my-display-id">ID</div>
-              </div>
+              <b id="my-display-name">Имя</b>
+              <div style="font-size:11px; color:var(--accent);" id="my-display-id">ID</div>
             </div>
-            <span style="font-size:18px;">⚙️</span>
+            <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Сменить тему">🌙</button>
           </div>
 
           <div class="search-box">
@@ -435,37 +401,6 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Модальное окно профиля -->
-  <div class="modal-overlay" id="profile-modal">
-    <div class="modal-card">
-      <h3>Профиль</h3>
-      
-      <div class="profile-avatar-picker" onclick="triggerAvatarUpload()">
-        <span id="profile-avatar-preview">U</span>
-        <input type="file" id="avatar-input" accept="image/*" style="display:none;" onchange="handleAvatarSelect(event)">
-      </div>
-      <div style="text-align:center; margin-bottom:15px;">
-        <button class="btn btn-secondary" style="width:auto; padding:4px 8px; font-size:11px;" onclick="removeAvatar()">Удалить аватарку</button>
-      </div>
-
-      <div class="input-group">
-        <label>Имя</label>
-        <input type="text" id="profile-name-input" placeholder="Ваше имя">
-      </div>
-
-      <div class="input-group">
-        <label>Тема оформления</label>
-        <select id="theme-select" onchange="changeTheme(this.value)">
-          <option value="dark">Тёмная</option>
-          <option value="light">Светлая</option>
-        </select>
-      </div>
-
-      <button class="btn" onclick="saveProfile()">Сохранить</button>
-      <button class="btn btn-secondary" onclick="closeProfileModal()">Закрыть</button>
-    </div>
-  </div>
-
   <!-- Меню действий с сообщением -->
   <div class="msg-actions-sheet" id="msg-actions-sheet">
     <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
@@ -476,7 +411,6 @@ app.get('*', (req, res) => {
     let currentUser = null;
     let activePeer = null;
     let selectedFile = null;
-    let tempAvatarBase64 = null;
     
     let mediaRecorder = null;
     let audioChunks = [];
@@ -488,12 +422,22 @@ app.get('*', (req, res) => {
     let selectedMsgId = null;
     let longTouchTimer = null;
 
+    // Управление темой
     const savedTheme = localStorage.getItem('app_theme') || 'dark';
     document.documentElement.setAttribute('data-theme', savedTheme);
+    updateThemeIcon(savedTheme);
 
-    function changeTheme(theme) {
-      document.documentElement.setAttribute('data-theme', theme);
-      localStorage.setItem('app_theme', theme);
+    function toggleTheme() {
+      const current = document.documentElement.getAttribute('data-theme');
+      const next = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('app_theme', next);
+      updateThemeIcon(next);
+    }
+
+    function updateThemeIcon(theme) {
+      const btn = document.getElementById('theme-toggle-btn');
+      if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️';
     }
 
     async function registerUser() {
@@ -530,7 +474,9 @@ app.get('*', (req, res) => {
       document.getElementById('auth-screen').classList.remove('active');
       document.getElementById('app-screen').classList.add('active');
 
-      updateMyProfileUI();
+      document.getElementById('my-display-name').innerText = currentUser.name;
+      document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
+
       loadDialogs();
       
       setInterval(() => {
@@ -539,88 +485,6 @@ app.get('*', (req, res) => {
           if (activePeer) loadMessagesQuiet();
         }
       }, 1500);
-    }
-
-    function updateMyProfileUI() {
-      document.getElementById('my-display-name').innerText = currentUser.name;
-      document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
-
-      const avatarContainer = document.getElementById('my-avatar-icon');
-      if (currentUser.avatar) {
-        avatarContainer.innerHTML = \`<img src="\${currentUser.avatar}">\`;
-      } else {
-        avatarContainer.innerText = (currentUser.name || 'U')[0].toUpperCase();
-      }
-    }
-
-    function openProfileModal() {
-      document.getElementById('profile-name-input').value = currentUser.name;
-      document.getElementById('theme-select').value = localStorage.getItem('app_theme') || 'dark';
-      
-      tempAvatarBase64 = currentUser.avatar || '';
-      renderProfileAvatarPreview();
-      
-      document.getElementById('profile-modal').classList.add('active');
-    }
-
-    function closeProfileModal() {
-      document.getElementById('profile-modal').classList.remove('active');
-    }
-
-    function renderProfileAvatarPreview() {
-      const preview = document.getElementById('profile-avatar-preview');
-      if (tempAvatarBase64) {
-        preview.innerHTML = \`<img src="\${tempAvatarBase64}">\`;
-      } else {
-        preview.innerText = (currentUser.name || 'U')[0].toUpperCase();
-      }
-    }
-
-    function triggerAvatarUpload() {
-      document.getElementById('avatar-input').click();
-    }
-
-    function handleAvatarSelect(e) {
-      const file = e.target.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        tempAvatarBase64 = evt.target.result;
-        renderProfileAvatarPreview();
-      };
-      reader.readAsDataURL(file);
-    }
-
-    function removeAvatar() {
-      tempAvatarBase64 = '';
-      renderProfileAvatarPreview();
-    }
-
-    async function saveProfile() {
-      const newName = document.getElementById('profile-name-input').value.trim();
-      if (!newName) return alert('Имя не может быть пустым');
-
-      try {
-        const res = await fetch('/api/user/profile', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            userId: currentUser.id,
-            name: newName,
-            avatar: tempAvatarBase64
-          })
-        });
-        const data = await res.json();
-        if (data.success) {
-          currentUser = data.user;
-          updateMyProfileUI();
-          closeProfileModal();
-        } else {
-          alert('Не удалось сохранить профиль.');
-        }
-      } catch(e) {
-        alert('Ошибка при сохранении данных профиля.');
-      }
     }
 
     async function loadDialogs() {
@@ -640,7 +504,7 @@ app.get('*', (req, res) => {
         const res = await fetch('/api/dialogs/' + currentUser.id);
         const dialogs = await res.json();
         
-        const currentHash = JSON.stringify(dialogs.map(d => d.id + d.name + d.avatar));
+        const currentHash = JSON.stringify(dialogs.map(d => d.id + d.name));
         if (currentHash !== lastDialogsHash) {
           lastDialogsHash = currentHash;
           renderChatList(dialogs);
@@ -686,13 +550,8 @@ app.get('*', (req, res) => {
         const div = document.createElement('div');
         div.className = 'chat-item ' + (currentActiveId === item.id ? 'active' : '');
         div.onclick = () => openChat(item);
-        
-        const avatarContent = item.avatar 
-          ? \`<img src="\${item.avatar}">\` 
-          : (item.name || 'U')[0].toUpperCase();
 
         div.innerHTML = \`
-          <div class="avatar">\${avatarContent}</div>
           <div>
             <div style="font-weight:bold;">\${item.name}</div>
             <div style="font-size:11px; color:var(--text-muted);">ID: \${item.id}</div>
