@@ -539,7 +539,7 @@ app.get('*', (req, res) => {
       </div>
 
       <div class="profile-actions" style="align-items: center;">
-        <button class="profile-link-btn" onclick="triggerAvatarInput()">Загрузить аватарку</button>
+        <button class="profile-link-btn" onclick="triggerAvatarInput()">Загрузить фото</button>
         <input type="file" id="avatar-file-input" style="display:none;" accept="image/*" onchange="handleAvatarSelect(event)">
         <button class="profile-link-btn" id="remove-avatar-link-btn" style="color: #e53935; display:none;" onclick="removeMyAvatar()">Удалить фото профиля</button>
         
