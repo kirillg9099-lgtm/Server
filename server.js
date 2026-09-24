@@ -76,23 +76,13 @@ function decryptText(text) {
   return text;
 }
 
-// Регистрация с проверкой коллизий ID
+// Регистрация с автоматическим разрешением коллизий ID
 app.post('/api/register', (req, res) => {
   let { id, name, avatar, contacts } = req.body;
   const accounts = readAccounts();
 
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'Введите имя' });
-  }
-
-  // Проверка на коллизию ID (если ID занят другим пользователем с другим именем/сессией)
-  if (id) {
-    const existingIndex = accounts.findIndex(u => u.id === id);
-    if (existingIndex !== -1) {
-      // Если ID занят, но это другой пользователь (например, совпал рандом), меняем ID для нового
-      // Проверяем по совпадению: если имя сильно отличается и это не тот же девайс, даем новый ID
-      // Для простоты: если ID уже есть, но регистрируется новый клиент, проверим, не занят ли он.
-    }
   }
 
   let finalId = id;
@@ -124,14 +114,13 @@ app.post('/api/register', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Пинг для поддержания активности и синхронизации кэшированных данных/профиля
+// Пинг и синхронизация кэша
 app.post('/api/ping', (req, res) => {
   const { id, name, avatar, contacts, knownUsers } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
 
   const accounts = readAccounts();
   
-  // Синхронизация кэшированных пользователей с сервера
   if (Array.isArray(knownUsers)) {
     knownUsers.forEach(kUser => {
       if (!kUser.id) return;
@@ -189,7 +178,7 @@ app.post('/api/profile/update', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Получение информации о пользователе (для профиля)
+// Получение профиля пользователя
 app.get('/api/users/:userId', (req, res) => {
   const accounts = readAccounts();
   const user = accounts.find(u => u.id === req.params.userId);
@@ -197,7 +186,7 @@ app.get('/api/users/:userId', (req, res) => {
   res.json({ id: user.id, name: user.name, avatar: user.avatar || '' });
 });
 
-// Блокировка/разблокировка чата с пользователем
+// Включение/выключение сообщений (блок пользователя)
 app.post('/api/users/block', (req, res) => {
   const { userId, peerId, block } = req.body;
   const accounts = readAccounts();
@@ -228,7 +217,7 @@ app.get('/api/users/search', (req, res) => {
   res.json(results);
 });
 
-// Отправка сообщений
+// Отправка сообщений с проверкой блоков
 app.post('/api/messages/send', (req, res) => {
   const { senderId, receiverId, text, fileData, fileName, fileType } = req.body;
   const accounts = readAccounts();
@@ -236,10 +225,10 @@ app.post('/api/messages/send', (req, res) => {
   const receiver = accounts.find(u => u.id === receiverId);
 
   if (sender && sender.blockedContacts && sender.blockedContacts.includes(receiverId)) {
-    return res.status(403.1).json({ error: 'Чат заблокирован вами' });
+    return res.status(403).json({ error: 'Сообщения отключены вами' });
   }
   if (receiver && receiver.blockedContacts && receiver.blockedContacts.includes(senderId)) {
-    return res.status(403).json({ error: 'Вы заблокированы пользователем' });
+    return res.status(403).json({ error: 'Сообщения отключены получателем' });
   }
 
   const messages = readMessages();
@@ -286,7 +275,7 @@ app.delete('/api/messages/:msgId', (req, res) => {
   res.json({ success: true });
 });
 
-// Получение сообщений чата
+// Получение сообщений
 app.get('/api/messages/:userId/:peerId', (req, res) => {
   const { userId, peerId } = req.params;
   const messages = readMessages();
@@ -322,7 +311,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
-// Клиентский интерфейс
+// HTML клиентская часть
 app.get('*', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -407,8 +396,9 @@ app.get('*', (req, res) => {
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
     .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
     
-    .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; }
+    .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
+    .audio-preview { width: 240px; margin-top: 5px; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
     .attachment-preview-container { background: var(--bg-sidebar); padding: 10px 15px; border-top: 1px solid var(--border); display: none; align-items: center; gap: 12px; }
@@ -428,7 +418,7 @@ app.get('*', (req, res) => {
 
     .empty-state { margin: auto; text-align: center; color: var(--text-muted); font-size: 14px; }
 
-    /* Модальные окна профилей (в стиле Telegram) */
+    /* Модальные окна */
     .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: none; align-items: center; justify-content: center; }
     .modal-overlay.active { display: flex; }
     .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); position: relative; }
@@ -437,6 +427,16 @@ app.get('*', (req, res) => {
     .profile-name { font-size: 20px; font-weight: bold; margin-bottom: 5px; }
     .profile-id { font-size: 13px; color: var(--accent); margin-bottom: 20px; }
     .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
+
+    /* Ссылочные кнопки-текст для профиля */
+    .profile-link-btn { background: none; border: none; color: var(--accent); font-size: 14px; font-weight: 500; cursor: pointer; padding: 5px; text-align: center; }
+    .profile-link-btn:hover { text-decoration: underline; }
+
+    /* Полноэкранный просмотр изображений */
+    #image-viewer-modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: none; align-items: center; justify-content: center; }
+    #image-viewer-modal.active { display: flex; }
+    #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; object-fit: contain; }
+    .viewer-close { position: absolute; top: 20px; right: 20px; color: #fff; font-size: 30px; cursor: pointer; background: none; border: none; }
 
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
@@ -451,7 +451,7 @@ app.get('*', (req, res) => {
 </head>
 <body>
 
-  <!-- Экран входа / регистрации -->
+  <!-- Авторизация -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход в мессенджер</h2>
@@ -463,7 +463,7 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Главный экран -->
+  <!-- Основной экран -->
   <div id="app-screen" class="screen">
     <div id="app-container">
       
@@ -505,7 +505,7 @@ app.get('*', (req, res) => {
         </div>
 
         <div class="attachment-preview-container" id="attachment-preview-container">
-          <img id="attachment-thumb-img" class="attachment-thumb" src="" alt="">
+          <img id="attachment-thumb-img" class="attachment-thumb" src="" alt="" style="display:none;">
           <div class="attachment-info">
             <div class="attachment-name" id="attachment-name-label">файл</div>
             <div style="font-size:11px; color:var(--text-muted);" id="attachment-type-label">Готово к отправке</div>
@@ -534,21 +534,22 @@ app.get('*', (req, res) => {
       <div class="profile-id" id="my-profile-id-view">ID</div>
       
       <div class="input-group" style="width:100%;">
-        <label style="font-size:12px; color:var(--text-muted);">Изменить имя:</label>
+        <label style="font-size:12px; color:var(--text-muted);">Переименовать себя:</label>
         <input type="text" id="edit-my-name-input" placeholder="Ваше имя...">
       </div>
 
-      <div class="profile-actions">
-        <button class="btn btn-secondary" onclick="triggerAvatarInput()">Загрузить аватарку</button>
+      <div class="profile-actions" style="align-items: center;">
+        <button class="profile-link-btn" onclick="triggerAvatarInput()">Загрузить аватарку</button>
         <input type="file" id="avatar-file-input" style="display:none;" accept="image/*" onchange="handleAvatarSelect(event)">
-        <button class="btn btn-secondary" id="remove-avatar-btn" onclick="removeMyAvatar()">Удалить аватарку</button>
+        <button class="profile-link-btn" id="remove-avatar-link-btn" style="color: #e53935; display:none;" onclick="removeMyAvatar()">Удалить фото профиля</button>
+        
         <button class="btn" onclick="saveMyProfileChanges()">Сохранить</button>
         <button class="btn btn-secondary" onclick="closeMyProfile()">Закрыть</button>
       </div>
     </div>
   </div>
 
-  <!-- Модальное окно профиля собеседника (Telegram-style) -->
+  <!-- Модальное окно профиля собеседника -->
   <div class="modal-overlay" id="peer-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="peer-profile-avatar-view"></div>
@@ -556,10 +557,16 @@ app.get('*', (req, res) => {
       <div class="profile-id" id="peer-profile-id-view">ID</div>
       
       <div class="profile-actions">
-        <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Заблокировать сообщения</button>
+        <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Отключить сообщения</button>
         <button class="btn btn-secondary" onclick="closePeerProfile()">Закрыть</button>
       </div>
     </div>
+  </div>
+
+  <!-- Полноэкранный просмотр изображений -->
+  <div id="image-viewer-modal" onclick="closeImageViewer()">
+    <button class="viewer-close" onclick="closeImageViewer()">✕</button>
+    <img id="full-screen-img" src="" alt="">
   </div>
 
   <!-- Лист действий с сообщением -->
@@ -592,7 +599,6 @@ app.get('*', (req, res) => {
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
 
-    // Запрос разрешений на уведомления браузера
     if (window.Notification && Notification.permission !== 'granted') {
       Notification.requestPermission();
     }
@@ -706,7 +712,6 @@ app.get('*', (req, res) => {
         });
         const data = await res.json();
         if (data.success && data.user) {
-          // Если сервер автоматически сменил ID из-за коллизии
           if (data.user.id !== currentUser.id) {
             currentUser.id = data.user.id;
             localStorage.setItem('messenger_user', JSON.stringify(currentUser));
@@ -727,6 +732,14 @@ app.get('*', (req, res) => {
       renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
       document.getElementById('my-profile-name-view').innerText = currentUser.name;
       document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
+      
+      const removeLinkBtn = document.getElementById('remove-avatar-link-btn');
+      if (currentUser.avatar) {
+        removeLinkBtn.style.display = 'block';
+      } else {
+        removeLinkBtn.style.display = 'none';
+      }
+
       document.getElementById('my-profile-modal').classList.add('active');
     }
 
@@ -745,6 +758,7 @@ app.get('*', (req, res) => {
       reader.onload = function(evt) {
         currentUser.avatar = evt.target.result;
         renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+        document.getElementById('remove-avatar-link-btn').style.display = 'block';
       };
       reader.readAsDataURL(file);
     }
@@ -752,6 +766,7 @@ app.get('*', (req, res) => {
     function removeMyAvatar() {
       currentUser.avatar = '';
       renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+      document.getElementById('remove-avatar-link-btn').style.display = 'none';
     }
 
     async function saveMyProfileChanges() {
@@ -784,7 +799,7 @@ app.get('*', (req, res) => {
 
       const blockBtn = document.getElementById('block-peer-btn');
       const isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.includes(activePeer.id);
-      blockBtn.innerText = isBlocked ? 'Разблокировать сообщения' : 'Заблокировать сообщения';
+      blockBtn.innerText = isBlocked ? 'Включить сообщения' : 'Отключить сообщения';
       blockBtn.className = isBlocked ? 'btn' : 'btn btn-secondary';
 
       document.getElementById('peer-profile-modal').classList.add('active');
@@ -810,10 +825,10 @@ app.get('*', (req, res) => {
           currentUser.blockedContacts = data.blockedContacts;
           localStorage.setItem('messenger_user', JSON.stringify(currentUser));
           closePeerProfile();
-          alert(nextBlock ? 'Пользователь заблокирован' : 'Пользователь разблокирован');
+          alert(nextBlock ? 'Сообщения отключены' : 'Сообщения включены');
         }
       } catch(e) {
-        alert('Ошибка при изменении статуса блока');
+        alert('Ошибка при изменении статуса сообщений');
       }
     }
 
@@ -943,7 +958,6 @@ app.get('*', (req, res) => {
         
         const currentHash = JSON.stringify(messages.map(m => m.id));
         if (currentHash !== lastMessagesHash) {
-          // Проверка на входящие сообщения для генерации браузерного уведомления
           if (messages.length > 0) {
             const lastMsg = messages[messages.length - 1];
             if (lastMsg.senderId === activePeer.id && lastMessagesHash !== '') {
@@ -961,6 +975,15 @@ app.get('*', (req, res) => {
       if (window.Notification && Notification.permission === 'granted' && document.hidden) {
         new Notification(title, { body: bodyText });
       }
+    }
+
+    function openImageViewer(src) {
+      document.getElementById('full-screen-img').src = src;
+      document.getElementById('image-viewer-modal').classList.add('active');
+    }
+
+    function closeImageViewer() {
+      document.getElementById('image-viewer-modal').classList.remove('active');
     }
 
     function renderMessagesContainer(messages) {
@@ -993,11 +1016,11 @@ app.get('*', (req, res) => {
         const fileType = m.fileType || '';
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
-            html += \`<img src="\${m.fileData}" class="media-preview">\`;
+            html += \`<img src="\${m.fileData}" class="media-preview" onclick="openImageViewer('\${m.fileData}')">\`;
           } else if (fileType.startsWith('video/')) {
             html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
           } else if (fileType.startsWith('audio/')) {
-            html += \`<audio src="\${m.fileData}" controls style="margin-top:5px; max-width:100%;"></audio>\`;
+            html += \`<audio src="\${m.fileData}" controls class="audio-preview"></audio>\`;
           } else {
             html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
           }
@@ -1104,6 +1127,10 @@ app.get('*', (req, res) => {
           thumbImg.src = '';
           thumbImg.style.display = 'none';
           typeLabel.innerText = 'Видео';
+        } else if (file.type.startsWith('audio/')) {
+          thumbImg.src = '';
+          thumbImg.style.display = 'none';
+          typeLabel.innerText = 'Аудиозапись';
         } else {
           thumbImg.src = '';
           thumbImg.style.display = 'none';
@@ -1147,8 +1174,14 @@ app.get('*', (req, res) => {
             const audioBlob = new Blob(audioChunks, { type: actualType });
             const reader = new FileReader();
             reader.onload = function(evt) {
-              selectedFile = { data: evt.target.result, name: 'голосовое_сообщение', type: actualType };
-              sendMsg();
+              selectedFile = { data: evt.target.result, name: 'голосовое_сообщение.wav', type: actualType };
+              
+              // Показываем в панели предпросмотра (как файл/фото)
+              const previewContainer = document.getElementById('attachment-preview-container');
+              document.getElementById('attachment-thumb-img').style.display = 'none';
+              document.getElementById('attachment-name-label').innerText = 'Голосовое сообщение';
+              document.getElementById('attachment-type-label').innerText = 'Аудио (нажмите Отправить)';
+              previewContainer.classList.add('active');
             };
             reader.readAsDataURL(audioBlob);
             stream.getTracks().forEach(track => track.stop());
@@ -1213,8 +1246,8 @@ app.get('*', (req, res) => {
           body: JSON.stringify(body)
         });
 
-        if (res.status === 403 || res.status === 403.1) {
-          alert('Сообщение не доставлено: чат заблокирован.');
+        if (res.status === 403) {
+          alert('Сообщение не доставлено: чат заблокирован или отключен.');
         }
 
         if (tempDiv) tempDiv.remove();
