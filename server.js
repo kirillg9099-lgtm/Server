@@ -582,6 +582,9 @@ app.get('*', (req, res) => {
     let activePeer = null;
     let selectedFile = null;
     
+    // Временная переменная для аватара в диалоговом окне редактирования профиля
+    let tempAvatar = '';
+
     let mediaRecorder = null;
     let audioChunks = [];
     let isRecording = false;
@@ -728,13 +731,16 @@ app.get('*', (req, res) => {
     }
 
     function openMyProfile() {
+      tempAvatar = currentUser.avatar || '';
       document.getElementById('edit-my-name-input').value = currentUser.name;
-      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+      
+      const tempObj = { name: currentUser.name, avatar: tempAvatar };
+      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), tempObj);
       document.getElementById('my-profile-name-view').innerText = currentUser.name;
       document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
       
       const removeLinkBtn = document.getElementById('remove-avatar-link-btn');
-      if (currentUser.avatar) {
+      if (tempAvatar) {
         removeLinkBtn.style.display = 'block';
       } else {
         removeLinkBtn.style.display = 'none';
@@ -748,7 +754,9 @@ app.get('*', (req, res) => {
     }
 
     function triggerAvatarInput() {
-      document.getElementById('avatar-file-input').click();
+      const input = document.getElementById('avatar-file-input');
+      input.value = ''; // Сбрасываем значение, чтобы можно было выбрать тот же файл повторно
+      input.click();
     }
 
     function handleAvatarSelect(e) {
@@ -756,22 +764,25 @@ app.get('*', (req, res) => {
       if (!file) return;
       const reader = new FileReader();
       reader.onload = function(evt) {
-        currentUser.avatar = evt.target.result;
-        renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+        tempAvatar = evt.target.result;
+        const tempObj = { name: currentUser.name, avatar: tempAvatar };
+        renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), tempObj);
         document.getElementById('remove-avatar-link-btn').style.display = 'block';
       };
       reader.readAsDataURL(file);
     }
 
     function removeMyAvatar() {
-      currentUser.avatar = '';
-      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+      tempAvatar = '';
+      const tempObj = { name: currentUser.name, avatar: '' };
+      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), tempObj);
       document.getElementById('remove-avatar-link-btn').style.display = 'none';
     }
 
     async function saveMyProfileChanges() {
       const newName = document.getElementById('edit-my-name-input').value.trim();
       if (newName) currentUser.name = newName;
+      currentUser.avatar = tempAvatar;
 
       try {
         const res = await fetch('/api/profile/update', {
@@ -900,13 +911,13 @@ app.get('*', (req, res) => {
         div.onclick = () => openChat(item);
 
         const avatarId = 'chat_av_' + item.id;
-        div.innerHTML = \`
-          <div class="avatar-circle" id="\${avatarId}"></div>
+        div.innerHTML = `
+          <div class="avatar-circle" id="${avatarId}"></div>
           <div>
-            <div style="font-weight:bold;">\${item.name}</div>
-            <div style="font-size:11px; color:var(--text-muted);">ID: \${item.id}</div>
+            <div style="font-weight:bold;">${item.name}</div>
+            <div style="font-size:11px; color:var(--text-muted);">ID: ${item.id}</div>
           </div>
-        \`;
+        `;
         container.appendChild(div);
         renderAvatarIntoElement(document.getElementById(avatarId), item);
       });
@@ -944,7 +955,7 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
+        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
         const messages = await res.json();
         renderMessagesContainer(messages);
       } catch(e) {}
@@ -953,7 +964,7 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
+        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
         const messages = await res.json();
         
         const currentHash = JSON.stringify(messages.map(m => m.id));
@@ -1011,22 +1022,22 @@ app.get('*', (req, res) => {
         div.ontouchmove = () => clearTimeout(longTouchTimer);
 
         let html = '';
-        if (m.text) html += \`<div>\${m.text}</div>\`;
+        if (m.text) html += `<div>${m.text}</div>`;
 
         const fileType = m.fileType || '';
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
-            html += \`<img src="\${m.fileData}" class="media-preview" onclick="openImageViewer('\${m.fileData}')">\`;
+            html += `<img src="${m.fileData}" class="media-preview" onclick="openImageViewer('${m.fileData}')">`;
           } else if (fileType.startsWith('video/')) {
-            html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
+            html += `<video src="${m.fileData}" controls class="video-preview"></video>`;
           } else if (fileType.startsWith('audio/')) {
-            html += \`<audio src="\${m.fileData}" controls class="audio-preview"></audio>\`;
+            html += `<audio src="${m.fileData}" controls class="audio-preview"></audio>`;
           } else {
-            html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
+            html += `<a class="file-link" onclick="event.stopPropagation()">📁 ${m.fileName || 'Файл'}</a>`;
           }
         }
 
-        html += \`<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">\${m.timestamp || ''}</div>\`;
+        html += `<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">${m.timestamp || ''}</div>`;
         div.innerHTML = html;
         container.appendChild(div);
       });
@@ -1103,7 +1114,9 @@ app.get('*', (req, res) => {
     }
 
     function triggerFileInput() {
-      document.getElementById('file-input').click();
+      const input = document.getElementById('file-input');
+      input.value = '';
+      input.click();
     }
 
     function handleFileSelect(e) {
@@ -1176,7 +1189,6 @@ app.get('*', (req, res) => {
             reader.onload = function(evt) {
               selectedFile = { data: evt.target.result, name: 'голосовое_сообщение.wav', type: actualType };
               
-              // Показываем в панели предпросмотра (как файл/фото)
               const previewContainer = document.getElementById('attachment-preview-container');
               document.getElementById('attachment-thumb-img').style.display = 'none';
               document.getElementById('attachment-name-label').innerText = 'Голосовое сообщение';
@@ -1218,14 +1230,14 @@ app.get('*', (req, res) => {
       if (isVideo) {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
-        tempDiv.innerHTML = \`
-          \${text ? '<div>' + text + '</div>' : ''}
+        tempDiv.innerHTML = `
+          ${text ? '<div>' + text + '</div>' : ''}
           <div class="uploading-box">
             <div class="spinner"></div>
-            <div>Загрузка видео... (\${fileToSend.name})</div>
+            <div>Загрузка видео... (${fileToSend.name})</div>
           </div>
           <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
-        \`;
+        `;
         container.appendChild(tempDiv);
         container.scrollTop = container.scrollHeight;
       }
