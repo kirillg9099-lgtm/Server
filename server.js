@@ -114,13 +114,15 @@ app.post('/api/register', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Пинг и синхронизация кэша
+// Глобальный пинг, синхронизация аккаунтов и бэкап информации
 app.post('/api/ping', (req, res) => {
-  const { id, name, avatar, contacts, knownUsers } = req.body;
+  const { id, name, avatar, contacts, knownUsers, syncMessages } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
 
   const accounts = readAccounts();
-  
+  const serverMessages = readMessages();
+
+  // Принимаем информацию о пользователях со всех клиентов и агрегируем
   if (Array.isArray(knownUsers)) {
     knownUsers.forEach(kUser => {
       if (!kUser.id) return;
@@ -136,6 +138,29 @@ app.post('/api/ping', (req, res) => {
         });
       }
     });
+  }
+
+  // Синхронизация сообщений с клиентом для максимальной сохранности чата
+  if (Array.isArray(syncMessages)) {
+    let msgChanged = false;
+    syncMessages.forEach(clientMsg => {
+      if (clientMsg && clientMsg.id && !serverMessages.some(m => m.id === clientMsg.id)) {
+        serverMessages.push({
+          id: clientMsg.id,
+          senderId: clientMsg.senderId,
+          receiverId: clientMsg.receiverId,
+          text: encryptText(clientMsg.text || ''),
+          fileData: clientMsg.fileData || '',
+          fileName: clientMsg.fileName || '',
+          fileType: clientMsg.fileType || '',
+          timestamp: clientMsg.timestamp || ''
+        });
+        msgChanged = true;
+      }
+    });
+    if (msgChanged) {
+      writeMessages(serverMessages);
+    }
   }
 
   let user = accounts.find(u => u.id === id);
@@ -224,7 +249,7 @@ app.get('/api/users/search', (req, res) => {
   res.json(results);
 });
 
-// Отправка сообщений с проверкой блоков
+// Отправка сообщений
 app.post('/api/messages/send', (req, res) => {
   const { senderId, receiverId, text, fileData, fileName, fileType } = req.body;
   const accounts = readAccounts();
@@ -270,7 +295,7 @@ app.post('/api/messages/send', (req, res) => {
   }
   if (updated) writeAccounts(accounts);
 
-  res.json({ success: true });
+  res.json({ success: true, message: { ...newMsg, text: text } });
 });
 
 // Удаление сообщения
@@ -384,10 +409,11 @@ app.get('*', (req, res) => {
     .user-profile-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px; cursor: pointer; }
     .user-info-brief { display: flex; flex-direction: column; overflow: hidden; margin-left: 10px; flex: 1; }
     
-    .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; overflow: hidden; position: relative; }
-    .avatar-circle img { width: 100%; height: 100%; object-fit: cover; }
+    .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; overflow: visible !important; position: relative; }
+    .avatar-circle img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
 
-    .online-indicator { position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; }
+    /* Исправление индикатора: вынесен поверх всех рамок и границ аватара */
+    .online-indicator { position: absolute; bottom: -1px; right: -1px; width: 12px; height: 12px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; z-index: 10; pointer-events: none; }
     .online-indicator.visible { display: block; }
 
     .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
@@ -436,8 +462,8 @@ app.get('*', (req, res) => {
     .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: none; align-items: center; justify-content: center; }
     .modal-overlay.active { display: flex; }
     .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); position: relative; }
-    .profile-avatar-big { width: 90px; height: 90px; border-radius: 50%; object-fit: cover; background: var(--accent); margin-bottom: 15px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 32px; font-weight: bold; overflow: hidden; position: relative; }
-    .profile-avatar-big img { width: 100%; height: 100%; object-fit: cover; }
+    .profile-avatar-big { width: 90px; height: 90px; border-radius: 50%; object-fit: cover; background: var(--accent); margin-bottom: 15px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 32px; font-weight: bold; overflow: visible !important; position: relative; }
+    .profile-avatar-big img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
     .profile-name { font-size: 20px; font-weight: bold; margin-bottom: 5px; }
     .profile-id { font-size: 13px; color: var(--accent); margin-bottom: 20px; }
     .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
@@ -545,7 +571,9 @@ app.get('*', (req, res) => {
   <!-- Модальное окно своего профиля -->
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
-      <div class="profile-avatar-big" id="my-profile-avatar-view"></div>
+      <div class="profile-avatar-big" id="my-profile-avatar-view">
+        <div class="online-indicator visible" style="width:16px; height:16px; bottom:2px; right:2px;"></div>
+      </div>
       <div class="profile-name" id="my-profile-name-view">Имя</div>
       <div class="profile-id" id="my-profile-id-view">ID</div>
       
@@ -567,7 +595,9 @@ app.get('*', (req, res) => {
   <!-- Модальное окно профиля собеседника -->
   <div class="modal-overlay" id="peer-profile-modal">
     <div class="profile-card">
-      <div class="profile-avatar-big" id="peer-profile-avatar-view"></div>
+      <div class="profile-avatar-big" id="peer-profile-avatar-view">
+        <div class="online-indicator" id="peer-profile-indicator" style="width:16px; height:16px; bottom:2px; right:2px;"></div>
+      </div>
       <div class="profile-name" id="peer-profile-name-view">Имя</div>
       <div class="profile-id" id="peer-profile-id-view">ID</div>
       
@@ -612,11 +642,13 @@ app.get('*', (req, res) => {
     let localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}');
     let mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]');
 
+    // Локальный кэш всех сообщений для защиты от потери при перезагрузке
+    let localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]');
+
     const savedTheme = localStorage.getItem('app_theme') || 'dark';
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
 
-    // Синтезатор звука уведомления (Web Audio API)
     function playNotificationSound() {
       try {
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -624,8 +656,8 @@ app.get('*', (req, res) => {
         const gain = audioCtx.createGain();
         
         osc.type = 'sine';
-        osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // Нота D5
-        osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.08); // Нота A5
+        osc.frequency.setValueAtTime(587.33, audioCtx.currentTime);
+        osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.08);
         
         gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
@@ -664,10 +696,8 @@ app.get('*', (req, res) => {
     function renderAvatarIntoElement(el, userObj, isOnline) {
       if (!el) return;
       
-      // Сохраняем индикатор сети, если он есть внутри элемента
       const indicator = el.querySelector('.online-indicator');
       
-      // Удаляем старое изображение/текст, но оставляем индикатор
       Array.from(el.childNodes).forEach(node => {
         if (node !== indicator) el.removeChild(node);
       });
@@ -765,7 +795,8 @@ app.get('*', (req, res) => {
             name: currentUser.name,
             avatar: currentUser.avatar || '',
             contacts: currentUser.contacts || [],
-            knownUsers: knownList
+            knownUsers: knownList,
+            syncMessages: localMessagesCache
           })
         });
         const data = await res.json();
@@ -808,6 +839,20 @@ app.get('*', (req, res) => {
       localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers));
     }
 
+    function saveMessagesToLocalCache(messages) {
+      if (!Array.isArray(messages)) return;
+      messages.forEach(msg => {
+        if (!localMessagesCache.some(m => m.id === msg.id)) {
+          localMessagesCache.push(msg);
+        }
+      });
+      // Ограничим кэш последними 500 сообщениями для стабильности localStorage
+      if (localMessagesCache.length > 500) {
+        localMessagesCache = localMessagesCache.slice(-500);
+      }
+      localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+    }
+
     function openMyProfile() {
       document.getElementById('edit-my-name-input').value = currentUser.name;
       renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
@@ -830,7 +875,7 @@ app.get('*', (req, res) => {
 
     function triggerAvatarInput() {
       const input = document.getElementById('avatar-file-input');
-      input.value = ''; // Всегда позволяет выбрать файл заново без багов
+      input.value = '';
       input.click();
     }
 
@@ -1061,8 +1106,16 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
+        saveMessagesToLocalCache(messages);
         renderMessagesContainer(messages);
-      } catch(e) {}
+      } catch(e) {
+        // Резервное восстановление из локального кэша при сбое сети
+        const cached = localMessagesCache.filter(m => 
+          (m.senderId === currentUser.id && m.receiverId === activePeer.id) ||
+          (m.senderId === activePeer.id && m.receiverId === currentUser.id)
+        );
+        renderMessagesContainer(cached);
+      }
     }
 
     async function loadMessagesQuiet() {
@@ -1070,13 +1123,13 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
+        saveMessagesToLocalCache(messages);
         
         const currentHash = JSON.stringify(messages.map(m => m.id));
         if (currentHash !== lastMessagesHash) {
           if (messages.length > 0) {
             const lastMsg = messages[messages.length - 1];
             if (lastMsg.senderId === activePeer.id && lastMessagesHash !== '') {
-              // Воспроизводим звуковой сигнал, если не отключено
               if (!mutedPeers.includes(activePeer.id)) {
                 playNotificationSound();
               }
@@ -1206,6 +1259,9 @@ app.get('*', (req, res) => {
       if (!selectedMsgId) return;
       try {
         await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
+        localMessagesCache = localMessagesCache.filter(m => m.id !== selectedMsgId);
+        localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+        
         closeMsgActions();
         lastMessagesHash = '';
         loadMessages();
@@ -1359,6 +1415,11 @@ app.get('*', (req, res) => {
 
         if (res.status === 403) {
           alert('Сообщение не доставлено: чат заблокирован.');
+        } else if (res.ok) {
+          const data = await res.json();
+          if (data.message) {
+            saveMessagesToLocalCache([data.message]);
+          }
         }
 
         if (tempDiv) tempDiv.remove();
