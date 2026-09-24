@@ -190,7 +190,7 @@ app.post('/api/messages/send', (req, res) => {
   }
   if (updated) writeAccounts(accounts);
 
-  res.json({ success: true });
+  res.json({ success: true, msgId: newMsg.id });
 });
 
 // Удаление сообщения
@@ -318,8 +318,20 @@ app.get('*', (req, res) => {
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
     
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; cursor: pointer; background: #000; }
-    .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; }
+    .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
+
+    /* Превью прикрепленного файла перед отправкой (как в ТГ) */
+    .attachment-preview-container { background: var(--bg-sidebar); padding: 10px 15px; border-top: 1px solid var(--border); display: none; align-items: center; gap: 12px; }
+    .attachment-preview-container.active { display: flex; }
+    .attachment-thumb { width: 45px; height: 45px; border-radius: 6px; object-fit: cover; background: #000; }
+    .attachment-info { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    .attachment-name { font-size: 13px; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .attachment-cancel { cursor: pointer; color: #e53935; font-size: 18px; padding: 5px; }
+
+    .uploading-box { display: flex; align-items: center; gap: 10px; padding: 8px; background: rgba(0,0,0,0.15); border-radius: 8px; margin-top: 5px; font-size: 13px; }
+    .spinner { width: 16px; height: 16px; border: 2px solid var(--accent); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 
     .input-bar { background: var(--bg-sidebar); padding: 10px; display: flex; gap: 10px; align-items: center; flex-shrink: 0; border-top: 1px solid var(--border); }
     .input-bar input[type="text"] { flex: 1; padding: 12px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; }
@@ -386,6 +398,16 @@ app.get('*', (req, res) => {
 
         <div class="messages-container" id="messages-container">
           <div class="empty-state">Выберите диалог слева или найдите пользователя в поиске</div>
+        </div>
+
+        <!-- Блок предпросмотра прикрепленного файла -->
+        <div class="attachment-preview-container" id="attachment-preview-container">
+          <img id="attachment-thumb-img" class="attachment-thumb" src="" alt="">
+          <div class="attachment-info">
+            <div class="attachment-name" id="attachment-name-label">файл</div>
+            <div style="font-size:11px; color:var(--text-muted);" id="attachment-type-label">Готово к отправке</div>
+          </div>
+          <span class="attachment-cancel" onclick="cancelAttachment()" title="Отменить">✕</span>
         </div>
 
         <div class="input-bar" id="input-bar" style="display:none;">
@@ -665,23 +687,6 @@ app.get('*', (req, res) => {
       document.getElementById('msg-actions-sheet').classList.remove('active');
     }
 
-    async function deleteSelectedMessage() {
-      if (!selectedMsgId) return;
-      try {
-        const res = await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
-        const data = await res.json();
-        if (data.success) {
-          closeMsgActions();
-          lastMessagesHash = '';
-          loadMessages();
-        } else {
-          alert('Ошибка при удалении.');
-        }
-      } catch(e) {
-        alert('Не удалось удалить сообщение.');
-      }
-    }
-
     function triggerFileInput() {
       document.getElementById('file-input').click();
     }
@@ -692,9 +697,36 @@ app.get('*', (req, res) => {
       const reader = new FileReader();
       reader.onload = function(evt) {
         selectedFile = { data: evt.target.result, name: file.name, type: file.type };
-        alert('Файл прикреплен: ' + file.name);
+        
+        // Показываем превью над инпутом в стиле Telegram
+        const previewContainer = document.getElementById('attachment-preview-container');
+        const thumbImg = document.getElementById('attachment-thumb-img');
+        const nameLabel = document.getElementById('attachment-name-label');
+        const typeLabel = document.getElementById('attachment-type-label');
+
+        nameLabel.innerText = file.name;
+        if (file.type.startsWith('image/')) {
+          thumbImg.src = evt.target.result;
+          thumbImg.style.display = 'block';
+          typeLabel.innerText = 'Фото';
+        } else if (file.type.startsWith('video/')) {
+          thumbImg.src = '';
+          thumbImg.style.display = 'none';
+          typeLabel.innerText = 'Видео';
+        } else {
+          thumbImg.src = '';
+          thumbImg.style.display = 'none';
+          typeLabel.innerText = 'Файл';
+        }
+        previewContainer.classList.add('active');
       };
       reader.readAsDataURL(file);
+    }
+
+    function cancelAttachment() {
+      selectedFile = null;
+      document.getElementById('file-input').value = '';
+      document.getElementById('attachment-preview-container').classList.remove('active');
     }
 
     function getSupportedMimeType() {
@@ -755,15 +787,41 @@ app.get('*', (req, res) => {
       if (!activePeer) return;
       const input = document.getElementById('msg-input');
       const text = input.value.trim();
-      if (!text && !selectedFile) return;
+      const fileToSend = selectedFile;
+
+      if (!text && !fileToSend) return;
+
+      // Сразу очищаем поле ввода и закрываем превью, чтобы пользователь мог отправлять дальше
+      input.value = '';
+      cancelAttachment();
+
+      const isVideo = fileToSend && fileToSend.type && fileToSend.type.startsWith('video/');
+      const container = document.getElementById('messages-container');
+      
+      let tempDiv = null;
+      if (isVideo) {
+        // Создаем временный блок "Загрузка видео..."
+        tempDiv = document.createElement('div');
+        tempDiv.className = 'msg my';
+        tempDiv.innerHTML = \`
+          \${text ? '<div>' + text + '</div>' : ''}
+          <div class="uploading-box">
+            <div class="spinner"></div>
+            <div>Загрузка видео... (\${fileToSend.name})</div>
+          </div>
+          <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
+        \`;
+        container.appendChild(tempDiv);
+        container.scrollTop = container.scrollHeight;
+      }
 
       const body = {
         senderId: currentUser.id,
         receiverId: activePeer.id,
         text: text,
-        fileData: selectedFile ? selectedFile.data : '',
-        fileName: selectedFile ? selectedFile.name : '',
-        fileType: selectedFile ? selectedFile.type : ''
+        fileData: fileToSend ? fileToSend.data : '',
+        fileName: fileToSend ? fileToSend.name : '',
+        fileType: fileToSend ? fileToSend.type : ''
       };
 
       try {
@@ -773,14 +831,12 @@ app.get('*', (req, res) => {
           body: JSON.stringify(body)
         });
 
-        input.value = '';
-        selectedFile = null;
-        document.getElementById('file-input').value = '';
-        
+        if (tempDiv) tempDiv.remove();
         lastMessagesHash = '';
         loadMessages();
         loadDialogs();
       } catch(e) {
+        if (tempDiv) tempDiv.remove();
         alert('Не удалось отправить сообщение.');
       }
     }
