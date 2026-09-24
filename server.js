@@ -15,7 +15,7 @@ process.on('unhandledRejection', (reason) => {
 // Хранилища в памяти
 const accounts = [];
 const messages = [];
-const userStatus = {}; // Хранение статусов печати/отправки { userId: { isTyping: true, statusText: 'печатает...' } }
+const userStatus = {}; 
 const SECRET_SHIFT = 7;
 
 function encryptData(text) {
@@ -108,7 +108,6 @@ app.post('/api/messages/send', (req, res) => {
     }
   }
 
-  // Очищаем статус отправки/печати при отправке
   if (userStatus[senderId]) {
     userStatus[senderId] = { isTyping: false, text: '' };
   }
@@ -158,7 +157,6 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
-// Эндпоинт для статуса печати/отправки файла
 app.post('/api/status', (req, res) => {
   const { userId, isTyping, statusText } = req.body;
   if (userId) {
@@ -198,15 +196,16 @@ app.get('/', (req, res) => {
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; -webkit-tap-highlight-color: transparent; }
     html, body { height: 100dvh; width: 100vw; background: var(--bg-app); color: var(--text-main); overflow: hidden; position: fixed; top: 0; left: 0; }
 
-    .screen { display: none; height: 100%; width: 100%; position: absolute; top: 0; left: 0; }
+    .screen { display: none; height: 100%; width: 100%; position: absolute; top: 0; left: 0; align-items: center; justify-content: center; }
     .active { display: flex; }
 
-    .auth-container { margin: auto; width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; }
-    .auth-container h2 { margin-bottom: 20px; text-align: center; color: var(--accent); }
+    /* Увеличенный интерфейс входа на телефонах */
+    .auth-container { width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+    .auth-container h2 { margin-bottom: 20px; text-align: center; color: var(--accent); font-size: 22px; }
     .input-group { margin-bottom: 15px; }
-    .input-group label { display: block; margin-bottom: 5px; font-size: 13px; color: var(--text-muted); }
-    .input-group input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; }
-    .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
+    .input-group label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-muted); }
+    .input-group input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; font-size: 15px; }
+    .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 15px; }
     .btn-danger { background: #e53935; color: #fff; }
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
 
@@ -238,7 +237,6 @@ app.get('/', (req, res) => {
     .video-preview { width: 240px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
-    /* Превью прикрепленного файла над строкой ввода (как в Телеграм) */
     .file-preview-bar { background: var(--bg-sidebar); border-top: 1px solid var(--border); padding: 8px 12px; display: none; align-items: center; gap: 10px; }
     .file-preview-bar.active { display: flex; }
     .preview-thumb { width: 36px; height: 36px; object-fit: cover; border-radius: 4px; background: #000; }
@@ -253,6 +251,25 @@ app.get('/', (req, res) => {
     .msg-actions-sheet.active { display: flex; }
 
     @media (max-width: 600px) {
+      /* Чуть крупнее элементы входа именно на телефонах */
+      .auth-container {
+        width: 92%;
+        max-width: none;
+        padding: 30px 22px;
+      }
+      .auth-container h2 {
+        font-size: 26px;
+        margin-bottom: 22px;
+      }
+      .auth-container .input-group input {
+        padding: 15px;
+        font-size: 16px;
+      }
+      .auth-container .btn {
+        padding: 15px;
+        font-size: 16px;
+      }
+
       #app-container { flex-direction: column; }
       .sidebar { width: 100%; height: 100%; }
       .main-chat { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; display: none; }
@@ -302,7 +319,6 @@ app.get('/', (req, res) => {
         
         <div class="messages-container" id="messages-container"></div>
 
-        <!-- Превью файла над строкой ввода (Telegram-стиль) -->
         <div class="file-preview-bar" id="file-preview-bar">
           <img id="preview-thumb" class="preview-thumb" src="" style="display:none;">
           <div class="preview-info" id="preview-name">Файл выбран</div>
@@ -332,7 +348,7 @@ app.get('/', (req, res) => {
     var currentUser = null;
     var activePeer = null;
     var selectedFile = null;
-    var isSending = false; // Блокировка от двойной отправки
+    var isSending = false;
 
     var mediaRecorder = null;
     var audioChunks = [];
@@ -343,7 +359,8 @@ app.get('/', (req, res) => {
     var typingTimer = null;
 
     async function handleGuestLogin() {
-      var val = document.getElementById('auth-name').value.trim();
+      var inputEl = document.getElementById('auth-name');
+      var val = inputEl ? inputEl.value.trim() : '';
       try {
         var res = await fetch('/api/guest', {
           method: 'POST',
@@ -371,6 +388,16 @@ app.get('/', (req, res) => {
         }
       } catch (e) { alert('Ошибка входа'); }
     }
+
+    // Поддержка нажатия Enter для входа
+    document.addEventListener('DOMContentLoaded', function() {
+      var inputEl = document.getElementById('auth-name');
+      if (inputEl) {
+        inputEl.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') handleGuestLogin();
+        });
+      }
+    });
 
     async function loadDialogs() {
       if (!currentUser) return;
@@ -485,7 +512,6 @@ app.get('/', (req, res) => {
 
     function onInputTyping() {
       if (!currentUser) return;
-      var textInput = document.getElementById('msg-input').value;
       var statusText = selectedFile ? 'отправляет файл...' : 'печатает...';
       
       fetch('/api/status', {
@@ -537,7 +563,6 @@ app.get('/', (req, res) => {
       reader.onload = function(evt) {
         selectedFile = { data: evt.target.result, name: file.name, type: file.type };
         
-        // Показываем превью над строкой ввода (как в Телеграм)
         var previewBar = document.getElementById('file-preview-bar');
         var thumb = document.getElementById('preview-thumb');
         var nameEl = document.getElementById('preview-name');
@@ -600,7 +625,7 @@ app.get('/', (req, res) => {
     }
 
     async function sendMsg() {
-      if (isSending) return; // Защита от дубликатов/двойных нажатий
+      if (isSending) return;
       
       var input = document.getElementById('msg-input');
       var text = input.value.trim();
@@ -617,7 +642,6 @@ app.get('/', (req, res) => {
         fileType: selectedFile ? selectedFile.type : ''
       };
 
-      // Сбрасываем поля ввода и превью СРАЗУ, чтобы избежать повторной отправки
       input.value = '';
       clearSelectedFile();
 
