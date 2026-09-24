@@ -199,7 +199,6 @@ app.get('/', (req, res) => {
     .screen { display: none; height: 100%; width: 100%; position: fixed; top: 0; left: 0; align-items: center; justify-content: center; z-index: 100; background: var(--bg-app); }
     .screen.active { display: flex; }
 
-    /* Увеличенный интерфейс входа на телефонах */
     .auth-container { width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 101; }
     .auth-container h2 { margin-bottom: 20px; text-align: center; color: var(--accent); font-size: 22px; }
     .input-group { margin-bottom: 15px; }
@@ -683,4 +682,4 @@ app.get('/', (req, res) => {
   `);
 });
 
-app.listen(PORT, () => console.log(`[СЕРВЕР ЗАПУЩЕН] Порт: `${PORT}));
+app.listen(PORT, () => console.log(`[СЕРВЕР ЗАПУЩЕН] Порт: ${PORT}`));
