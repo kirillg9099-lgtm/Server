@@ -12,7 +12,6 @@ process.on('unhandledRejection', (reason) => {
   console.error('[ОШИБКА ПРОМИСА]:', reason);
 });
 
-// Хранилища в памяти
 const accounts = [];
 const messages = [];
 const userStatus = {}; 
@@ -46,8 +45,6 @@ function decryptData(text) {
   } catch (e) {}
   return String(text);
 }
-
-// --- API МАРШРУТЫ ---
 
 app.post('/api/guest', (req, res) => {
   try {
@@ -170,7 +167,6 @@ app.get('/api/status/:peerId', (req, res) => {
   res.json(userStatus[peerId] || { isTyping: false, statusText: '' });
 });
 
-// --- ВЕБ-ИНТЕРФЕЙС ---
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -196,19 +192,22 @@ app.get('/', (req, res) => {
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; -webkit-tap-highlight-color: transparent; }
     html, body { height: 100%; width: 100%; background: var(--bg-app); color: var(--text-main); overflow: hidden; }
 
-    .screen { display: none; height: 100%; width: 100%; position: fixed; top: 0; left: 0; align-items: center; justify-content: center; z-index: 100; background: var(--bg-app); }
-    .screen.active { display: flex; }
+    .screen { display: none; height: 100%; width: 100%; position: absolute; top: 0; left: 0; align-items: center; justify-content: center; background: var(--bg-app); }
+    .screen.active { display: flex; z-index: 100; }
 
-    .auth-container { width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 101; }
-    .auth-container h2 { margin-bottom: 20px; text-align: center; color: var(--accent); font-size: 22px; }
-    .input-group { margin-bottom: 15px; }
-    .input-group label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-muted); }
-    .input-group input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; font-size: 15px; }
-    .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 15px; }
+    .auth-box { width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+    .auth-box h2 { margin-bottom: 20px; text-align: center; color: var(--accent); font-size: 24px; }
+    .field-group { margin-bottom: 15px; }
+    .field-group label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-muted); }
+    .field-group input { width: 100%; padding: 14px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; font-size: 16px; }
+    
+    .action-btn { width: 100%; padding: 14px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; font-size: 16px; cursor: pointer; text-align: center; }
+    .action-btn:active { opacity: 0.8; }
+
     .btn-danger { background: #e53935; color: #fff; }
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
 
-    #app-screen { z-index: 10; }
+    #app-screen { z-index: 50; }
     #app-container { display: flex; width: 100%; height: 100%; position: relative; }
     .sidebar { width: 320px; min-width: 260px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
@@ -251,24 +250,6 @@ app.get('/', (req, res) => {
     .msg-actions-sheet.active { display: flex; }
 
     @media (max-width: 600px) {
-      .auth-container {
-        width: 92%;
-        max-width: none;
-        padding: 30px 22px;
-      }
-      .auth-container h2 {
-        font-size: 26px;
-        margin-bottom: 22px;
-      }
-      .auth-container .input-group input {
-        padding: 15px;
-        font-size: 16px;
-      }
-      .auth-container .btn {
-        padding: 15px;
-        font-size: 16px;
-      }
-
       #app-container { flex-direction: column; }
       .sidebar { width: 100%; height: 100%; }
       .main-chat { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; display: none; }
@@ -279,13 +260,13 @@ app.get('/', (req, res) => {
 <body>
 
   <div id="auth-screen" class="screen active">
-    <div class="auth-container">
+    <div class="auth-box">
       <h2>Вход</h2>
-      <div class="input-group">
-        <label>Имя</label>
-        <input type="text" id="auth-name" placeholder="Ваше имя">
+      <div class="field-group">
+        <label>Ваше имя</label>
+        <input type="text" id="auth-name-input" placeholder="Введите имя...">
       </div>
-      <button class="btn" id="login-btn">Войти</button>
+      <button type="button" class="action-btn" id="login-action-btn">Войти</button>
     </div>
   </div>
 
@@ -331,7 +312,7 @@ app.get('/', (req, res) => {
             
             <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
             <input type="text" id="msg-input" placeholder="Сообщение..." oninput="onInputTyping()" onkeydown="if(event.key==='Enter') sendMsg()">
-            <button class="btn" style="width:auto; padding:8px 14px;" onclick="sendMsg()">➤</button>
+            <button class="action-btn" style="width:auto; padding:8px 14px;" onclick="sendMsg()">➤</button>
           </div>
         </div>
       </div>
@@ -339,8 +320,8 @@ app.get('/', (req, res) => {
   </div>
 
   <div class="msg-actions-sheet" id="msg-actions-sheet">
-    <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
-    <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
+    <button class="action-btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
+    <button class="action-btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
 
   <script>
@@ -358,17 +339,19 @@ app.get('/', (req, res) => {
     var typingTimer = null;
     var globalInterval = null;
 
-    async function handleGuestLogin() {
-      var inputEl = document.getElementById('auth-name');
-      var val = inputEl ? inputEl.value.trim() : '';
+    async function executeLogin() {
+      var nameInput = document.getElementById('auth-name-input');
+      var nameVal = nameInput ? nameInput.value.trim() : '';
+
       try {
-        var res = await fetch('/api/guest', {
+        var response = await fetch('/api/guest', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ name: val })
+          body: JSON.stringify({ name: nameVal })
         });
-        var data = await res.json();
-        if (data && data.user) {
+        var data = await response.json();
+        
+        if (data && data.success && data.user) {
           currentUser = data.user;
           document.getElementById('auth-screen').classList.remove('active');
           document.getElementById('app-screen').classList.add('active');
@@ -386,28 +369,36 @@ app.get('/', (req, res) => {
               }
             }
           }, 1500);
+        } else {
+          alert('Не удалось войти');
         }
-      } catch (e) { alert('Ошибка входа'); }
+      } catch (err) {
+        alert('Ошибка соединения с сервером');
+      }
     }
 
-    document.addEventListener('DOMContentLoaded', function() {
-      var inputEl = document.getElementById('auth-name');
-      var loginBtn = document.getElementById('login-btn');
-
-      if (inputEl) {
-        inputEl.addEventListener('keydown', function(e) {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            handleGuestLogin();
-          }
-        });
-      }
+    window.addEventListener('DOMContentLoaded', function() {
+      var loginBtn = document.getElementById('login-action-btn');
+      var nameInput = document.getElementById('auth-name-input');
 
       if (loginBtn) {
-        loginBtn.addEventListener('click', handleGuestLogin);
+        // Обработка обычного клика и тач-события для мгновенного отклика на мобильных
+        loginBtn.addEventListener('click', function(e) {
+          e.preventDefault();
+          executeLogin();
+        });
         loginBtn.addEventListener('touchend', function(e) {
           e.preventDefault();
-          handleGuestLogin();
+          executeLogin();
+        }, { passive: false });
+      }
+
+      if (nameInput) {
+        nameInput.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            executeLogin();
+          }
         });
       }
     });
