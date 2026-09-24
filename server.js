@@ -382,7 +382,6 @@ app.get('/', (req, res) => {
       var nameInput = document.getElementById('auth-name-input');
 
       if (loginBtn) {
-        // Обработка обычного клика и тач-события для мгновенного отклика на мобильных
         loginBtn.addEventListener('click', function(e) {
           e.preventDefault();
           executeLogin();
