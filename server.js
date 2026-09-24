@@ -194,13 +194,13 @@ app.get('/', (req, res) => {
       --modal-bg: #17212b;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; -webkit-tap-highlight-color: transparent; }
-    html, body { height: 100dvh; width: 100vw; background: var(--bg-app); color: var(--text-main); overflow: hidden; position: fixed; top: 0; left: 0; }
+    html, body { height: 100%; width: 100%; background: var(--bg-app); color: var(--text-main); overflow: hidden; }
 
-    .screen { display: none; height: 100%; width: 100%; position: absolute; top: 0; left: 0; align-items: center; justify-content: center; }
-    .active { display: flex; }
+    .screen { display: none; height: 100%; width: 100%; position: fixed; top: 0; left: 0; align-items: center; justify-content: center; z-index: 100; background: var(--bg-app); }
+    .screen.active { display: flex; }
 
     /* Увеличенный интерфейс входа на телефонах */
-    .auth-container { width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+    .auth-container { width: 90%; max-width: 340px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 101; }
     .auth-container h2 { margin-bottom: 20px; text-align: center; color: var(--accent); font-size: 22px; }
     .input-group { margin-bottom: 15px; }
     .input-group label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-muted); }
@@ -209,6 +209,7 @@ app.get('/', (req, res) => {
     .btn-danger { background: #e53935; color: #fff; }
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
 
+    #app-screen { z-index: 10; }
     #app-container { display: flex; width: 100%; height: 100%; position: relative; }
     .sidebar { width: 320px; min-width: 260px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; height: 100%; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
@@ -285,7 +286,7 @@ app.get('/', (req, res) => {
         <label>Имя</label>
         <input type="text" id="auth-name" placeholder="Ваше имя">
       </div>
-      <button class="btn" onclick="handleGuestLogin()">Войти</button>
+      <button class="btn" id="login-btn">Войти</button>
     </div>
   </div>
 
@@ -392,12 +393,22 @@ app.get('/', (req, res) => {
 
     document.addEventListener('DOMContentLoaded', function() {
       var inputEl = document.getElementById('auth-name');
+      var loginBtn = document.getElementById('login-btn');
+
       if (inputEl) {
         inputEl.addEventListener('keydown', function(e) {
           if (e.key === 'Enter') {
             e.preventDefault();
             handleGuestLogin();
           }
+        });
+      }
+
+      if (loginBtn) {
+        loginBtn.addEventListener('click', handleGuestLogin);
+        loginBtn.addEventListener('touchend', function(e) {
+          e.preventDefault();
+          handleGuestLogin();
         });
       }
     });
@@ -672,4 +683,4 @@ app.get('/', (req, res) => {
   `);
 });
 
-app.listen(PORT, () => console.log(`[СЕРВЕР ЗАПУЩЕН] Порт: ${PORT}`));
+app.listen(PORT, () => console.log(`[СЕРВЕР ЗАПУЩЕН] Порт: `${PORT}));
