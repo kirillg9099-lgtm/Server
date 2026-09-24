@@ -76,65 +76,143 @@ function decryptText(text) {
   return text;
 }
 
-// Регистрация или восстановление/подтверждение активности аккаунта
+// Регистрация с проверкой коллизий ID
 app.post('/api/register', (req, res) => {
-  const { id, name, contacts } = req.body;
+  let { id, name, avatar, contacts } = req.body;
   const accounts = readAccounts();
-
-  if (id) {
-    let existing = accounts.find(u => u.id === id);
-    if (existing) {
-      existing.updatedAt = Date.now();
-      if (name) existing.name = name.trim();
-      if (Array.isArray(contacts)) {
-        existing.contacts = Array.from(new Set([...(existing.contacts || []), ...contacts]));
-      }
-      writeAccounts(accounts);
-      return res.json({ success: true, user: existing });
-    }
-  }
 
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'Введите имя' });
   }
 
-  const newAccount = {
-    id: id || ('id_' + Math.random().toString(36).substr(2, 9)),
-    name: name.trim(),
-    contacts: Array.isArray(contacts) ? contacts : [],
-    updatedAt: Date.now()
-  };
+  // Проверка на коллизию ID (если ID занят другим пользователем с другим именем/сессией)
+  if (id) {
+    const existingIndex = accounts.findIndex(u => u.id === id);
+    if (existingIndex !== -1) {
+      // Если ID занят, но это другой пользователь (например, совпал рандом), меняем ID для нового
+      // Проверяем по совпадению: если имя сильно отличается и это не тот же девайс, даем новый ID
+      // Для простоты: если ID уже есть, но регистрируется новый клиент, проверим, не занят ли он.
+    }
+  }
 
-  accounts.push(newAccount);
+  let finalId = id;
+  if (!finalId || accounts.some(u => u.id === finalId && u.name !== name.trim())) {
+    finalId = 'id_' + Math.random().toString(36).substr(2, 9);
+  }
+
+  let user = accounts.find(u => u.id === finalId);
+  if (user) {
+    user.name = name.trim();
+    if (avatar !== undefined) user.avatar = avatar;
+    user.updatedAt = Date.now();
+    if (Array.isArray(contacts)) {
+      user.contacts = Array.from(new Set([...(user.contacts || []), ...contacts]));
+    }
+  } else {
+    user = {
+      id: finalId,
+      name: name.trim(),
+      avatar: avatar || '',
+      contacts: Array.isArray(contacts) ? contacts : [],
+      blockedContacts: [],
+      updatedAt: Date.now()
+    };
+    accounts.push(user);
+  }
+
   writeAccounts(accounts);
-  res.json({ success: true, user: newAccount });
+  res.json({ success: true, user });
 });
 
-// Пинг для поддержания пользователя живым в списках после перезагрузки сервера
+// Пинг для поддержания активности и синхронизации кэшированных данных/профиля
 app.post('/api/ping', (req, res) => {
-  const { id, contacts } = req.body;
+  const { id, name, avatar, contacts, knownUsers } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
 
   const accounts = readAccounts();
-  let user = accounts.find(u => u.id === id);
+  
+  // Синхронизация кэшированных пользователей с сервера
+  if (Array.isArray(knownUsers)) {
+    knownUsers.forEach(kUser => {
+      if (!kUser.id) return;
+      let acc = accounts.find(a => a.id === kUser.id);
+      if (!acc) {
+        accounts.push({
+          id: kUser.id,
+          name: kUser.name || 'Пользователь',
+          avatar: kUser.avatar || '',
+          contacts: [],
+          blockedContacts: [],
+          updatedAt: Date.now()
+        });
+      }
+    });
+  }
 
+  let user = accounts.find(u => u.id === id);
   if (!user) {
-    // Если сервер сбросился, но у клиента остался профиль — восстанавливаем его на сервере
     user = {
       id,
-      name: req.body.name || 'Пользователь',
+      name: name || 'Пользователь',
+      avatar: avatar || '',
       contacts: Array.isArray(contacts) ? contacts : [],
+      blockedContacts: [],
       updatedAt: Date.now()
     };
     accounts.push(user);
   } else {
     user.updatedAt = Date.now();
+    if (name) user.name = name;
+    if (avatar !== undefined) user.avatar = avatar;
     if (Array.isArray(contacts)) {
       user.contacts = Array.from(new Set([...(user.contacts || []), ...contacts]));
     }
   }
+
   writeAccounts(accounts);
-  res.json({ success: true });
+  res.json({ success: true, user });
+});
+
+// Обновление профиля
+app.post('/api/profile/update', (req, res) => {
+  const { id, name, avatar } = req.body;
+  const accounts = readAccounts();
+  let user = accounts.find(u => u.id === id);
+
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+
+  if (name && name.trim()) user.name = name.trim();
+  if (avatar !== undefined) user.avatar = avatar;
+  user.updatedAt = Date.now();
+
+  writeAccounts(accounts);
+  res.json({ success: true, user });
+});
+
+// Получение информации о пользователе (для профиля)
+app.get('/api/users/:userId', (req, res) => {
+  const accounts = readAccounts();
+  const user = accounts.find(u => u.id === req.params.userId);
+  if (!user) return res.status(404).json({ error: 'Не найден' });
+  res.json({ id: user.id, name: user.name, avatar: user.avatar || '' });
+});
+
+// Блокировка/разблокировка чата с пользователем
+app.post('/api/users/block', (req, res) => {
+  const { userId, peerId, block } = req.body;
+  const accounts = readAccounts();
+  let user = accounts.find(u => u.id === userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  if (!user.blockedContacts) user.blockedContacts = [];
+  if (block) {
+    if (!user.blockedContacts.includes(peerId)) user.blockedContacts.push(peerId);
+  } else {
+    user.blockedContacts = user.blockedContacts.filter(id => id !== peerId);
+  }
+
+  writeAccounts(accounts);
+  res.json({ success: true, blockedContacts: user.blockedContacts });
 });
 
 // Поиск аккаунтов
@@ -145,7 +223,7 @@ app.get('/api/users/search', (req, res) => {
   const accounts = readAccounts();
   const results = accounts.filter(u => {
     return (u.id && u.id.toLowerCase().includes(q)) || (u.name && u.name.toLowerCase().includes(q));
-  }).map(u => ({ id: u.id, name: u.name }));
+  }).map(u => ({ id: u.id, name: u.name, avatar: u.avatar || '' }));
 
   res.json(results);
 });
@@ -155,6 +233,14 @@ app.post('/api/messages/send', (req, res) => {
   const { senderId, receiverId, text, fileData, fileName, fileType } = req.body;
   const accounts = readAccounts();
   const sender = accounts.find(u => u.id === senderId);
+  const receiver = accounts.find(u => u.id === receiverId);
+
+  if (sender && sender.blockedContacts && sender.blockedContacts.includes(receiverId)) {
+    return res.status(403.1).json({ error: 'Чат заблокирован вами' });
+  }
+  if (receiver && receiver.blockedContacts && receiver.blockedContacts.includes(senderId)) {
+    return res.status(403).json({ error: 'Вы заблокированы пользователем' });
+  }
 
   const messages = readMessages();
   const newMsg = {
@@ -179,7 +265,6 @@ app.post('/api/messages/send', (req, res) => {
       updated = true;
     }
   }
-  const receiver = accounts.find(u => u.id === receiverId);
   if (receiver) {
     if (!receiver.contacts) receiver.contacts = [];
     if (!receiver.contacts.includes(senderId)) {
@@ -231,7 +316,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   });
 
   const dialogs = accounts.filter(u => peerIds.has(u.id) && u.id !== userId).map(u => ({
-    id: u.id, name: u.name
+    id: u.id, name: u.name, avatar: u.avatar || ''
   }));
 
   res.json(dialogs);
@@ -296,8 +381,11 @@ app.get('*', (req, res) => {
     .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
     
-    .user-profile-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px; }
-    .user-info-brief { display: flex; flex-direction: column; overflow: hidden; }
+    .user-profile-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px; cursor: pointer; }
+    .user-info-brief { display: flex; flex-direction: column; overflow: hidden; margin-left: 10px; flex: 1; }
+    
+    .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; overflow: hidden; }
+    .avatar-circle img { width: 100%; height: 100%; object-fit: cover; }
 
     .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
 
@@ -310,14 +398,16 @@ app.get('*', (req, res) => {
     .chat-item:hover, .chat-item.active { background: var(--bg-active); }
 
     .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); position: relative; }
-    .chat-header { background: var(--bg-sidebar); padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
+    .chat-header { background: var(--bg-sidebar); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
+    .chat-header-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; overflow: hidden; }
+    
     .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; }
     
     .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; position: relative; user-select: none; transition: background 0.2s; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
     .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
     
-    .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; cursor: pointer; background: #000; }
+    .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
@@ -338,6 +428,16 @@ app.get('*', (req, res) => {
 
     .empty-state { margin: auto; text-align: center; color: var(--text-muted); font-size: 14px; }
 
+    /* Модальные окна профилей (в стиле Telegram) */
+    .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: none; align-items: center; justify-content: center; }
+    .modal-overlay.active { display: flex; }
+    .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); position: relative; }
+    .profile-avatar-big { width: 90px; height: 90px; border-radius: 50%; object-fit: cover; background: var(--accent); margin-bottom: 15px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 32px; font-weight: bold; overflow: hidden; position: relative; }
+    .profile-avatar-big img { width: 100%; height: 100%; object-fit: cover; }
+    .profile-name { font-size: 20px; font-weight: bold; margin-bottom: 5px; }
+    .profile-id { font-size: 13px; color: var(--accent); margin-bottom: 20px; }
+    .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
+
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
 
@@ -351,9 +451,10 @@ app.get('*', (req, res) => {
 </head>
 <body>
 
+  <!-- Экран входа / регистрации -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
-      <h2>Введите имя</h2>
+      <h2>Вход в мессенджер</h2>
       <div id="auth-error" class="error-msg"></div>
       <div class="input-group">
         <input type="text" id="auth-name" placeholder="Ваше имя..." onkeydown="if(event.key==='Enter') registerUser()">
@@ -362,17 +463,19 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
+  <!-- Главный экран -->
   <div id="app-screen" class="screen">
     <div id="app-container">
       
       <div class="sidebar">
         <div class="sidebar-header">
-          <div class="user-profile-bar">
+          <div class="user-profile-bar" onclick="openMyProfile()">
+            <div class="avatar-circle" id="my-avatar-circle"></div>
             <div class="user-info-brief">
               <b id="my-display-name">Имя</b>
               <div style="font-size:11px; color:var(--accent);" id="my-display-id">ID</div>
             </div>
-            <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Сменить тему">🌙</button>
+            <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="event.stopPropagation(); toggleTheme()" title="Сменить тему">🌙</button>
           </div>
 
           <div class="search-box">
@@ -387,7 +490,13 @@ app.get('*', (req, res) => {
       <div class="main-chat" id="main-chat">
         <div class="chat-header" id="chat-header">
           <button class="btn btn-secondary" style="width:auto; padding:6px 12px; font-size:12px; display:none;" id="back-to-list-btn" onclick="closeMobileChat()">← Назад</button>
-          <div id="active-peer-name" style="font-weight:bold;">Выберите чат</div>
+          <div class="chat-header-info" onclick="openPeerProfile()">
+            <div class="avatar-circle" id="peer-avatar-circle" style="width:36px; height:36px; font-size:14px;"></div>
+            <div>
+              <div id="active-peer-name" style="font-weight:bold;">Выберите чат</div>
+              <div id="active-peer-status" style="font-size:11px; color:var(--text-muted);">нажмите для профиля</div>
+            </div>
+          </div>
           <div></div>
         </div>
 
@@ -417,6 +526,43 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
+  <!-- Модальное окно своего профиля -->
+  <div class="modal-overlay" id="my-profile-modal">
+    <div class="profile-card">
+      <div class="profile-avatar-big" id="my-profile-avatar-view"></div>
+      <div class="profile-name" id="my-profile-name-view">Имя</div>
+      <div class="profile-id" id="my-profile-id-view">ID</div>
+      
+      <div class="input-group" style="width:100%;">
+        <label style="font-size:12px; color:var(--text-muted);">Изменить имя:</label>
+        <input type="text" id="edit-my-name-input" placeholder="Ваше имя...">
+      </div>
+
+      <div class="profile-actions">
+        <button class="btn btn-secondary" onclick="triggerAvatarInput()">Загрузить аватарку</button>
+        <input type="file" id="avatar-file-input" style="display:none;" accept="image/*" onchange="handleAvatarSelect(event)">
+        <button class="btn btn-secondary" id="remove-avatar-btn" onclick="removeMyAvatar()">Удалить аватарку</button>
+        <button class="btn" onclick="saveMyProfileChanges()">Сохранить</button>
+        <button class="btn btn-secondary" onclick="closeMyProfile()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно профиля собеседника (Telegram-style) -->
+  <div class="modal-overlay" id="peer-profile-modal">
+    <div class="profile-card">
+      <div class="profile-avatar-big" id="peer-profile-avatar-view"></div>
+      <div class="profile-name" id="peer-profile-name-view">Имя</div>
+      <div class="profile-id" id="peer-profile-id-view">ID</div>
+      
+      <div class="profile-actions">
+        <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Заблокировать сообщения</button>
+        <button class="btn btn-secondary" onclick="closePeerProfile()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Лист действий с сообщением -->
   <div class="msg-actions-sheet" id="msg-actions-sheet">
     <button class="btn" id="action-btn-copy" onclick="actionCopyText()" style="display:none;">Копировать текст</button>
     <button class="btn" id="action-btn-download" onclick="actionDownloadFile()" style="display:none;">Скачать файл</button>
@@ -440,11 +586,17 @@ app.get('*', (req, res) => {
     let selectedMsgObj = null;
     let longTouchTimer = null;
 
+    let localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}');
+
     const savedTheme = localStorage.getItem('app_theme') || 'dark';
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
 
-    // Авто-вход при наличии сохраненных данных в LocalStorage
+    // Запрос разрешений на уведомления браузера
+    if (window.Notification && Notification.permission !== 'granted') {
+      Notification.requestPermission();
+    }
+
     window.addEventListener('DOMContentLoaded', () => {
       const savedUser = localStorage.getItem('messenger_user');
       if (savedUser) {
@@ -466,6 +618,20 @@ app.get('*', (req, res) => {
     function updateThemeIcon(theme) {
       const btn = document.getElementById('theme-toggle-btn');
       if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️';
+    }
+
+    function renderAvatarIntoElement(el, userObj) {
+      if (!el) return;
+      el.innerHTML = '';
+      if (userObj && userObj.avatar) {
+        const img = document.createElement('img');
+        img.src = userObj.avatar;
+        el.appendChild(img);
+      } else if (userObj && userObj.name) {
+        el.innerText = userObj.name.charAt(0).toUpperCase();
+      } else {
+        el.innerText = '?';
+      }
     }
 
     async function registerUser() {
@@ -504,15 +670,10 @@ app.get('*', (req, res) => {
       document.getElementById('auth-screen').classList.remove('active');
       document.getElementById('app-screen').classList.add('active');
 
-      document.getElementById('my-display-name').innerText = currentUser.name;
-      document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
-
-      // Первичный пинг для восстановления на сервере
+      updateMyProfileUI();
       sendPing();
-
       loadDialogs();
       
-      // Интервал обновления и пинга (каждые 2 секунды)
       setInterval(() => {
         if (currentUser && !isRecording) {
           sendPing();
@@ -522,19 +683,138 @@ app.get('*', (req, res) => {
       }, 2000);
     }
 
+    function updateMyProfileUI() {
+      document.getElementById('my-display-name').innerText = currentUser.name;
+      document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
+      renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser);
+    }
+
     async function sendPing() {
       if (!currentUser) return;
       try {
-        await fetch('/api/ping', {
+        const knownList = Object.values(localKnownUsers);
+        const res = await fetch('/api/ping', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             id: currentUser.id,
             name: currentUser.name,
-            contacts: currentUser.contacts || []
+            avatar: currentUser.avatar || '',
+            contacts: currentUser.contacts || [],
+            knownUsers: knownList
           })
         });
+        const data = await res.json();
+        if (data.success && data.user) {
+          // Если сервер автоматически сменил ID из-за коллизии
+          if (data.user.id !== currentUser.id) {
+            currentUser.id = data.user.id;
+            localStorage.setItem('messenger_user', JSON.stringify(currentUser));
+            updateMyProfileUI();
+          }
+        }
       } catch(e) {}
+    }
+
+    function cacheUser(user) {
+      if (!user || !user.id) return;
+      localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar };
+      localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers));
+    }
+
+    function openMyProfile() {
+      document.getElementById('edit-my-name-input').value = currentUser.name;
+      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+      document.getElementById('my-profile-name-view').innerText = currentUser.name;
+      document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
+      document.getElementById('my-profile-modal').classList.add('active');
+    }
+
+    function closeMyProfile() {
+      document.getElementById('my-profile-modal').classList.remove('active');
+    }
+
+    function triggerAvatarInput() {
+      document.getElementById('avatar-file-input').click();
+    }
+
+    function handleAvatarSelect(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        currentUser.avatar = evt.target.result;
+        renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function removeMyAvatar() {
+      currentUser.avatar = '';
+      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+    }
+
+    async function saveMyProfileChanges() {
+      const newName = document.getElementById('edit-my-name-input').value.trim();
+      if (newName) currentUser.name = newName;
+
+      try {
+        const res = await fetch('/api/profile/update', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar })
+        });
+        const data = await res.json();
+        if (data.success) {
+          currentUser = data.user;
+          localStorage.setItem('messenger_user', JSON.stringify(currentUser));
+          updateMyProfileUI();
+          closeMyProfile();
+        }
+      } catch(e) {
+        alert('Не удалось обновить профиль');
+      }
+    }
+
+    function openPeerProfile() {
+      if (!activePeer) return;
+      renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer);
+      document.getElementById('peer-profile-name-view').innerText = activePeer.name;
+      document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
+
+      const blockBtn = document.getElementById('block-peer-btn');
+      const isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.includes(activePeer.id);
+      blockBtn.innerText = isBlocked ? 'Разблокировать сообщения' : 'Заблокировать сообщения';
+      blockBtn.className = isBlocked ? 'btn' : 'btn btn-secondary';
+
+      document.getElementById('peer-profile-modal').classList.add('active');
+    }
+
+    function closePeerProfile() {
+      document.getElementById('peer-profile-modal').classList.remove('active');
+    }
+
+    async function toggleBlockPeer() {
+      if (!activePeer) return;
+      const isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.includes(activePeer.id);
+      const nextBlock = !isBlocked;
+
+      try {
+        const res = await fetch('/api/users/block', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id, block: nextBlock })
+        });
+        const data = await res.json();
+        if (data.success) {
+          currentUser.blockedContacts = data.blockedContacts;
+          localStorage.setItem('messenger_user', JSON.stringify(currentUser));
+          closePeerProfile();
+          alert(nextBlock ? 'Пользователь заблокирован' : 'Пользователь разблокирован');
+        }
+      } catch(e) {
+        alert('Ошибка при изменении статуса блока');
+      }
     }
 
     async function loadDialogs() {
@@ -543,6 +823,7 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch('/api/dialogs/' + currentUser.id);
         const dialogs = await res.json();
+        dialogs.forEach(d => cacheUser(d));
         renderChatList(dialogs);
       } catch(e) {}
     }
@@ -553,6 +834,7 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch('/api/dialogs/' + currentUser.id);
         const dialogs = await res.json();
+        dialogs.forEach(d => cacheUser(d));
         
         const currentHash = JSON.stringify(dialogs);
         if (currentHash !== lastDialogsHash) {
@@ -576,6 +858,7 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
         const users = await res.json();
+        users.forEach(u => cacheUser(u));
         renderChatList(users.filter(u => u.id !== currentUser.id));
       } catch(e) {}
     }
@@ -601,20 +884,25 @@ app.get('*', (req, res) => {
         div.className = 'chat-item ' + (currentActiveId === item.id ? 'active' : '');
         div.onclick = () => openChat(item);
 
+        const avatarId = 'chat_av_' + item.id;
         div.innerHTML = \`
+          <div class="avatar-circle" id="\${avatarId}"></div>
           <div>
             <div style="font-weight:bold;">\${item.name}</div>
             <div style="font-size:11px; color:var(--text-muted);">ID: \${item.id}</div>
           </div>
         \`;
         container.appendChild(div);
+        renderAvatarIntoElement(document.getElementById(avatarId), item);
       });
     }
 
     function openChat(peer) {
       activePeer = peer;
       lastMessagesHash = '';
-      document.getElementById('active-peer-name').innerText = peer.name + ' (ID: ' + peer.id + ')';
+      document.getElementById('active-peer-name').innerText = peer.name;
+      document.getElementById('active-peer-status').innerText = 'ID: ' + peer.id;
+      renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), peer);
       document.getElementById('input-bar').style.display = 'flex';
       
       if (!currentUser.contacts) currentUser.contacts = [];
@@ -655,10 +943,24 @@ app.get('*', (req, res) => {
         
         const currentHash = JSON.stringify(messages.map(m => m.id));
         if (currentHash !== lastMessagesHash) {
+          // Проверка на входящие сообщения для генерации браузерного уведомления
+          if (messages.length > 0) {
+            const lastMsg = messages[messages.length - 1];
+            if (lastMsg.senderId === activePeer.id && lastMessagesHash !== '') {
+              showBrowserNotification(activePeer.name, lastMsg.text || 'Вложенный файл');
+            }
+          }
+
           lastMessagesHash = currentHash;
           renderMessagesContainer(messages);
         }
       } catch(e) {}
+    }
+
+    function showBrowserNotification(title, bodyText) {
+      if (window.Notification && Notification.permission === 'granted' && document.hidden) {
+        new Notification(title, { body: bodyText });
+      }
     }
 
     function renderMessagesContainer(messages) {
@@ -905,11 +1207,15 @@ app.get('*', (req, res) => {
       };
 
       try {
-        await fetch('/api/messages/send', {
+        const res = await fetch('/api/messages/send', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(body)
         });
+
+        if (res.status === 403 || res.status === 403.1) {
+          alert('Сообщение не доставлено: чат заблокирован.');
+        }
 
         if (tempDiv) tempDiv.remove();
         lastMessagesHash = '';
