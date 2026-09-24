@@ -82,6 +82,7 @@ app.get('/api/users/search', (req, res) => {
 
 app.post('/api/messages/send', (req, res) => {
   const { senderId, receiverId, text, fileData, fileName, fileType } = req.body;
+  if (!senderId || !receiverId) return res.status(400).json({ success: false });
 
   const newMsg = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
@@ -97,19 +98,18 @@ app.post('/api/messages/send', (req, res) => {
   messages.push(newMsg);
 
   const sender = accounts.find(u => u.id === senderId);
-  if (sender && !sender.contacts.includes(receiverId)) {
-    sender.contacts.push(receiverId);
+  if (sender) {
+    if (!sender.contacts) sender.contacts = [];
+    if (!sender.contacts.includes(receiverId)) sender.contacts.push(receiverId);
   }
   const receiver = accounts.find(u => u.id === receiverId);
   if (receiver) {
     if (!receiver.contacts) receiver.contacts = [];
-    if (!receiver.contacts.includes(senderId)) {
-      receiver.contacts.push(senderId);
-    }
+    if (!receiver.contacts.includes(senderId)) receiver.contacts.push(senderId);
   }
 
   if (userStatus[senderId]) {
-    userStatus[senderId] = { isTyping: false, text: '' };
+    userStatus[senderId] = { isTyping: false, statusText: '' };
   }
 
   res.json({ success: true });
@@ -230,7 +230,7 @@ app.get('/', (req, res) => {
 
     .messages-container { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 15px; display: flex; flex-direction: column; gap: 10px; }
     
-    .msg { max-width: 75%; padding: 10px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; }
+    .msg { max-width: 75%; padding: 10px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; overflow-wrap: break-word; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
 
     .media-preview { width: 240px; height: 160px; object-fit: cover; border-radius: 8px; margin-top: 6px; display: block; cursor: pointer; background: #000; }
@@ -251,7 +251,6 @@ app.get('/', (req, res) => {
     .msg-actions-sheet.active { display: flex; }
 
     @media (max-width: 600px) {
-      /* Чуть крупнее элементы входа именно на телефонах */
       .auth-container {
         width: 92%;
         max-width: none;
@@ -357,6 +356,7 @@ app.get('/', (req, res) => {
     var selectedMsgId = null;
     var longTouchTimer = null;
     var typingTimer = null;
+    var globalInterval = null;
 
     async function handleGuestLogin() {
       var inputEl = document.getElementById('auth-name');
@@ -376,7 +376,8 @@ app.get('/', (req, res) => {
           document.getElementById('my-display-id').innerText = 'Мой ID: ' + currentUser.id;
           
           loadDialogs();
-          setInterval(function() {
+          if (globalInterval) clearInterval(globalInterval);
+          globalInterval = setInterval(function() {
             if (currentUser && !isRecording) {
               loadDialogs();
               if (activePeer) {
@@ -389,12 +390,14 @@ app.get('/', (req, res) => {
       } catch (e) { alert('Ошибка входа'); }
     }
 
-    // Поддержка нажатия Enter для входа
     document.addEventListener('DOMContentLoaded', function() {
       var inputEl = document.getElementById('auth-name');
       if (inputEl) {
         inputEl.addEventListener('keydown', function(e) {
-          if (e.key === 'Enter') handleGuestLogin();
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            handleGuestLogin();
+          }
         });
       }
     });
@@ -423,12 +426,15 @@ app.get('/', (req, res) => {
 
     function renderChatList(list) {
       var container = document.getElementById('chat-list');
+      if (!container) return;
+      
+      var currentActiveId = activePeer ? activePeer.id : null;
       container.innerHTML = '';
       if (!list || list.length === 0) return;
 
       list.forEach(function(item) {
         var div = document.createElement('div');
-        div.className = 'chat-item' + (activePeer && activePeer.id === item.id ? ' active' : '');
+        div.className = 'chat-item' + (currentActiveId === item.id ? ' active' : '');
         div.onclick = function() { openChat(item); };
         div.innerHTML = '<div class="avatar">' + (item.name[0] || 'U').toUpperCase() + '</div>' +
           '<div style="overflow:hidden;"><b>' + item.name + '</b><div style="font-size:11px; color:var(--text-muted);">ID: ' + item.id + '</div></div>';
@@ -446,11 +452,13 @@ app.get('/', (req, res) => {
         document.getElementById('back-btn').style.display = 'block';
       }
       loadMessages();
+      loadDialogs();
     }
 
     function closeMobileChat() {
       document.getElementById('main-chat-panel').classList.remove('mobile-active');
       activePeer = null;
+      loadDialogs();
     }
 
     async function loadMessages() {
