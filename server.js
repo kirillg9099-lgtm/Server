@@ -58,7 +58,6 @@ function writeAccounts(data) { safeWriteJSON(ACCOUNTS_FILE, data); }
 function readMessages() { return safeReadJSON(MESSAGES_FILE, []); }
 function writeMessages(data) { safeWriteJSON(MESSAGES_FILE, data); }
 
-// Быстрое шифрование только текста (файлы не шифруем, чтобы они не весили больше и отправлялись мгновенно)
 function encryptText(text) {
   if (!text) return '';
   try {
@@ -77,24 +76,65 @@ function decryptText(text) {
   return text;
 }
 
-// Регистрация
+// Регистрация или восстановление/подтверждение активности аккаунта
 app.post('/api/register', (req, res) => {
-  const { name } = req.body;
+  const { id, name, contacts } = req.body;
+  const accounts = readAccounts();
+
+  if (id) {
+    let existing = accounts.find(u => u.id === id);
+    if (existing) {
+      existing.updatedAt = Date.now();
+      if (name) existing.name = name.trim();
+      if (Array.isArray(contacts)) {
+        existing.contacts = Array.from(new Set([...(existing.contacts || []), ...contacts]));
+      }
+      writeAccounts(accounts);
+      return res.json({ success: true, user: existing });
+    }
+  }
+
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'Введите имя' });
   }
 
-  const accounts = readAccounts();
   const newAccount = {
-    id: 'id_' + Math.random().toString(36).substr(2, 9),
+    id: id || ('id_' + Math.random().toString(36).substr(2, 9)),
     name: name.trim(),
-    contacts: [],
+    contacts: Array.isArray(contacts) ? contacts : [],
     updatedAt: Date.now()
   };
 
   accounts.push(newAccount);
   writeAccounts(accounts);
   res.json({ success: true, user: newAccount });
+});
+
+// Пинг для поддержания пользователя живым в списках после перезагрузки сервера
+app.post('/api/ping', (req, res) => {
+  const { id, contacts } = req.body;
+  if (!id) return res.status(400).json({ error: 'No id' });
+
+  const accounts = readAccounts();
+  let user = accounts.find(u => u.id === id);
+
+  if (!user) {
+    // Если сервер сбросился, но у клиента остался профиль — восстанавливаем его на сервере
+    user = {
+      id,
+      name: req.body.name || 'Пользователь',
+      contacts: Array.isArray(contacts) ? contacts : [],
+      updatedAt: Date.now()
+    };
+    accounts.push(user);
+  } else {
+    user.updatedAt = Date.now();
+    if (Array.isArray(contacts)) {
+      user.contacts = Array.from(new Set([...(user.contacts || []), ...contacts]));
+    }
+  }
+  writeAccounts(accounts);
+  res.json({ success: true });
 });
 
 // Поиск аккаунтов
@@ -122,7 +162,7 @@ app.post('/api/messages/send', (req, res) => {
     senderId,
     receiverId,
     text: encryptText(text || ''),
-    fileData: fileData || '', // Файлы храним напрямую для максимальной скорости
+    fileData: fileData || '',
     fileName: fileName || '',
     fileType: fileType || '',
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -190,7 +230,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
     if (m.receiverId === userId) peerIds.add(m.senderId);
   });
 
-  const dialogs = accounts.filter(u => peerIds.has(u.id)).map(u => ({
+  const dialogs = accounts.filter(u => peerIds.has(u.id) && u.id !== userId).map(u => ({
     id: u.id, name: u.name
   }));
 
@@ -219,6 +259,7 @@ app.get('*', (req, res) => {
       --text-muted: #7f91a4;
       --accent: #5288c1;
       --border: #0e1621;
+      --msg-selected: rgba(82, 136, 193, 0.3);
     }
 
     :root[data-theme="light"] {
@@ -233,6 +274,7 @@ app.get('*', (req, res) => {
       --text-muted: #707579;
       --accent: #3390ec;
       --border: #e6ebee;
+      --msg-selected: rgba(51, 144, 236, 0.2);
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
@@ -271,8 +313,9 @@ app.get('*', (req, res) => {
     .chat-header { background: var(--bg-sidebar); padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
     .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; }
     
-    .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; position: relative; user-select: none; }
+    .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; position: relative; user-select: none; transition: background 0.2s; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
+    .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
     
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; cursor: pointer; background: #000; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
@@ -375,6 +418,8 @@ app.get('*', (req, res) => {
   </div>
 
   <div class="msg-actions-sheet" id="msg-actions-sheet">
+    <button class="btn" id="action-btn-copy" onclick="actionCopyText()" style="display:none;">Копировать текст</button>
+    <button class="btn" id="action-btn-download" onclick="actionDownloadFile()" style="display:none;">Скачать файл</button>
     <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
@@ -392,11 +437,23 @@ app.get('*', (req, res) => {
     let lastMessagesHash = '';
 
     let selectedMsgId = null;
+    let selectedMsgObj = null;
     let longTouchTimer = null;
 
     const savedTheme = localStorage.getItem('app_theme') || 'dark';
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
+
+    // Авто-вход при наличии сохраненных данных в LocalStorage
+    window.addEventListener('DOMContentLoaded', () => {
+      const savedUser = localStorage.getItem('messenger_user');
+      if (savedUser) {
+        try {
+          currentUser = JSON.parse(savedUser);
+          startApp();
+        } catch(e) {}
+      }
+    });
 
     function toggleTheme() {
       const current = document.documentElement.getAttribute('data-theme');
@@ -412,7 +469,8 @@ app.get('*', (req, res) => {
     }
 
     async function registerUser() {
-      const name = document.getElementById('auth-name').value.trim();
+      const nameInput = document.getElementById('auth-name');
+      const name = nameInput.value.trim();
       const errBox = document.getElementById('auth-error');
 
       if (!name) {
@@ -433,6 +491,7 @@ app.get('*', (req, res) => {
           errBox.style.display = 'block';
         } else {
           currentUser = data.user;
+          localStorage.setItem('messenger_user', JSON.stringify(currentUser));
           startApp();
         }
       } catch(e) {
@@ -448,15 +507,34 @@ app.get('*', (req, res) => {
       document.getElementById('my-display-name').innerText = currentUser.name;
       document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
 
+      // Первичный пинг для восстановления на сервере
+      sendPing();
+
       loadDialogs();
       
-      // Оптимизированный интервал опроса (2 секунды) для плавной работы
+      // Интервал обновления и пинга (каждые 2 секунды)
       setInterval(() => {
         if (currentUser && !isRecording) {
+          sendPing();
           loadDialogsQuiet();
           if (activePeer) loadMessagesQuiet();
         }
       }, 2000);
+    }
+
+    async function sendPing() {
+      if (!currentUser) return;
+      try {
+        await fetch('/api/ping', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            id: currentUser.id,
+            name: currentUser.name,
+            contacts: currentUser.contacts || []
+          })
+        });
+      } catch(e) {}
     }
 
     async function loadDialogs() {
@@ -539,6 +617,12 @@ app.get('*', (req, res) => {
       document.getElementById('active-peer-name').innerText = peer.name + ' (ID: ' + peer.id + ')';
       document.getElementById('input-bar').style.display = 'flex';
       
+      if (!currentUser.contacts) currentUser.contacts = [];
+      if (!currentUser.contacts.includes(peer.id)) {
+        currentUser.contacts.push(peer.id);
+        localStorage.setItem('messenger_user', JSON.stringify(currentUser));
+      }
+
       const chatItems = document.querySelectorAll('.chat-item');
       chatItems.forEach(el => el.classList.remove('active'));
       
@@ -593,10 +677,10 @@ app.get('*', (req, res) => {
 
         div.oncontextmenu = (e) => {
           e.preventDefault();
-          openMsgActions(m.id);
+          openMsgActions(m, div);
         };
         div.ontouchstart = () => {
-          longTouchTimer = setTimeout(() => openMsgActions(m.id), 500);
+          longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
         };
         div.ontouchend = () => clearTimeout(longTouchTimer);
         div.ontouchmove = () => clearTimeout(longTouchTimer);
@@ -607,13 +691,13 @@ app.get('*', (req, res) => {
         const fileType = m.fileType || '';
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
-            html += \`<img src="\${m.fileData}" class="media-preview" onclick="window.open('\${m.fileData}')">\`;
+            html += \`<img src="\${m.fileData}" class="media-preview">\`;
           } else if (fileType.startsWith('video/')) {
             html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
           } else if (fileType.startsWith('audio/')) {
             html += \`<audio src="\${m.fileData}" controls style="margin-top:5px; max-width:100%;"></audio>\`;
           } else {
-            html += \`<a class="file-link" href="\${m.fileData}" download="\${m.fileName || 'file'}">📁 \${m.fileName || 'Файл'}</a>\`;
+            html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
           }
         }
 
@@ -627,14 +711,70 @@ app.get('*', (req, res) => {
       }
     }
 
-    function openMsgActions(msgId) {
-      selectedMsgId = msgId;
+    function openMsgActions(msg, element) {
+      selectedMsgId = msg.id;
+      selectedMsgObj = msg;
+
+      document.querySelectorAll('.msg').forEach(el => el.classList.remove('selected-msg'));
+      element.classList.add('selected-msg');
+
+      const copyBtn = document.getElementById('action-btn-copy');
+      const downloadBtn = document.getElementById('action-btn-download');
+
+      if (msg.text && !msg.fileData) {
+        copyBtn.style.display = 'block';
+      } else {
+        copyBtn.style.display = 'none';
+      }
+
+      if (msg.fileData) {
+        downloadBtn.style.display = 'block';
+      } else {
+        downloadBtn.style.display = 'none';
+      }
+
       document.getElementById('msg-actions-sheet').classList.add('active');
     }
 
     function closeMsgActions() {
       selectedMsgId = null;
+      selectedMsgObj = null;
+      document.querySelectorAll('.msg').forEach(el => el.classList.remove('selected-msg'));
       document.getElementById('msg-actions-sheet').classList.remove('active');
+    }
+
+    function actionCopyText() {
+      if (selectedMsgObj && selectedMsgObj.text) {
+        navigator.clipboard.writeText(selectedMsgObj.text).then(() => {
+          closeMsgActions();
+        }).catch(() => {
+          alert('Не удалось скопировать');
+        });
+      }
+    }
+
+    function actionDownloadFile() {
+      if (selectedMsgObj && selectedMsgObj.fileData) {
+        const a = document.createElement('a');
+        a.href = selectedMsgObj.fileData;
+        a.download = selectedMsgObj.fileName || 'download';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        closeMsgActions();
+      }
+    }
+
+    async function deleteSelectedMessage() {
+      if (!selectedMsgId) return;
+      try {
+        await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
+        closeMsgActions();
+        lastMessagesHash = '';
+        loadMessages();
+      } catch(e) {
+        alert('Не удалось удалить сообщение.');
+      }
     }
 
     function triggerFileInput() {
