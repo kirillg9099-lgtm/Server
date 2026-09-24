@@ -183,10 +183,11 @@ app.get('/api/users/:userId', (req, res) => {
   const accounts = readAccounts();
   const user = accounts.find(u => u.id === req.params.userId);
   if (!user) return res.status(404).json({ error: 'Не найден' });
-  res.json({ id: user.id, name: user.name, avatar: user.avatar || '' });
+  const isOnline = user.updatedAt && (Date.now() - user.updatedAt < 8000);
+  res.json({ id: user.id, name: user.name, avatar: user.avatar || '', isOnline, updatedAt: user.updatedAt });
 });
 
-// Включение/выключение сообщений (блок пользователя)
+// Блокировка/разблокировка пользователя
 app.post('/api/users/block', (req, res) => {
   const { userId, peerId, block } = req.body;
   const accounts = readAccounts();
@@ -210,9 +211,15 @@ app.get('/api/users/search', (req, res) => {
   if (!q) return res.json([]);
   
   const accounts = readAccounts();
+  const now = Date.now();
   const results = accounts.filter(u => {
     return (u.id && u.id.toLowerCase().includes(q)) || (u.name && u.name.toLowerCase().includes(q));
-  }).map(u => ({ id: u.id, name: u.name, avatar: u.avatar || '' }));
+  }).map(u => ({
+    id: u.id,
+    name: u.name,
+    avatar: u.avatar || '',
+    isOnline: u.updatedAt && (now - u.updatedAt < 8000)
+  }));
 
   res.json(results);
 });
@@ -225,10 +232,10 @@ app.post('/api/messages/send', (req, res) => {
   const receiver = accounts.find(u => u.id === receiverId);
 
   if (sender && sender.blockedContacts && sender.blockedContacts.includes(receiverId)) {
-    return res.status(403).json({ error: 'Сообщения отключены вами' });
+    return res.status(403).json({ error: 'Вы заблокировали этого пользователя' });
   }
   if (receiver && receiver.blockedContacts && receiver.blockedContacts.includes(senderId)) {
-    return res.status(403).json({ error: 'Сообщения отключены получателем' });
+    return res.status(403).json({ error: 'Вы заблокированы получателем' });
   }
 
   const messages = readMessages();
@@ -297,6 +304,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   const accounts = readAccounts();
   const currentUser = accounts.find(u => u.id === userId);
   const messages = readMessages();
+  const now = Date.now();
 
   const peerIds = new Set(currentUser ? currentUser.contacts || [] : []);
   messages.forEach(m => {
@@ -305,7 +313,10 @@ app.get('/api/dialogs/:userId', (req, res) => {
   });
 
   const dialogs = accounts.filter(u => peerIds.has(u.id) && u.id !== userId).map(u => ({
-    id: u.id, name: u.name, avatar: u.avatar || ''
+    id: u.id,
+    name: u.name,
+    avatar: u.avatar || '',
+    isOnline: u.updatedAt && (now - u.updatedAt < 8000)
   }));
 
   res.json(dialogs);
@@ -361,7 +372,7 @@ app.get('*', (req, res) => {
     .auth-container h2 { margin-bottom: 20px; color: var(--accent); }
     .input-group { margin-bottom: 15px; text-align: left; }
     .input-group input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; }
-    .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+    .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top: 10px; pointer-events: auto; }
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
     .btn-danger { background: #e53935; color: #fff; }
     .error-msg { color: #e53935; font-size: 12px; margin-top: 8px; display: none; }
@@ -373,8 +384,11 @@ app.get('*', (req, res) => {
     .user-profile-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px; cursor: pointer; }
     .user-info-brief { display: flex; flex-direction: column; overflow: hidden; margin-left: 10px; flex: 1; }
     
-    .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; overflow: hidden; }
+    .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; overflow: hidden; position: relative; }
     .avatar-circle img { width: 100%; height: 100%; object-fit: cover; }
+
+    .online-indicator { position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; }
+    .online-indicator.visible { display: block; }
 
     .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
 
@@ -468,7 +482,9 @@ app.get('*', (req, res) => {
       <div class="sidebar">
         <div class="sidebar-header">
           <div class="user-profile-bar" onclick="openMyProfile()">
-            <div class="avatar-circle" id="my-avatar-circle"></div>
+            <div class="avatar-circle" id="my-avatar-circle">
+              <div class="online-indicator visible" id="my-online-indicator"></div>
+            </div>
             <div class="user-info-brief">
               <b id="my-display-name">Имя</b>
               <div style="font-size:11px; color:var(--accent);" id="my-display-id">ID</div>
@@ -489,7 +505,9 @@ app.get('*', (req, res) => {
         <div class="chat-header" id="chat-header">
           <button class="btn btn-secondary" style="width:auto; padding:6px 12px; font-size:12px; display:none;" id="back-to-list-btn" onclick="closeMobileChat()">← Назад</button>
           <div class="chat-header-info" onclick="openPeerProfile()">
-            <div class="avatar-circle" id="peer-avatar-circle" style="width:36px; height:36px; font-size:14px;"></div>
+            <div class="avatar-circle" id="peer-avatar-circle" style="width:36px; height:36px; font-size:14px;">
+              <div class="online-indicator" id="peer-online-indicator"></div>
+            </div>
             <div>
               <div id="active-peer-name" style="font-weight:bold;">Выберите чат</div>
               <div id="active-peer-status" style="font-size:11px; color:var(--text-muted);">нажмите для профиля</div>
@@ -532,7 +550,6 @@ app.get('*', (req, res) => {
       <div class="profile-id" id="my-profile-id-view">ID</div>
       
       <div class="input-group" style="width:100%;">
-        <label style="font-size:12px; color:var(--text-muted);">Переименовать себя:</label>
         <input type="text" id="edit-my-name-input" placeholder="Ваше имя...">
       </div>
 
@@ -555,8 +572,8 @@ app.get('*', (req, res) => {
       <div class="profile-id" id="peer-profile-id-view">ID</div>
       
       <div class="profile-actions">
-        <button class="btn btn-secondary" id="mute-peer-btn" onclick="toggleMutePeer()">Выключить уведомления</button>
-        <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Отключить сообщения</button>
+        <button class="btn btn-secondary" id="mute-peer-btn" onclick="toggleMutePeer()">Выключить звуковой сигнал</button>
+        <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Заблокировать</button>
         <button class="btn btn-secondary" onclick="closePeerProfile()">Закрыть</button>
       </div>
     </div>
@@ -599,8 +616,26 @@ app.get('*', (req, res) => {
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
 
-    if (window.Notification && Notification.permission !== 'granted') {
-      Notification.requestPermission();
+    // Синтезатор звука уведомления (Web Audio API)
+    function playNotificationSound() {
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // Нота D5
+        osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.08); // Нота A5
+        
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.3);
+      } catch(e) {}
     }
 
     window.addEventListener('DOMContentLoaded', () => {
@@ -626,17 +661,37 @@ app.get('*', (req, res) => {
       if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️';
     }
 
-    function renderAvatarIntoElement(el, userObj) {
+    function renderAvatarIntoElement(el, userObj, isOnline) {
       if (!el) return;
-      el.innerHTML = '';
+      
+      // Сохраняем индикатор сети, если он есть внутри элемента
+      const indicator = el.querySelector('.online-indicator');
+      
+      // Удаляем старое изображение/текст, но оставляем индикатор
+      Array.from(el.childNodes).forEach(node => {
+        if (node !== indicator) el.removeChild(node);
+      });
+
       if (userObj && userObj.avatar) {
         const img = document.createElement('img');
         img.src = userObj.avatar;
-        el.appendChild(img);
+        el.insertBefore(img, indicator);
       } else if (userObj && userObj.name) {
-        el.innerText = userObj.name.charAt(0).toUpperCase();
+        const span = document.createElement('span');
+        span.innerText = userObj.name.charAt(0).toUpperCase();
+        el.insertBefore(span, indicator);
       } else {
-        el.innerText = '?';
+        const span = document.createElement('span');
+        span.innerText = '?';
+        el.insertBefore(span, indicator);
+      }
+
+      if (indicator) {
+        if (isOnline) {
+          indicator.classList.add('visible');
+        } else {
+          indicator.classList.remove('visible');
+        }
       }
     }
 
@@ -684,7 +739,10 @@ app.get('*', (req, res) => {
         if (currentUser && !isRecording) {
           sendPing();
           loadDialogsQuiet();
-          if (activePeer) loadMessagesQuiet();
+          if (activePeer) {
+            loadMessagesQuiet();
+            refreshActivePeerStatus();
+          }
         }
       }, 2000);
     }
@@ -692,7 +750,7 @@ app.get('*', (req, res) => {
     function updateMyProfileUI() {
       document.getElementById('my-display-name').innerText = currentUser.name;
       document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
-      renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser);
+      renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
     }
 
     async function sendPing() {
@@ -721,6 +779,29 @@ app.get('*', (req, res) => {
       } catch(e) {}
     }
 
+    async function refreshActivePeerStatus() {
+      if (!activePeer) return;
+      try {
+        const res = await fetch('/api/users/' + activePeer.id);
+        if (res.ok) {
+          const info = await res.json();
+          activePeer.isOnline = info.isOnline;
+          activePeer.name = info.name;
+          activePeer.avatar = info.avatar;
+          
+          const statusEl = document.getElementById('active-peer-status');
+          if (info.isOnline) {
+            statusEl.innerText = 'в сети';
+            statusEl.style.color = '#4cd964';
+          } else {
+            statusEl.innerText = 'не в сети';
+            statusEl.style.color = 'var(--text-muted)';
+          }
+          renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), activePeer, info.isOnline);
+        }
+      } catch(e) {}
+    }
+
     function cacheUser(user) {
       if (!user || !user.id) return;
       localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar };
@@ -729,7 +810,7 @@ app.get('*', (req, res) => {
 
     function openMyProfile() {
       document.getElementById('edit-my-name-input').value = currentUser.name;
-      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
       document.getElementById('my-profile-name-view').innerText = currentUser.name;
       document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
       
@@ -749,7 +830,7 @@ app.get('*', (req, res) => {
 
     function triggerAvatarInput() {
       const input = document.getElementById('avatar-file-input');
-      input.value = ''; // Исправление бага с невозможностью повторно выбрать тот же файл
+      input.value = ''; // Всегда позволяет выбрать файл заново без багов
       input.click();
     }
 
@@ -759,7 +840,7 @@ app.get('*', (req, res) => {
       const reader = new FileReader();
       reader.onload = function(evt) {
         currentUser.avatar = evt.target.result;
-        renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+        renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
         document.getElementById('remove-avatar-link-btn').style.display = 'block';
       };
       reader.readAsDataURL(file);
@@ -767,7 +848,7 @@ app.get('*', (req, res) => {
 
     function removeMyAvatar() {
       currentUser.avatar = '';
-      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser);
+      renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
       document.getElementById('remove-avatar-link-btn').style.display = 'none';
     }
 
@@ -795,18 +876,18 @@ app.get('*', (req, res) => {
 
     function openPeerProfile() {
       if (!activePeer) return;
-      renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer);
+      renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
       document.getElementById('peer-profile-name-view').innerText = activePeer.name;
       document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
 
       const blockBtn = document.getElementById('block-peer-btn');
       const isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.includes(activePeer.id);
-      blockBtn.innerText = isBlocked ? 'Включить сообщения' : 'Отключить сообщения';
-      blockBtn.className = isBlocked ? 'btn' : 'btn btn-secondary';
+      blockBtn.innerText = isBlocked ? 'Разблокировать' : 'Заблокировать';
+      blockBtn.className = isBlocked ? 'btn btn-secondary' : 'btn btn-danger';
 
       const muteBtn = document.getElementById('mute-peer-btn');
       const isMuted = mutedPeers.includes(activePeer.id);
-      muteBtn.innerText = isMuted ? 'Включить уведомления' : 'Выключить уведомления';
+      muteBtn.innerText = isMuted ? 'Включить звуковой сигнал' : 'Выключить звуковой сигнал';
       muteBtn.className = isMuted ? 'btn' : 'btn btn-secondary';
 
       document.getElementById('peer-profile-modal').classList.add('active');
@@ -821,10 +902,10 @@ app.get('*', (req, res) => {
       const index = mutedPeers.indexOf(activePeer.id);
       if (index > -1) {
         mutedPeers.splice(index, 1);
-        alert('Уведомления включены');
+        alert('Звуковой сигнал включен');
       } else {
         mutedPeers.push(activePeer.id);
-        alert('Уведомления выключены');
+        alert('Звуковой сигнал выключен');
       }
       localStorage.setItem('messenger_muted_peers', JSON.stringify(mutedPeers));
       openPeerProfile();
@@ -846,10 +927,10 @@ app.get('*', (req, res) => {
           currentUser.blockedContacts = data.blockedContacts;
           localStorage.setItem('messenger_user', JSON.stringify(currentUser));
           closePeerProfile();
-          alert(nextBlock ? 'Сообщения отключены' : 'Сообщения включены');
+          alert(nextBlock ? 'Пользователь заблокирован' : 'Пользователь разблокирован');
         }
       } catch(e) {
-        alert('Ошибка при изменении статуса сообщений');
+        alert('Ошибка при изменении статуса блокировки');
       }
     }
 
@@ -921,15 +1002,19 @@ app.get('*', (req, res) => {
         div.onclick = () => openChat(item);
 
         const avatarId = 'chat_av_' + item.id;
+        const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
+
         div.innerHTML = \`
-          <div class="avatar-circle" id="\${avatarId}"></div>
+          <div class="avatar-circle" id="\${avatarId}">
+            <div class="online-indicator \${item.isOnline ? 'visible' : ''}"></div>
+          </div>
           <div>
             <div style="font-weight:bold;">\${item.name}</div>
-            <div style="font-size:11px; color:var(--text-muted);">ID: \${item.id}</div>
+            <div style="font-size:11px;">\${onlineText}</div>
           </div>
         \`;
         container.appendChild(div);
-        renderAvatarIntoElement(document.getElementById(avatarId), item);
+        renderAvatarIntoElement(document.getElementById(avatarId), item, item.isOnline);
       });
     }
 
@@ -937,8 +1022,17 @@ app.get('*', (req, res) => {
       activePeer = peer;
       lastMessagesHash = '';
       document.getElementById('active-peer-name').innerText = peer.name;
-      document.getElementById('active-peer-status').innerText = 'ID: ' + peer.id;
-      renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), peer);
+      
+      const statusEl = document.getElementById('active-peer-status');
+      if (peer.isOnline) {
+        statusEl.innerText = 'в сети';
+        statusEl.style.color = '#4cd964';
+      } else {
+        statusEl.innerText = 'не в сети';
+        statusEl.style.color = 'var(--text-muted)';
+      }
+
+      renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), peer, peer.isOnline);
       document.getElementById('input-bar').style.display = 'flex';
       
       if (!currentUser.contacts) currentUser.contacts = [];
@@ -982,17 +1076,9 @@ app.get('*', (req, res) => {
           if (messages.length > 0) {
             const lastMsg = messages[messages.length - 1];
             if (lastMsg.senderId === activePeer.id && lastMessagesHash !== '') {
-              // Проверяем, не отключены ли уведомления для этого пользователя
+              // Воспроизводим звуковой сигнал, если не отключено
               if (!mutedPeers.includes(activePeer.id)) {
-                let notificationText = lastMsg.text;
-                if (!notificationText && lastMsg.fileData) {
-                  if (lastMsg.fileType && lastMsg.fileType.startsWith('image/')) {
-                    notificationText = 'Вам отправили изображение';
-                  } else {
-                    notificationText = 'Вам отправили файл: ' + (lastMsg.fileName || 'файл');
-                  }
-                }
-                showBrowserNotification(activePeer.name, notificationText || 'Новое сообщение');
+                playNotificationSound();
               }
             }
           }
@@ -1001,12 +1087,6 @@ app.get('*', (req, res) => {
           renderMessagesContainer(messages);
         }
       } catch(e) {}
-    }
-
-    function showBrowserNotification(title, bodyText) {
-      if (window.Notification && Notification.permission === 'granted') {
-        new Notification(title, { body: bodyText });
-      }
     }
 
     function openImageViewer(src) {
@@ -1278,7 +1358,7 @@ app.get('*', (req, res) => {
         });
 
         if (res.status === 403) {
-          alert('Сообщение не доставлено: чат заблокирован или отключен.');
+          alert('Сообщение не доставлено: чат заблокирован.');
         }
 
         if (tempDiv) tempDiv.remove();
