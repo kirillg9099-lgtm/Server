@@ -105,6 +105,7 @@ app.post('/api/register', (req, res) => {
       avatar: avatar || '',
       contacts: Array.isArray(contacts) ? contacts : [],
       blockedContacts: [],
+      hiddenDialogs: [],
       updatedAt: Date.now()
     };
     accounts.push(user);
@@ -114,15 +115,38 @@ app.post('/api/register', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Глобальный пинг, синхронизация аккаунтов и бэкап информации
+// Глобальный пинг, синхронизация аккаунтов, статусов прочтения, удалений и бэкап информации
 app.post('/api/ping', (req, res) => {
-  const { id, name, avatar, contacts, knownUsers, syncMessages } = req.body;
+  const { id, name, avatar, contacts, knownUsers, syncMessages, readMsgIds, deletedMsgIds } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
 
   const accounts = readAccounts();
   const serverMessages = readMessages();
 
-  // Принимаем информацию о пользователях со всех клиентов и агрегируем
+  // Синхронизация статусов прочтения сообщений со всех клиентов
+  if (Array.isArray(readMsgIds) && readMsgIds.length > 0) {
+    let changed = false;
+    serverMessages.forEach(m => {
+      if (readMsgIds.includes(m.id) && !m.isRead) {
+        m.isRead = true;
+        changed = true;
+      }
+    });
+    if (changed) writeMessages(serverMessages);
+  }
+
+  // Синхронизация удаленных сообщений со всех клиентов (глобальное удаление у всех)
+  if (Array.isArray(deletedMsgIds) && deletedMsgIds.length > 0) {
+    let changed = false;
+    serverMessages.forEach(m => {
+      if (deletedMsgIds.includes(m.id) && !m.isDeleted) {
+        m.isDeleted = true;
+        changed = true;
+      }
+    });
+    if (changed) writeMessages(serverMessages);
+  }
+
   if (Array.isArray(knownUsers)) {
     knownUsers.forEach(kUser => {
       if (!kUser.id) return;
@@ -134,28 +158,39 @@ app.post('/api/ping', (req, res) => {
           avatar: kUser.avatar || '',
           contacts: [],
           blockedContacts: [],
+          hiddenDialogs: [],
           updatedAt: Date.now()
         });
       }
     });
   }
 
-  // Синхронизация сообщений с клиентом для максимальной сохранности чата
   if (Array.isArray(syncMessages)) {
     let msgChanged = false;
     syncMessages.forEach(clientMsg => {
-      if (clientMsg && clientMsg.id && !serverMessages.some(m => m.id === clientMsg.id)) {
-        serverMessages.push({
-          id: clientMsg.id,
-          senderId: clientMsg.senderId,
-          receiverId: clientMsg.receiverId,
-          text: encryptText(clientMsg.text || ''),
-          fileData: clientMsg.fileData || '',
-          fileName: clientMsg.fileName || '',
-          fileType: clientMsg.fileType || '',
-          timestamp: clientMsg.timestamp || ''
-        });
-        msgChanged = true;
+      if (clientMsg && clientMsg.id) {
+        let existing = serverMessages.find(m => m.id === clientMsg.id);
+        if (!existing) {
+          serverMessages.push({
+            id: clientMsg.id,
+            senderId: clientMsg.senderId,
+            receiverId: clientMsg.receiverId,
+            text: encryptText(clientMsg.text || ''),
+            fileData: clientMsg.fileData || '',
+            fileName: clientMsg.fileName || '',
+            fileType: clientMsg.fileType || '',
+            timestamp: clientMsg.timestamp || '',
+            isRead: !!clientMsg.isRead,
+            isDeleted: !!clientMsg.isDeleted
+          });
+          msgChanged = true;
+        } else if (clientMsg.isDeleted && !existing.isDeleted) {
+          existing.isDeleted = true;
+          msgChanged = true;
+        } else if (clientMsg.isRead && !existing.isRead) {
+          existing.isRead = true;
+          msgChanged = true;
+        }
       }
     });
     if (msgChanged) {
@@ -171,6 +206,7 @@ app.post('/api/ping', (req, res) => {
       avatar: avatar || '',
       contacts: Array.isArray(contacts) ? contacts : [],
       blockedContacts: [],
+      hiddenDialogs: [],
       updatedAt: Date.now()
     };
     accounts.push(user);
@@ -184,7 +220,7 @@ app.post('/api/ping', (req, res) => {
   }
 
   writeAccounts(accounts);
-  res.json({ success: true, user });
+  res.json({ success: true, user, serverMessages: serverMessages.map(m => ({ ...m, text: decryptText(m.text) })) });
 });
 
 // Обновление профиля
@@ -230,6 +266,20 @@ app.post('/api/users/block', (req, res) => {
   res.json({ success: true, blockedContacts: user.blockedContacts });
 });
 
+// Скрытие (удаление) чата для конкретного пользователя
+app.post('/api/chat/hide', (req, res) => {
+  const { userId, peerId } = req.body;
+  const accounts = readAccounts();
+  let user = accounts.find(u => u.id === userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  if (!user.hiddenDialogs) user.hiddenDialogs = [];
+  if (!user.hiddenDialogs.includes(peerId)) user.hiddenDialogs.push(peerId);
+
+  writeAccounts(accounts);
+  res.json({ success: true, hiddenDialogs: user.hiddenDialogs });
+});
+
 // Поиск аккаунтов
 app.get('/api/users/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
@@ -263,6 +313,14 @@ app.post('/api/messages/send', (req, res) => {
     return res.status(403).json({ error: 'Вы заблокированы получателем' });
   }
 
+  // Если чат был скрыт ранее, при новом сообщении снова показываем его
+  if (sender && sender.hiddenDialogs) {
+    sender.hiddenDialogs = sender.hiddenDialogs.filter(id => id !== receiverId);
+  }
+  if (receiver && receiver.hiddenDialogs) {
+    receiver.hiddenDialogs = receiver.hiddenDialogs.filter(id => id !== senderId);
+  }
+
   const messages = readMessages();
   const newMsg = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
@@ -272,7 +330,9 @@ app.post('/api/messages/send', (req, res) => {
     fileData: fileData || '',
     fileName: fileName || '',
     fileType: fileType || '',
-    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    isRead: false,
+    isDeleted: false
   };
 
   messages.push(newMsg);
@@ -293,17 +353,57 @@ app.post('/api/messages/send', (req, res) => {
       updated = true;
     }
   }
-  if (updated) writeAccounts(accounts);
+  if (updated || sender || receiver) writeAccounts(accounts);
 
   res.json({ success: true, message: { ...newMsg, text: text } });
 });
 
-// Удаление сообщения
+// Отметка сообщения как прочитанного
+app.post('/api/messages/read', (req, res) => {
+  const { msgIds } = req.body;
+  if (!Array.isArray(msgIds) || msgIds.length === 0) return res.json({ success: true });
+
+  const messages = readMessages();
+  let changed = false;
+  messages.forEach(m => {
+    if (msgIds.includes(m.id) && !m.isRead) {
+      m.isRead = true;
+      changed = true;
+    }
+  });
+  if (changed) writeMessages(messages);
+  res.json({ success: true });
+});
+
+// Удаление сообщения (пометка у всех)
 app.delete('/api/messages/:msgId', (req, res) => {
   const { msgId } = req.params;
   let messages = readMessages();
-  messages = messages.filter(m => m.id !== msgId);
-  writeMessages(messages);
+  let changed = false;
+  messages.forEach(m => {
+    if (m.id === msgId) {
+      m.isDeleted = true;
+      changed = true;
+    }
+  });
+  if (changed) writeMessages(messages);
+  res.json({ success: true });
+});
+
+// Очистка всей истории чата между двумя пользователями
+app.post('/api/chat/clear', (req, res) => {
+  const { userId, peerId } = req.body;
+  let messages = readMessages();
+  let changed = false;
+  messages.forEach(m => {
+    if ((m.senderId === userId && m.receiverId === peerId) || (m.senderId === peerId && m.receiverId === userId)) {
+      if (!m.isDeleted) {
+        m.isDeleted = true;
+        changed = true;
+      }
+    }
+  });
+  if (changed) writeMessages(messages);
   res.json({ success: true });
 });
 
@@ -313,8 +413,10 @@ app.get('/api/messages/:userId/:peerId', (req, res) => {
   const messages = readMessages();
   
   const chatMsgs = messages.filter(m => 
-    (m.senderId === userId && m.receiverId === peerId) ||
-    (m.senderId === peerId && m.receiverId === userId)
+    !m.isDeleted && (
+      (m.senderId === userId && m.receiverId === peerId) ||
+      (m.senderId === peerId && m.receiverId === userId)
+    )
   ).map(m => ({
     ...m,
     text: decryptText(m.text)
@@ -331,13 +433,17 @@ app.get('/api/dialogs/:userId', (req, res) => {
   const messages = readMessages();
   const now = Date.now();
 
+  const hiddenSet = new Set(currentUser && currentUser.hiddenDialogs ? currentUser.hiddenDialogs : []);
   const peerIds = new Set(currentUser ? currentUser.contacts || [] : []);
+  
   messages.forEach(m => {
-    if (m.senderId === userId) peerIds.add(m.receiverId);
-    if (m.receiverId === userId) peerIds.add(m.senderId);
+    if (!m.isDeleted) {
+      if (m.senderId === userId) peerIds.add(m.receiverId);
+      if (m.receiverId === userId) peerIds.add(m.senderId);
+    }
   });
 
-  const dialogs = accounts.filter(u => peerIds.has(u.id) && u.id !== userId).map(u => ({
+  const dialogs = accounts.filter(u => peerIds.has(u.id) && u.id !== userId && !hiddenSet.has(u.id)).map(u => ({
     id: u.id,
     name: u.name,
     avatar: u.avatar || '',
@@ -412,7 +518,6 @@ app.get('*', (req, res) => {
     .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; overflow: visible !important; position: relative; }
     .avatar-circle img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
 
-    /* Исправление индикатора: вынесен поверх всех рамок и границ аватара */
     .online-indicator { position: absolute; bottom: -1px; right: -1px; width: 12px; height: 12px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; z-index: 10; pointer-events: none; }
     .online-indicator.visible { display: block; }
 
@@ -430,6 +535,17 @@ app.get('*', (req, res) => {
     .chat-header { background: var(--bg-sidebar); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
     .chat-header-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; overflow: hidden; }
     
+    .chat-menu-container { position: relative; }
+    .menu-dots-btn { background: transparent; border: none; color: var(--text-main); font-size: 20px; cursor: pointer; padding: 8px; border-radius: 50%; display: none; align-items: center; justify-content: center; }
+    .menu-dots-btn:hover { background: var(--bg-input); }
+
+    /* Выпадающий мини-список по клику */
+    .chat-dropdown-menu { position: absolute; right: 0; top: 45px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 220px; display: none; flex-direction: column; z-index: 1000; overflow: hidden; }
+    .chat-dropdown-menu.active { display: flex; }
+    .menu-item { padding: 12px 16px; font-size: 14px; cursor: pointer; border-bottom: 1px solid var(--border); text-align: left; background: none; border-top: none; border-left: none; border-right: none; color: var(--text-main); width: 100%; }
+    .menu-item:hover { background: var(--bg-active); }
+    .menu-item.danger { color: #e53935; }
+
     .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; }
     
     .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; position: relative; user-select: none; transition: background 0.2s; }
@@ -440,6 +556,11 @@ app.get('*', (req, res) => {
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
     .audio-preview { width: 240px; margin-top: 5px; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
+
+    /* Мелкие галочки под сообщением */
+    .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
+    .ticks { font-size: 11px; letter-spacing: -3px; font-weight: bold; }
+    .ticks.read { color: var(--accent); }
 
     .attachment-preview-container { background: var(--bg-sidebar); padding: 10px 15px; border-top: 1px solid var(--border); display: none; align-items: center; gap: 12px; }
     .attachment-preview-container.active { display: flex; }
@@ -479,15 +600,20 @@ app.get('*', (req, res) => {
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
 
+    @media (min-width: 601px) {
+      .menu-dots-btn { display: flex !important; }
+    }
+
     @media (max-width: 600px) {
       .sidebar { width: 100%; display: flex; }
       .main-chat { display: none; width: 100%; }
       .app-mobile-chat .sidebar { display: none; }
       .app-mobile-chat .main-chat { display: flex; }
+      .app-mobile-chat .menu-dots-btn { display: flex !important; }
     }
   </style>
 </head>
-<body>
+<body onclick="onBodyGlobalClick(event)">
 
   <!-- Авторизация -->
   <div id="auth-screen" class="screen active">
@@ -539,10 +665,17 @@ app.get('*', (req, res) => {
               <div id="active-peer-status" style="font-size:11px; color:var(--text-muted);">нажмите для профиля</div>
             </div>
           </div>
-          <div></div>
+          
+          <div class="chat-menu-container">
+            <button class="menu-dots-btn" id="chat-menu-dots-btn" onclick="toggleChatDropdown(event)" title="Опции чата">⋮</button>
+            <div class="chat-dropdown-menu" id="chat-dropdown-menu">
+              <button class="menu-item" onclick="clearChatHistory()">Очистить историю</button>
+              <button class="menu-item danger" onclick="deleteCurrentChat()">Удалить чат</button>
+            </div>
+          </div>
         </div>
 
-        <div class="messages-container" id="messages-container">
+        <div class="messages-container" id="messages-container" onscroll="checkVisibleMessages()">
           <div class="empty-state">Выберите диалог слева или найдите пользователя в поиске</div>
         </div>
 
@@ -641,8 +774,6 @@ app.get('*', (req, res) => {
 
     let localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}');
     let mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]');
-
-    // Локальный кэш всех сообщений для защиты от потери при перезагрузке
     let localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]');
 
     const savedTheme = localStorage.getItem('app_theme') || 'dark';
@@ -693,11 +824,25 @@ app.get('*', (req, res) => {
       if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️';
     }
 
+    function toggleChatDropdown(e) {
+      e.stopPropagation();
+      const menu = document.getElementById('chat-dropdown-menu');
+      menu.classList.toggle('active');
+    }
+
+    function onBodyGlobalClick(e) {
+      const menu = document.getElementById('chat-dropdown-menu');
+      const dotsBtn = document.getElementById('chat-menu-dots-btn');
+      if (menu && menu.classList.contains('active')) {
+        if (!menu.contains(e.target) && e.target !== dotsBtn) {
+          menu.classList.remove('active');
+        }
+      }
+    }
+
     function renderAvatarIntoElement(el, userObj, isOnline) {
       if (!el) return;
-      
       const indicator = el.querySelector('.online-indicator');
-      
       Array.from(el.childNodes).forEach(node => {
         if (node !== indicator) el.removeChild(node);
       });
@@ -717,11 +862,8 @@ app.get('*', (req, res) => {
       }
 
       if (indicator) {
-        if (isOnline) {
-          indicator.classList.add('visible');
-        } else {
-          indicator.classList.remove('visible');
-        }
+        if (isOnline) indicator.classList.add('visible');
+        else indicator.classList.remove('visible');
       }
     }
 
@@ -806,6 +948,12 @@ app.get('*', (req, res) => {
             localStorage.setItem('messenger_user', JSON.stringify(currentUser));
             updateMyProfileUI();
           }
+          if (Array.isArray(data.serverMessages)) {
+            // Синхронизируем локальный кэш с актуальным состоянием сервера (включая удаления и прочтения)
+            localMessagesCache = data.serverMessages;
+            localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+            if (activePeer) renderMessagesContainer(getPeerMessages(activePeer.id));
+          }
         }
       } catch(e) {}
     }
@@ -839,18 +987,13 @@ app.get('*', (req, res) => {
       localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers));
     }
 
-    function saveMessagesToLocalCache(messages) {
-      if (!Array.isArray(messages)) return;
-      messages.forEach(msg => {
-        if (!localMessagesCache.some(m => m.id === msg.id)) {
-          localMessagesCache.push(msg);
-        }
-      });
-      // Ограничим кэш последними 500 сообщениями для стабильности localStorage
-      if (localMessagesCache.length > 500) {
-        localMessagesCache = localMessagesCache.slice(-500);
-      }
-      localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+    function getPeerMessages(peerId) {
+      return localMessagesCache.filter(m => 
+        !m.isDeleted && (
+          (m.senderId === currentUser.id && m.receiverId === peerId) ||
+          (m.senderId === peerId && m.receiverId === currentUser.id)
+        )
+      );
     }
 
     function openMyProfile() {
@@ -860,11 +1003,8 @@ app.get('*', (req, res) => {
       document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
       
       const removeLinkBtn = document.getElementById('remove-avatar-link-btn');
-      if (currentUser.avatar) {
-        removeLinkBtn.style.display = 'block';
-      } else {
-        removeLinkBtn.style.display = 'none';
-      }
+      if (currentUser.avatar) removeLinkBtn.style.display = 'block';
+      else removeLinkBtn.style.display = 'none';
 
       document.getElementById('my-profile-modal').classList.add('active');
     }
@@ -976,6 +1116,48 @@ app.get('*', (req, res) => {
         }
       } catch(e) {
         alert('Ошибка при изменении статуса блокировки');
+      }
+    }
+
+    async function clearChatHistory() {
+      document.getElementById('chat-dropdown-menu').classList.remove('active');
+      if (!activePeer || !confirm('Очистить всю историю этого чата для всех участников?')) return;
+      try {
+        await fetch('/api/chat/clear', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id })
+        });
+        localMessagesCache.forEach(m => {
+          if ((m.senderId === currentUser.id && m.receiverId === activePeer.id) || (m.senderId === activePeer.id && m.receiverId === currentUser.id)) {
+            m.isDeleted = true;
+          }
+        });
+        localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+        lastMessagesHash = '';
+        loadMessages();
+      } catch(e) {
+        alert('Не удалось очистить историю');
+      }
+    }
+
+    async function deleteCurrentChat() {
+      document.getElementById('chat-dropdown-menu').classList.remove('active');
+      if (!activePeer || !confirm('Удалить чат? Он исчезнет из списка, пока вы снова не напишете этому человеку.')) return;
+      try {
+        await fetch('/api/chat/hide', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id })
+        });
+        closeMobileChat();
+        activePeer = null;
+        document.getElementById('input-bar').style.display = 'none';
+        document.getElementById('active-peer-name').innerText = 'Выберите чат';
+        document.getElementById('active-peer-status').innerText = 'нажмите для профиля';
+        loadDialogs();
+      } catch(e) {
+        alert('Не удалось удалить чат');
       }
     }
 
@@ -1106,15 +1288,22 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
-        saveMessagesToLocalCache(messages);
-        renderMessagesContainer(messages);
+        
+        // Обновляем локальный кэш
+        messages.forEach(msg => {
+          let idx = localMessagesCache.findIndex(m => m.id === msg.id);
+          if (idx !== -1) {
+            localMessagesCache[idx] = msg;
+          } else {
+            localMessagesCache.push(msg);
+          }
+        });
+        localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+        
+        renderMessagesContainer(getPeerMessages(activePeer.id));
+        checkVisibleMessages();
       } catch(e) {
-        // Резервное восстановление из локального кэша при сбое сети
-        const cached = localMessagesCache.filter(m => 
-          (m.senderId === currentUser.id && m.receiverId === activePeer.id) ||
-          (m.senderId === activePeer.id && m.receiverId === currentUser.id)
-        );
-        renderMessagesContainer(cached);
+        renderMessagesContainer(getPeerMessages(activePeer.id));
       }
     }
 
@@ -1123,21 +1312,28 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
-        saveMessagesToLocalCache(messages);
         
-        const currentHash = JSON.stringify(messages.map(m => m.id));
-        if (currentHash !== lastMessagesHash) {
-          if (messages.length > 0) {
-            const lastMsg = messages[messages.length - 1];
-            if (lastMsg.senderId === activePeer.id && lastMessagesHash !== '') {
-              if (!mutedPeers.includes(activePeer.id)) {
-                playNotificationSound();
-              }
-            }
+        let hasNewMsg = false;
+        messages.forEach(msg => {
+          let idx = localMessagesCache.findIndex(m => m.id === msg.id);
+          if (idx !== -1) {
+            localMessagesCache[idx] = msg;
+          } else {
+            localMessagesCache.push(msg);
+            if (msg.senderId === activePeer.id) hasNewMsg = true;
           }
-
+        });
+        localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+        
+        const peerMsgs = getPeerMessages(activePeer.id);
+        const currentHash = JSON.stringify(peerMsgs.map(m => m.id + '_' + m.isRead + '_' + m.isDeleted));
+        if (currentHash !== lastMessagesHash) {
+          if (hasNewMsg && lastMessagesHash !== '') {
+            if (!mutedPeers.includes(activePeer.id)) playNotificationSound();
+          }
           lastMessagesHash = currentHash;
-          renderMessagesContainer(messages);
+          renderMessagesContainer(peerMsgs);
+          checkVisibleMessages();
         }
       } catch(e) {}
     }
@@ -1148,6 +1344,7 @@ app.get('*', (req, res) => {
     }
 
     function closeImageViewer() {
+      document.getElementById('image-viewer-modal').classList.add('active') ? document.getElementById('image-viewer-modal').classList.remove('active') : null;
       document.getElementById('image-viewer-modal').classList.remove('active');
     }
 
@@ -1164,6 +1361,8 @@ app.get('*', (req, res) => {
       messages.forEach(m => {
         const div = document.createElement('div');
         div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
+        div.setAttribute('data-msg-id', m.id);
+        div.setAttribute('data-sender-id', m.senderId);
 
         div.oncontextmenu = (e) => {
           e.preventDefault();
@@ -1191,13 +1390,63 @@ app.get('*', (req, res) => {
           }
         }
 
-        html += \`<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">\${m.timestamp || ''}</div>\`;
+        // Галочки под сообщением: одна галочка, если не прочитано, две — если прочитано
+        let ticksHtml = '';
+        if (m.senderId === currentUser.id) {
+          const isReadClass = m.isRead ? 'ticks read' : 'ticks';
+          const ticksSymbol = m.isRead ? '✓✓' : '✓';
+          ticksHtml = \`<span class="\${isReadClass}">\${ticksSymbol}</span>\`;
+        }
+
+        html += \`
+          <div class="msg-footer">
+            <span>\${m.timestamp || ''}</span>
+            \${ticksHtml}
+          </div>
+        \`;
+
         div.innerHTML = html;
         container.appendChild(div);
       });
 
       if (isScrolledToBottom) {
         container.scrollTop = container.scrollHeight;
+      }
+    }
+
+    // Проверка видимости сообщений на экране получателя для фиксации прочтения
+    function checkVisibleMessages() {
+      if (!activePeer) return;
+      const container = document.getElementById('messages-container');
+      const msgElements = container.querySelectorAll('.msg');
+      const containerRect = container.getBoundingClientRect();
+
+      let unreadMsgIds = [];
+
+      msgElements.forEach(el => {
+        const senderId = el.getAttribute('data-sender-id');
+        const msgId = el.getAttribute('data-msg-id');
+        
+        // Если сообщение от собеседника и попало в кадр видимости
+        if (senderId === activePeer.id) {
+          const rect = el.getBoundingClientRect();
+          if (rect.top >= containerRect.top && rect.bottom <= containerRect.bottom) {
+            let msgObj = localMessagesCache.find(m => m.id === msgId);
+            if (msgObj && !msgObj.isRead) {
+              msgObj.isRead = true;
+              unreadMsgIds.push(msgId);
+            }
+          }
+        }
+      });
+
+      if (unreadMsgIds.length > 0) {
+        localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+        fetch('/api/messages/read', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ msgIds: unreadMsgIds })
+        }).catch(e => {});
       }
     }
 
@@ -1211,17 +1460,11 @@ app.get('*', (req, res) => {
       const copyBtn = document.getElementById('action-btn-copy');
       const downloadBtn = document.getElementById('action-btn-download');
 
-      if (msg.text && !msg.fileData) {
-        copyBtn.style.display = 'block';
-      } else {
-        copyBtn.style.display = 'none';
-      }
+      if (msg.text && !msg.fileData) copyBtn.style.display = 'block';
+      else copyBtn.style.display = 'none';
 
-      if (msg.fileData) {
-        downloadBtn.style.display = 'block';
-      } else {
-        downloadBtn.style.display = 'none';
-      }
+      if (msg.fileData) downloadBtn.style.display = 'block';
+      else downloadBtn.style.display = 'none';
 
       document.getElementById('msg-actions-sheet').classList.add('active');
     }
@@ -1237,9 +1480,7 @@ app.get('*', (req, res) => {
       if (selectedMsgObj && selectedMsgObj.text) {
         navigator.clipboard.writeText(selectedMsgObj.text).then(() => {
           closeMsgActions();
-        }).catch(() => {
-          alert('Не удалось скопировать');
-        });
+        }).catch(() => alert('Не удалось скопировать'));
       }
     }
 
@@ -1259,12 +1500,14 @@ app.get('*', (req, res) => {
       if (!selectedMsgId) return;
       try {
         await fetch('/api/messages/' + selectedMsgId, { method: 'DELETE' });
-        localMessagesCache = localMessagesCache.filter(m => m.id !== selectedMsgId);
+        localMessagesCache.forEach(m => {
+          if (m.id === selectedMsgId) m.isDeleted = true;
+        });
         localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
         
         closeMsgActions();
         lastMessagesHash = '';
-        loadMessages();
+        if (activePeer) renderMessagesContainer(getPeerMessages(activePeer.id));
       } catch(e) {
         alert('Не удалось удалить сообщение.');
       }
@@ -1291,18 +1534,10 @@ app.get('*', (req, res) => {
           thumbImg.src = evt.target.result;
           thumbImg.style.display = 'block';
           typeLabel.innerText = 'Фото';
-        } else if (file.type.startsWith('video/')) {
-          thumbImg.src = '';
-          thumbImg.style.display = 'none';
-          typeLabel.innerText = 'Видео';
-        } else if (file.type.startsWith('audio/')) {
-          thumbImg.src = '';
-          thumbImg.style.display = 'none';
-          typeLabel.innerText = 'Аудиозапись';
         } else {
           thumbImg.src = '';
           thumbImg.style.display = 'none';
-          typeLabel.innerText = 'Файл';
+          typeLabel.innerText = file.type.startsWith('video/') ? 'Видео' : (file.type.startsWith('audio/') ? 'Аудио' : 'Файл');
         }
         previewContainer.classList.add('active');
       };
@@ -1359,9 +1594,7 @@ app.get('*', (req, res) => {
           micBtn.innerText = '🔴';
         } catch (e) { alert('Нет доступа к микрофону.'); }
       } else {
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-          mediaRecorder.stop();
-        }
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
         isRecording = false;
         micBtn.innerText = '🎙️';
       }
@@ -1418,7 +1651,8 @@ app.get('*', (req, res) => {
         } else if (res.ok) {
           const data = await res.json();
           if (data.message) {
-            saveMessagesToLocalCache([data.message]);
+            localMessagesCache.push(data.message);
+            localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
           }
         }
 
