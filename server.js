@@ -72,6 +72,8 @@ function decryptText(text) {
   return text;
 }
 
+// ==================== API ====================
+
 app.post('/api/register', (req, res) => {
   let { id, name, avatar, contacts } = req.body;
   const accounts = readAccounts();
@@ -423,6 +425,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
+// ==================== КЛИЕНТ ====================
 app.get('*', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -464,6 +467,7 @@ app.get('*', (req, res) => {
     html, body { height: 100dvh; width: 100vw; background: var(--bg-app); color: var(--text-main); overflow: hidden; position: fixed; }
     .screen { display: none; height: 100dvh; width: 100vw; position: absolute; top: 0; left: 0; }
     .active { display: flex; }
+
     .auth-container { margin: auto; width: 90%; max-width: 360px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); text-align: center; }
     .auth-container h2 { margin-bottom: 20px; color: var(--accent); }
     .input-group { margin-bottom: 15px; text-align: left; }
@@ -472,6 +476,7 @@ app.get('*', (req, res) => {
     .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
     .btn-danger { background: #e53935; color: #fff; }
     .error-msg { color: #e53935; font-size: 12px; margin-top: 8px; display: none; }
+
     #app-container { display: flex; width: 100%; height: 100%; }
     .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
@@ -488,6 +493,7 @@ app.get('*', (req, res) => {
     .chat-list { flex: 1; overflow-y: auto; }
     .chat-item { display: flex; align-items: center; gap: 12px; padding: 12px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background 0.2s; }
     .chat-item:hover, .chat-item.active { background: var(--bg-active); }
+
     .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); position: relative; }
     .chat-header { background: var(--bg-sidebar); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
     .chat-header-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; overflow: hidden; }
@@ -499,31 +505,39 @@ app.get('*', (req, res) => {
     .menu-item { padding: 12px 16px; font-size: 14px; cursor: pointer; border-bottom: 1px solid var(--border); text-align: left; background: none; border-top: none; border-left: none; border-right: none; color: var(--text-main); width: 100%; }
     .menu-item:hover { background: var(--bg-active); }
     .menu-item.danger { color: #e53935; }
+
     .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; }
     .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; position: relative; user-select: none; transition: background 0.2s; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
     .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
+
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
     .audio-preview { width: 240px; max-width: 100%; margin-top: 5px; display: block; }
     .audio-slot { width: 240px; max-width: 100%; height: 40px; margin-top: 5px; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
+
     .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
     .ticks { font-size: 11px; letter-spacing: -3px; font-weight: bold; }
     .ticks.read { color: var(--accent); }
+
     .attachment-preview-container { background: var(--bg-sidebar); padding: 10px 15px; border-top: 1px solid var(--border); display: none; align-items: center; gap: 12px; }
     .attachment-preview-container.active { display: flex; }
     .attachment-thumb { width: 45px; height: 45px; border-radius: 6px; object-fit: cover; background: #000; }
     .attachment-info { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
     .attachment-name { font-size: 13px; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .attachment-cancel { cursor: pointer; color: #e53935; font-size: 18px; padding: 5px; }
+
     .uploading-box { display: flex; align-items: center; gap: 10px; padding: 8px; background: rgba(0,0,0,0.15); border-radius: 8px; margin-top: 5px; font-size: 13px; }
     .spinner { width: 16px; height: 16px; border: 2px solid var(--accent); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
     .input-bar { background: var(--bg-sidebar); padding: 10px; display: flex; gap: 10px; align-items: center; flex-shrink: 0; border-top: 1px solid var(--border); }
     .input-bar input[type="text"] { flex: 1; padding: 12px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; }
     .icon-btn { cursor: pointer; font-size: 22px; user-select: none; border: none; background: transparent; color: var(--text-main); }
+
     .empty-state { margin: auto; text-align: center; color: var(--text-muted); font-size: 14px; }
+
     .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: none; align-items: center; justify-content: center; }
     .modal-overlay.active { display: flex; }
     .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); position: relative; }
@@ -534,17 +548,23 @@ app.get('*', (req, res) => {
     .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
     .profile-link-btn { background: none; border: none; color: var(--accent); font-size: 14px; font-weight: 500; cursor: pointer; padding: 5px; text-align: center; }
     .profile-link-btn:hover { text-decoration: underline; }
+
     #image-viewer-modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: none; align-items: center; justify-content: center; }
     #image-viewer-modal.active { display: flex; }
     #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; object-fit: contain; }
     .viewer-close { position: absolute; top: 20px; right: 20px; color: #fff; font-size: 30px; cursor: pointer; background: none; border: none; }
+
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
+
     .recording-indicator { display: none; align-items: center; gap: 6px; font-size: 12px; color: #e53935; margin-left: 6px; }
     .recording-indicator.active { display: inline-flex; }
     .recording-dot { width: 8px; height: 8px; border-radius: 50%; background: #e53935; animation: recpulse 1s infinite; }
     @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-    @media (min-width: 601px) { .menu-dots-btn { display: flex !important; } }
+
+    @media (min-width: 601px) {
+      .menu-dots-btn { display: flex !important; }
+    }
     @media (max-width: 600px) {
       .sidebar { width: 100%; display: flex; }
       .main-chat { display: none; width: 100%; }
@@ -691,12 +711,14 @@ app.get('*', (req, res) => {
     let currentUser = null;
     let activePeer = null;
     let selectedFile = null;
+
     let mediaRecorder = null;
     let audioChunks = [];
     let isRecording = false;
     let activeStream = null;
     let recordStartedAt = 0;
     let recordingTimerInterval = null;
+
     let recordAudioCtx = null;
     let recordSourceNode = null;
     let recordProcessor = null;
@@ -704,6 +726,7 @@ app.get('*', (req, res) => {
 
     let lastDialogsHash = '';
     let lastMessagesHash = '';
+
     let selectedMsgId = null;
     let selectedMsgObj = null;
     let longTouchTimer = null;
@@ -733,7 +756,11 @@ app.get('*', (req, res) => {
     }
 
     function getAudioSignature(msg) {
-      return [(msg.fileType || ''), (msg.fileName || ''), quickHash(msg.fileData || '')].join('|');
+      return [
+        msg.fileType || '',
+        msg.fileName || '',
+        quickHash(msg.fileData || '')
+      ].join('|');
     }
 
     function dataUrlToBlobUrl(dataUrl) {
@@ -766,27 +793,35 @@ app.get('*', (req, res) => {
             return url;
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('Blob URL error', e);
+      }
       return fileData;
     }
 
     function getOrCreateAudioElement(msg) {
       const existing = audioPool.get(msg.id);
       const signature = getAudioSignature(msg);
-      if (existing && existing.signature === signature) return existing.element;
+
+      if (existing && existing.signature === signature) {
+        return existing.element;
+      }
       if (existing) {
         try { existing.element.pause(); } catch(e) {}
         if (existing.element.parentNode) existing.element.parentNode.removeChild(existing.element);
         audioPool.delete(msg.id);
       }
+
       const audio = document.createElement('audio');
       audio.controls = true;
       audio.className = 'audio-preview';
       audio.preload = 'metadata';
       audio.src = getOrCreateBlobUrl(signature, msg.fileData);
+
       audio.addEventListener('click', e => e.stopPropagation());
       audio.addEventListener('contextmenu', e => e.stopPropagation());
       audio.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
+
       document.getElementById('audio-pool').appendChild(audio);
       audioPool.set(msg.id, { element: audio, signature });
       return audio;
@@ -1242,15 +1277,15 @@ app.get('*', (req, res) => {
         div.onclick = () => openChat(item);
         const avatarId = 'chat_av_' + item.id;
         const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-        div.innerHTML = `
-          <div class="avatar-circle" id="${avatarId}">
-            <div class="online-indicator ${item.isOnline ? 'visible' : ''}"></div>
+        div.innerHTML = \`
+          <div class="avatar-circle" id="\${avatarId}">
+            <div class="online-indicator \${item.isOnline ? 'visible' : ''}"></div>
           </div>
           <div>
-            <div style="font-weight:bold;">${item.name}</div>
-            <div style="font-size:11px;">${onlineText}</div>
+            <div style="font-weight:bold;">\${item.name}</div>
+            <div style="font-size:11px;">\${onlineText}</div>
           </div>
-        `;
+        \`;
         container.appendChild(div);
         renderAvatarIntoElement(document.getElementById(avatarId), item, item.isOnline);
       });
@@ -1293,7 +1328,7 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
+        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
         messages.forEach(msg => {
           let idx = localMessagesCache.findIndex(m => m.id === msg.id);
@@ -1311,7 +1346,7 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
+        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
         let hasNewMsg = false;
         messages.forEach(msg => {
@@ -1374,19 +1409,19 @@ app.get('*', (req, res) => {
         div.ontouchmove = () => clearTimeout(longTouchTimer);
 
         let html = '';
-        if (m.text) html += `<div>${m.text}</div>`;
+        if (m.text) html += \`<div>\${m.text}</div>\`;
 
         const fileType = m.fileType || '';
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
-            html += `<img src="${m.fileData}" class="media-preview" onclick="openImageViewer('${m.fileData}')">`;
+            html += \`<img src="\${m.fileData}" class="media-preview" onclick="openImageViewer('\${m.fileData}')">\`;
           } else if (fileType.startsWith('video/')) {
-            html += `<video src="${m.fileData}" controls class="video-preview"></video>`;
+            html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
           } else if (fileType.startsWith('audio/')) {
-            html += `<div class="audio-slot" data-audio-msg-id="${m.id}"></div>`;
+            html += \`<div class="audio-slot" data-audio-msg-id="\${m.id}"></div>\`;
             validIds.push(m.id);
           } else {
-            html += `<a class="file-link" onclick="event.stopPropagation()">📁 ${m.fileName || 'Файл'}</a>`;
+            html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
           }
         }
 
@@ -1394,15 +1429,15 @@ app.get('*', (req, res) => {
         if (m.senderId === currentUser.id) {
           const isReadClass = m.isRead ? 'ticks read' : 'ticks';
           const ticksSymbol = m.isRead ? '✓✓' : '✓';
-          ticksHtml = `<span class="${isReadClass}">${ticksSymbol}</span>`;
+          ticksHtml = \`<span class="\${isReadClass}">\${ticksSymbol}</span>\`;
         }
 
-        html += `
+        html += \`
           <div class="msg-footer">
-            <span>${m.timestamp || ''}</span>
-            ${ticksHtml}
+            <span>\${m.timestamp || ''}</span>
+            \${ticksHtml}
           </div>
-        `;
+        \`;
 
         div.innerHTML = html;
 
@@ -1540,11 +1575,9 @@ app.get('*', (req, res) => {
       document.getElementById('attachment-preview-container').classList.remove('active');
     }
 
-    // ==================== ЗАПИСЬ ГОЛОСА (WAV через AudioWorklet-совместимый ScriptProcessor) ====================
-    // Ключевая идея: не используем MediaRecorder (он на Android часто даёт
-    // треск/помехи из-за timeslice-чанков и потери данных между ними).
-    // Вместо этого пишем сырые PCM-сэмплы через Web Audio API и в конце
-    // кодируем в WAV (16-bit PCM). Никаких потерь и треска.
+    // ==================== ЗАПИСЬ ГОЛОСА (WAV, чистый звук) ====================
+    // MediaRecorder на Android даёт треск из-за чанков. Поэтому пишем
+    // сырые PCM-сэмплы через Web Audio API и кодируем в WAV.
 
     function floatTo16BitPCM(output, offset, input) {
       for (let i = 0; i < input.length; i++, offset += 2) {
@@ -1580,6 +1613,17 @@ app.get('*', (req, res) => {
       return new Blob([view], { type: 'audio/wav' });
     }
 
+    function cleanupRecordingNodes() {
+      try { if (recordProcessor) recordProcessor.disconnect(); } catch(e) {}
+      try { if (recordSourceNode) recordSourceNode.disconnect(); } catch(e) {}
+      try { if (recordSilentGain) recordSilentGain.disconnect(); } catch(e) {}
+      try { if (recordAudioCtx && recordAudioCtx.state !== 'closed') recordAudioCtx.close(); } catch(e) {}
+      recordProcessor = null;
+      recordSourceNode = null;
+      recordSilentGain = null;
+      recordAudioCtx = null;
+    }
+
     function startRecordingTimer() {
       recordStartedAt = Date.now();
       const indicator = document.getElementById('recording-indicator');
@@ -1603,20 +1647,10 @@ app.get('*', (req, res) => {
       }
     }
 
-    function cleanupRecordingNodes() {
-      try { if (recordProcessor) recordProcessor.disconnect(); } catch(e) {}
-      try { if (recordSourceNode) recordSourceNode.disconnect(); } catch(e) {}
-      try { if (recordSilentGain) recordSilentGain.disconnect(); } catch(e) {}
-      try { if (recordAudioCtx && recordAudioCtx.state !== 'closed') recordAudioCtx.close(); } catch(e) {}
-      recordProcessor = null;
-      recordSourceNode = null;
-      recordSilentGain = null;
-      recordAudioCtx = null;
-    }
-
     async function toggleVoiceRecord() {
       const micBtn = document.getElementById('mic-btn');
 
+      // ---- СТОП ----
       if (isRecording) {
         isRecording = false;
         micBtn.innerText = '🎙️';
@@ -1626,33 +1660,21 @@ app.get('*', (req, res) => {
         const durationMs = Date.now() - recordStartedAt;
         const capturedRate = recordAudioCtx ? recordAudioCtx.sampleRate : 48000;
 
-        // Останавливаем граф
-        try { if (recordProcessor) recordProcessor.disconnect(); } catch(e) {}
-        try { if (recordSourceNode) recordSourceNode.disconnect(); } catch(e) {}
-        try { if (recordSilentGain) recordSilentGain.disconnect(); } catch(e) {}
+        cleanupRecordingNodes();
         try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e) {}
-        try { if (recordAudioCtx && recordAudioCtx.state !== 'closed') recordAudioCtx.close(); } catch(e) {}
-        recordProcessor = null;
-        recordSourceNode = null;
-        recordSilentGain = null;
-        recordAudioCtx = null;
         activeStream = null;
-        mediaRecorder = null;
 
         if (chunks.length === 0) {
           alert('Запись получилась пустой. Попробуйте ещё раз.');
           return;
         }
 
-        // Склеиваем PCM-семплы
+        // Склеиваем PCM
         let totalLen = 0;
         for (const c of chunks) totalLen += c.length;
         const merged = new Float32Array(totalLen);
         let off = 0;
-        for (const c of chunks) {
-          merged.set(c, off);
-          off += c.length;
-        }
+        for (const c of chunks) { merged.set(c, off); off += c.length; }
 
         // Понижаем частоту до 16 кГц — голос звучит нормально, размер меньше
         const targetRate = 16000;
@@ -1663,8 +1685,7 @@ app.get('*', (req, res) => {
           const newLen = Math.floor(merged.length / ratio);
           const down = new Float32Array(newLen);
           for (let i = 0; i < newLen; i++) {
-            const srcIdx = Math.floor(i * ratio);
-            down[i] = merged[srcIdx] || 0;
+            down[i] = merged[Math.floor(i * ratio)] || 0;
           }
           finalSamples = down;
           finalRate = targetRate;
@@ -1689,6 +1710,7 @@ app.get('*', (req, res) => {
         return;
       }
 
+      // ---- СТАРТ ----
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         alert('Ваш браузер не поддерживает запись с микрофона.');
         return;
@@ -1716,8 +1738,8 @@ app.get('*', (req, res) => {
         const source = ctx.createMediaStreamSource(stream);
         recordSourceNode = source;
 
-        // ScriptProcessor — работает везде, включая Android. Размер буфера
-        // 4096 даёт ~85мс при 48кГц, без треска при перегрузке.
+        // ScriptProcessor — работает на всех устройствах, включая Android.
+        // Буфер 4096 = ~85мс при 48кГц, без пропусков.
         const processor = ctx.createScriptProcessor(4096, 1, 1);
         recordProcessor = processor;
 
@@ -1726,12 +1748,12 @@ app.get('*', (req, res) => {
         processor.onaudioprocess = (e) => {
           if (!isRecording) return;
           const input = e.inputBuffer.getChannelData(0);
-          // Копируем, иначе буфер перезапишется
+          // Копируем — иначе буфер перезапишется
           audioChunks.push(new Float32Array(input));
         };
 
-        // На Android ScriptProcessor НЕ работает, пока не подключён к destination.
-        // Ставим silent gain, чтобы в динамик ничего не шло.
+        // На Android ScriptProcessor не работает, пока не подключён к destination.
+        // Silent gain даёт цепочку, но в динамик ничего не идёт.
         const silentGain = ctx.createGain();
         silentGain.gain.value = 0;
         recordSilentGain = silentGain;
@@ -1775,14 +1797,14 @@ app.get('*', (req, res) => {
       if (isVideo) {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
-        tempDiv.innerHTML = `
-          ${text ? '<div>' + text + '</div>' : ''}
+        tempDiv.innerHTML = \`
+          \${text ? '<div>' + text + '</div>' : ''}
           <div class="uploading-box">
             <div class="spinner"></div>
-            <div>Загрузка видео... (${fileToSend.name})</div>
+            <div>Загрузка видео... (\${fileToSend.name})</div>
           </div>
           <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
-        `;
+        \`;
         container.appendChild(tempDiv);
         container.scrollTop = container.scrollHeight;
       }
