@@ -5,7 +5,6 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Увеличен лимит для загрузки фото, видео и голосовых сообщений
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -16,7 +15,6 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('[ОШИБКА ПРОМИСА]:', reason);
 });
 
-// Инициализация директорий хранения
 const SERV_DIR = __dirname;
 const ARXIV_DIR = path.join(SERV_DIR, 'arxiv');
 const ACCOUNTS_DIR = path.join(ARXIV_DIR, 'accounts');
@@ -29,7 +27,6 @@ const MESSAGES_DIR = path.join(ARXIV_DIR, 'messages');
 const ACCOUNTS_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
 const MESSAGES_FILE = path.join(MESSAGES_DIR, 'messages.json');
 
-// Безопасное чтение и запись JSON файлов
 function safeReadJSON(filePath, fallback = []) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -57,7 +54,6 @@ function writeAccounts(data) { safeWriteJSON(ACCOUNTS_FILE, data); }
 function readMessages() { return safeReadJSON(MESSAGES_FILE, []); }
 function writeMessages(data) { safeWriteJSON(MESSAGES_FILE, data); }
 
-// Кодирование текста
 function encryptText(text) {
   if (!text) return '';
   try {
@@ -76,9 +72,8 @@ function decryptText(text) {
   return text;
 }
 
-// ==================== API МАРШРУТЫ ====================
+// ==================== API ====================
 
-// 1. Регистрация / авторизация
 app.post('/api/register', (req, res) => {
   let { id, name, avatar, contacts } = req.body;
   const accounts = readAccounts();
@@ -117,7 +112,6 @@ app.post('/api/register', (req, res) => {
   res.json({ success: true, user });
 });
 
-// 2. Пинг и синхронизация
 app.post('/api/ping', (req, res) => {
   const { id, name, avatar, contacts, knownUsers, syncMessages, readMsgIds, deletedMsgIds } = req.body;
   if (!id) return res.status(400).json({ error: 'No id provided' });
@@ -125,7 +119,6 @@ app.post('/api/ping', (req, res) => {
   const accounts = readAccounts();
   const serverMessages = readMessages();
 
-  // Отметка прочтения
   if (Array.isArray(readMsgIds) && readMsgIds.length > 0) {
     let changed = false;
     serverMessages.forEach(m => {
@@ -137,7 +130,6 @@ app.post('/api/ping', (req, res) => {
     if (changed) writeMessages(serverMessages);
   }
 
-  // Синхронизация удаленных сообщений
   if (Array.isArray(deletedMsgIds) && deletedMsgIds.length > 0) {
     let changed = false;
     serverMessages.forEach(m => {
@@ -149,7 +141,6 @@ app.post('/api/ping', (req, res) => {
     if (changed) writeMessages(serverMessages);
   }
 
-  // Известные пользователи
   if (Array.isArray(knownUsers)) {
     knownUsers.forEach(kUser => {
       if (!kUser.id) return;
@@ -168,7 +159,6 @@ app.post('/api/ping', (req, res) => {
     });
   }
 
-  // Синхронизация локальных сообщений
   if (Array.isArray(syncMessages)) {
     let msgChanged = false;
     syncMessages.forEach(clientMsg => {
@@ -200,7 +190,6 @@ app.post('/api/ping', (req, res) => {
     if (msgChanged) writeMessages(serverMessages);
   }
 
-  // Обновление статуса онлайна текущего пользователя
   let user = accounts.find(u => u.id === id);
   if (!user) {
     user = {
@@ -230,23 +219,18 @@ app.post('/api/ping', (req, res) => {
   });
 });
 
-// 3. Обновление профиля
 app.post('/api/profile/update', (req, res) => {
   const { id, name, avatar } = req.body;
   const accounts = readAccounts();
   let user = accounts.find(u => u.id === id);
-
   if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-
   if (name && name.trim()) user.name = name.trim();
   if (avatar !== undefined) user.avatar = avatar;
   user.updatedAt = Date.now();
-
   writeAccounts(accounts);
   res.json({ success: true, user });
 });
 
-// 4. Получение данных пользователя
 app.get('/api/users/:userId', (req, res) => {
   const accounts = readAccounts();
   const user = accounts.find(u => u.id === req.params.userId);
@@ -255,43 +239,35 @@ app.get('/api/users/:userId', (req, res) => {
   res.json({ id: user.id, name: user.name, avatar: user.avatar || '', isOnline, updatedAt: user.updatedAt });
 });
 
-// 5. Блокировка контактов
 app.post('/api/users/block', (req, res) => {
   const { userId, peerId, block } = req.body;
   const accounts = readAccounts();
   let user = accounts.find(u => u.id === userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
-
   if (!user.blockedContacts) user.blockedContacts = [];
   if (block) {
     if (!user.blockedContacts.includes(peerId)) user.blockedContacts.push(peerId);
   } else {
     user.blockedContacts = user.blockedContacts.filter(id => id !== peerId);
   }
-
   writeAccounts(accounts);
   res.json({ success: true, blockedContacts: user.blockedContacts });
 });
 
-// 6. Скрытие чата
 app.post('/api/chat/hide', (req, res) => {
   const { userId, peerId } = req.body;
   const accounts = readAccounts();
   let user = accounts.find(u => u.id === userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
-
   if (!user.hiddenDialogs) user.hiddenDialogs = [];
   if (!user.hiddenDialogs.includes(peerId)) user.hiddenDialogs.push(peerId);
-
   writeAccounts(accounts);
   res.json({ success: true, hiddenDialogs: user.hiddenDialogs });
 });
 
-// 7. Поиск аккаунтов
 app.get('/api/users/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
   if (!q) return res.json([]);
-  
   const accounts = readAccounts();
   const now = Date.now();
   const results = accounts.filter(u => {
@@ -302,11 +278,9 @@ app.get('/api/users/search', (req, res) => {
     avatar: u.avatar || '',
     isOnline: u.updatedAt && (now - u.updatedAt < 8000)
   }));
-
   res.json(results);
 });
 
-// 8. Отправка сообщений
 app.post('/api/messages/send', (req, res) => {
   const { senderId, receiverId, text, fileData, fileName, fileType } = req.body;
   const accounts = readAccounts();
@@ -364,11 +338,9 @@ app.post('/api/messages/send', (req, res) => {
   res.json({ success: true, message: { ...newMsg, text: text } });
 });
 
-// 9. Отметка о прочтении
 app.post('/api/messages/read', (req, res) => {
   const { msgIds } = req.body;
   if (!Array.isArray(msgIds) || msgIds.length === 0) return res.json({ success: true });
-
   const messages = readMessages();
   let changed = false;
   messages.forEach(m => {
@@ -381,7 +353,6 @@ app.post('/api/messages/read', (req, res) => {
   res.json({ success: true });
 });
 
-// 10. Удаление конкретного сообщения
 app.delete('/api/messages/:msgId', (req, res) => {
   const { msgId } = req.params;
   let messages = readMessages();
@@ -396,7 +367,6 @@ app.delete('/api/messages/:msgId', (req, res) => {
   res.json({ success: true });
 });
 
-// 11. Полная очистка диалога
 app.post('/api/chat/clear', (req, res) => {
   const { userId, peerId } = req.body;
   let messages = readMessages();
@@ -413,11 +383,9 @@ app.post('/api/chat/clear', (req, res) => {
   res.json({ success: true });
 });
 
-// 12. Получение сообщений чата
 app.get('/api/messages/:userId/:peerId', (req, res) => {
   const { userId, peerId } = req.params;
   const messages = readMessages();
-  
   const chatMsgs = messages.filter(m => 
     !m.isDeleted && (
       (m.senderId === userId && m.receiverId === peerId) ||
@@ -427,11 +395,9 @@ app.get('/api/messages/:userId/:peerId', (req, res) => {
     ...m,
     text: decryptText(m.text)
   }));
-
   res.json(chatMsgs);
 });
 
-// 13. Получение списка диалогов
 app.get('/api/dialogs/:userId', (req, res) => {
   const userId = req.params.userId;
   const accounts = readAccounts();
@@ -459,7 +425,7 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
-// ==================== РЕНДЕР КЛИЕНТСКОГО ИНТЕРФЕЙСА ====================
+// ==================== КЛИЕНТ ====================
 app.get('*', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -483,7 +449,6 @@ app.get('*', (req, res) => {
       --border: #0e1621;
       --msg-selected: rgba(82, 136, 193, 0.3);
     }
-
     :root[data-theme="light"] {
       --bg-app: #e6ebee;
       --bg-sidebar: #ffffff;
@@ -498,10 +463,8 @@ app.get('*', (req, res) => {
       --border: #e6ebee;
       --msg-selected: rgba(51, 144, 236, 0.2);
     }
-
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
     html, body { height: 100dvh; width: 100vw; background: var(--bg-app); color: var(--text-main); overflow: hidden; position: fixed; }
-
     .screen { display: none; height: 100dvh; width: 100vw; position: absolute; top: 0; left: 0; }
     .active { display: flex; }
 
@@ -517,22 +480,16 @@ app.get('*', (req, res) => {
     #app-container { display: flex; width: 100%; height: 100%; }
     .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
     .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
-    
     .user-profile-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px; cursor: pointer; }
     .user-info-brief { display: flex; flex-direction: column; overflow: hidden; margin-left: 10px; flex: 1; }
-    
     .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; overflow: visible !important; position: relative; }
     .avatar-circle img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
-
     .online-indicator { position: absolute; bottom: -1px; right: -1px; width: 12px; height: 12px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; z-index: 10; pointer-events: none; }
     .online-indicator.visible { display: block; }
-
     .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
-
     .search-box { position: relative; }
     .search-box input { width: 100%; padding: 10px 12px; border-radius: 18px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; font-size: 14px; }
     .clear-search { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; color: var(--text-muted); display: none; }
-
     .chat-list { flex: 1; overflow-y: auto; }
     .chat-item { display: flex; align-items: center; gap: 12px; padding: 12px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background 0.2s; }
     .chat-item:hover, .chat-item.active { background: var(--bg-active); }
@@ -540,11 +497,9 @@ app.get('*', (req, res) => {
     .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); position: relative; }
     .chat-header { background: var(--bg-sidebar); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
     .chat-header-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; overflow: hidden; }
-    
     .chat-menu-container { position: relative; }
     .menu-dots-btn { background: transparent; border: none; color: var(--text-main); font-size: 20px; cursor: pointer; padding: 8px; border-radius: 50%; display: none; align-items: center; justify-content: center; }
     .menu-dots-btn:hover { background: var(--bg-input); }
-
     .chat-dropdown-menu { position: absolute; right: 0; top: 45px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 220px; display: none; flex-direction: column; z-index: 1000; overflow: hidden; }
     .chat-dropdown-menu.active { display: flex; }
     .menu-item { padding: 12px 16px; font-size: 14px; cursor: pointer; border-bottom: 1px solid var(--border); text-align: left; background: none; border-top: none; border-left: none; border-right: none; color: var(--text-main); width: 100%; }
@@ -552,16 +507,75 @@ app.get('*', (req, res) => {
     .menu-item.danger { color: #e53935; }
 
     .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; }
-    
     .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; position: relative; user-select: none; transition: background 0.2s; }
     .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
     .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
-    
+
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
-    .audio-preview { width: 240px; max-width: 100%; margin-top: 5px; display: block; }
-    .audio-slot { width: 240px; max-width: 100%; height: 40px; margin-top: 5px; }
-    .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
+    .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; cursor: pointer; }
+
+    /* ==== НОВЫЙ КАСТОМНЫЙ АУДИО-ПЛЕЕР ==== */
+    .audio-msg-player {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 6px;
+      padding: 8px 12px;
+      background: rgba(0,0,0,0.18);
+      border-radius: 20px;
+      min-width: 220px;
+      max-width: 100%;
+    }
+    .audio-play-btn {
+      width: 36px;
+      height: 36px;
+      min-width: 36px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      padding-left: 3px;
+      user-select: none;
+    }
+    .audio-play-btn.playing { padding-left: 0; }
+    .audio-progress-wrap {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+    .audio-progress-bar {
+      width: 100%;
+      height: 4px;
+      background: rgba(255,255,255,0.25);
+      border-radius: 2px;
+      position: relative;
+      cursor: pointer;
+      overflow: hidden;
+    }
+    .audio-progress-fill {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 0%;
+      background: #fff;
+      border-radius: 2px;
+      transition: width 0.1s linear;
+    }
+    .audio-time-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+    .audio-hidden-audio { display: none; }
 
     .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
     .ticks { font-size: 11px; letter-spacing: -3px; font-weight: bold; }
@@ -592,7 +606,6 @@ app.get('*', (req, res) => {
     .profile-name { font-size: 20px; font-weight: bold; margin-bottom: 5px; }
     .profile-id { font-size: 13px; color: var(--accent); margin-bottom: 20px; }
     .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
-
     .profile-link-btn { background: none; border: none; color: var(--accent); font-size: 14px; font-weight: 500; cursor: pointer; padding: 5px; text-align: center; }
     .profile-link-btn:hover { text-decoration: underline; }
 
@@ -604,15 +617,9 @@ app.get('*', (req, res) => {
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
 
-    .recording-indicator { display: none; align-items: center; gap: 6px; font-size: 12px; color: #e53935; margin-left: 6px; }
-    .recording-indicator.active { display: inline-flex; }
-    .recording-dot { width: 8px; height: 8px; border-radius: 50%; background: #e53935; animation: recpulse 1s infinite; }
-    @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-
     @media (min-width: 601px) {
       .menu-dots-btn { display: flex !important; }
     }
-
     @media (max-width: 600px) {
       .sidebar { width: 100%; display: flex; }
       .main-chat { display: none; width: 100%; }
@@ -624,7 +631,6 @@ app.get('*', (req, res) => {
 </head>
 <body onclick="onBodyGlobalClick(event)">
 
-  <!-- Экран авторизации -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход в мессенджер</h2>
@@ -636,11 +642,8 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Главный экран приложения -->
   <div id="app-screen" class="screen">
     <div id="app-container">
-      
-      <!-- Боковая панель (Диалоги и поиск) -->
       <div class="sidebar">
         <div class="sidebar-header">
           <div class="user-profile-bar" onclick="openMyProfile()">
@@ -653,17 +656,14 @@ app.get('*', (req, res) => {
             </div>
             <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="event.stopPropagation(); toggleTheme()" title="Сменить тему">🌙</button>
           </div>
-
           <div class="search-box">
             <input type="text" id="search-input" placeholder="Поиск по имени или ID..." oninput="onSearchInput()">
             <span class="clear-search" id="clear-search-btn" onclick="clearSearch()">✕</span>
           </div>
         </div>
-        
         <div class="chat-list" id="chat-list"></div>
       </div>
 
-      <!-- Чат -->
       <div class="main-chat" id="main-chat">
         <div class="chat-header" id="chat-header">
           <button class="btn btn-secondary" style="width:auto; padding:6px 12px; font-size:12px; display:none;" id="back-to-list-btn" onclick="closeMobileChat()">← Назад</button>
@@ -676,7 +676,6 @@ app.get('*', (req, res) => {
               <div id="active-peer-status" style="font-size:11px; color:var(--text-muted);">нажмите для профиля</div>
             </div>
           </div>
-          
           <div class="chat-menu-container">
             <button class="menu-dots-btn" id="chat-menu-dots-btn" onclick="toggleChatDropdown(event)" title="Опции чата">⋮</button>
             <div class="chat-dropdown-menu" id="chat-dropdown-menu">
@@ -702,22 +701,13 @@ app.get('*', (req, res) => {
         <div class="input-bar" id="input-bar" style="display:none;">
           <button class="icon-btn" onclick="triggerFileInput()">📎</button>
           <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
-          
-          <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
-          <div class="recording-indicator" id="recording-indicator">
-            <span class="recording-dot"></span>
-            <span id="recording-timer">0:00</span>
-          </div>
-          
           <input type="text" id="msg-input" placeholder="Напишите сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" style="width:auto; padding:10px 18px; border-radius:20px;" onclick="sendMsg()">➤</button>
         </div>
       </div>
-
     </div>
   </div>
 
-  <!-- Модальные окна -->
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="my-profile-avatar-view">
@@ -725,16 +715,13 @@ app.get('*', (req, res) => {
       </div>
       <div class="profile-name" id="my-profile-name-view">Имя</div>
       <div class="profile-id" id="my-profile-id-view">ID</div>
-      
       <div class="input-group" style="width:100%;">
         <input type="text" id="edit-my-name-input" placeholder="Ваше имя...">
       </div>
-
       <div class="profile-actions" style="align-items: center;">
         <button class="profile-link-btn" onclick="triggerAvatarInput()">Загрузить фото</button>
         <input type="file" id="avatar-file-input" style="display:none;" accept="image/*" onchange="handleAvatarSelect(event)">
         <button class="profile-link-btn" id="remove-avatar-link-btn" style="color: #e53935; display:none;" onclick="removeMyAvatar()">Удалить фото профиля</button>
-        
         <button class="btn" onclick="saveMyProfileChanges()">Сохранить</button>
         <button class="btn btn-secondary" onclick="closeMyProfile()">Закрыть</button>
       </div>
@@ -748,7 +735,6 @@ app.get('*', (req, res) => {
       </div>
       <div class="profile-name" id="peer-profile-name-view">Имя</div>
       <div class="profile-id" id="peer-profile-id-view">ID</div>
-      
       <div class="profile-actions">
         <button class="btn btn-secondary" id="mute-peer-btn" onclick="toggleMutePeer()">Выключить звуковой сигнал</button>
         <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Заблокировать</button>
@@ -769,21 +755,13 @@ app.get('*', (req, res) => {
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
 
-  <!-- Скрытое хранилище аудио-плееров (чтобы не прерывать воспроизведение при синхронизации) -->
+  <!-- Скрытое хранилище аудио-элементов -->
   <div id="audio-pool" style="display:none; position:absolute; width:0; height:0; overflow:hidden;"></div>
 
   <script>
     let currentUser = null;
     let activePeer = null;
     let selectedFile = null;
-    
-    let mediaRecorder = null;
-    let audioChunks = [];
-    let isRecording = false;
-    let activeStream = null;
-    let recordStartedAt = 0;
-    let recordingTimerInterval = null;
-    let lastRecordErrorShown = 0;
 
     let lastDialogsHash = '';
     let lastMessagesHash = '';
@@ -800,11 +778,12 @@ app.get('*', (req, res) => {
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
 
-    // ==================== ПУЛ АУДИО-ПЛЕЕРОВ ====================
-    // Аудио-элементы хранятся в скрытом #audio-pool и переиспользуются по msgId.
-    // Если контент не изменился — элемент НЕ пересоздаётся, воспроизведение не прерывается.
-    // data:URL → Blob URL — стабильнее на Android для воспроизведения.
-    const audioPool = new Map();
+    // ==================== ПУЛ АУДИО ====================
+    // Каждый аудио-элемент создаётся один раз и переиспользуется по msgId.
+    // data:URL → Blob URL — стабильнее на Android/iOS.
+    // Blob URL кэшируется в Map, чтобы не создавать его заново при каждом рендере.
+    const audioPool = new Map(); // msgId -> { element, signature, objectUrl }
+    const blobUrlCache = new Map(); // signature -> objectUrl (шарим между совпадающими данными)
 
     function quickHash(str) {
       if (!str) return '0';
@@ -827,65 +806,64 @@ app.get('*', (req, res) => {
       ].join('|');
     }
 
-    // Конвертируем data:URL в Blob URL (стабильное воспроизведение на Android)
     function dataUrlToBlobUrl(dataUrl) {
-      try {
-        const commaIdx = dataUrl.indexOf(',');
-        if (commaIdx === -1) return null;
-        const meta = dataUrl.substring(5, commaIdx);
-        const isBase64 = meta.includes(';base64');
-        const mime = meta.split(';')[0] || 'audio/webm';
-        let blob;
-        if (isBase64) {
-          const b64 = dataUrl.substring(commaIdx + 1);
-          const bin = atob(b64);
-          const bytes = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-          blob = new Blob([bytes], { type: mime });
-        } else {
-          const decoded = decodeURIComponent(dataUrl.substring(commaIdx + 1));
-          blob = new Blob([decoded], { type: mime });
-        }
-        return URL.createObjectURL(blob);
-      } catch (e) {
-        console.error('dataUrlToBlobUrl error', e);
-        return null;
+      const commaIdx = dataUrl.indexOf(',');
+      if (commaIdx === -1) return null;
+      const meta = dataUrl.substring(5, commaIdx);
+      const isBase64 = meta.includes(';base64');
+      const mime = meta.split(';')[0] || 'audio/webm';
+      let blob;
+      if (isBase64) {
+        const b64 = dataUrl.substring(commaIdx + 1);
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        blob = new Blob([bytes], { type: mime });
+      } else {
+        const decoded = decodeURIComponent(dataUrl.substring(commaIdx + 1));
+        blob = new Blob([decoded], { type: mime });
       }
+      return URL.createObjectURL(blob);
     }
 
+    // Возвращаем стабильный Blob URL для одних и тех же данных
+    function getOrCreateBlobUrl(signature, fileData) {
+      if (blobUrlCache.has(signature)) return blobUrlCache.get(signature);
+      try {
+        if (fileData && fileData.startsWith('data:')) {
+          const url = dataUrlToBlobUrl(fileData);
+          if (url) {
+            blobUrlCache.set(signature, url);
+            return url;
+          }
+        }
+      } catch (e) {
+        console.error('Blob URL error', e);
+      }
+      return fileData;
+    }
+
+    // Возвращает готовый <audio> для скрытого пула.
+    // Если контент не изменился — возвращает тот же элемент (не прерывает воспроизведение).
     function getOrCreateAudioElement(msg) {
       const existing = audioPool.get(msg.id);
       const signature = getAudioSignature(msg);
 
+      if (existing && existing.signature === signature) {
+        return existing.element;
+      }
+
       if (existing) {
-        if (existing.signature === signature) {
-          return existing.element;
-        }
+        // Контент изменился — заменяем
         try { existing.element.pause(); } catch(e) {}
-        if (existing.element.dataset && existing.element.dataset.objectUrl) {
-          try { URL.revokeObjectURL(existing.element.dataset.objectUrl); } catch(e) {}
-        }
         if (existing.element.parentNode) existing.element.parentNode.removeChild(existing.element);
         audioPool.delete(msg.id);
       }
 
       const audio = document.createElement('audio');
-      audio.controls = true;
-      audio.className = 'audio-preview';
       audio.preload = 'metadata';
-
-      // Android Chrome плохо играет audio с data: URL — конвертируем в Blob URL.
-      if (msg.fileData && msg.fileData.startsWith('data:')) {
-        const blobUrl = dataUrlToBlobUrl(msg.fileData);
-        if (blobUrl) {
-          audio.src = blobUrl;
-          audio.dataset.objectUrl = blobUrl;
-        } else {
-          audio.src = msg.fileData;
-        }
-      } else {
-        audio.src = msg.fileData;
-      }
+      audio.src = getOrCreateBlobUrl(signature, msg.fileData);
+      audio.className = 'audio-hidden-audio';
 
       audio.addEventListener('click', e => e.stopPropagation());
       audio.addEventListener('contextmenu', e => e.stopPropagation());
@@ -901,11 +879,16 @@ app.get('*', (req, res) => {
       for (const [msgId, entry] of Array.from(audioPool.entries())) {
         if (!validSet.has(msgId)) {
           try { entry.element.pause(); } catch(e) {}
-          if (entry.element.dataset && entry.element.dataset.objectUrl) {
-            try { URL.revokeObjectURL(entry.element.dataset.objectUrl); } catch(e) {}
-          }
           if (entry.element.parentNode) entry.element.parentNode.removeChild(entry.element);
           audioPool.delete(msgId);
+        }
+      }
+      // Чистим Blob URL, которые больше не используются ни одним элементом
+      const usedSignatures = new Set(Array.from(audioPool.values()).map(v => v.signature));
+      for (const [sig, url] of Array.from(blobUrlCache.entries())) {
+        if (!usedSignatures.has(sig)) {
+          try { URL.revokeObjectURL(url); } catch(e) {}
+          blobUrlCache.delete(sig);
         }
       }
     }
@@ -921,22 +904,211 @@ app.get('*', (req, res) => {
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const osc = audioCtx.createOscillator();
         const gain = audioCtx.createGain();
-        
         osc.type = 'sine';
         osc.frequency.setValueAtTime(587.33, audioCtx.currentTime);
         osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.08);
-        
         gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
-        
         osc.connect(gain);
         gain.connect(audioCtx.destination);
-        
         osc.start();
         osc.stop(audioCtx.currentTime + 0.3);
       } catch(e) {}
     }
 
+    // ==================== КАСТОМНЫЙ ПЛЕЕР ====================
+    // Создаёт UI-обёртку поверх скрытого <audio>. Управляет воспроизведением,
+    // обновляет прогресс и время. Отслеживает состояние play/pause.
+    function formatTime(sec) {
+      if (!isFinite(sec) || sec < 0) sec = 0;
+      const s = Math.floor(sec);
+      const mm = Math.floor(s / 60);
+      const ss = (s % 60).toString().padStart(2, '0');
+      return mm + ':' + ss;
+    }
+
+    function buildAudioPlayer(msg) {
+      const audioEl = getOrCreateAudioElement(msg);
+
+      const wrap = document.createElement('div');
+      wrap.className = 'audio-msg-player';
+
+      const playBtn = document.createElement('button');
+      playBtn.className = 'audio-play-btn';
+      playBtn.type = 'button';
+      playBtn.innerText = '▶';
+      playBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleAudioPlay(audioEl, playBtn);
+      });
+      playBtn.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
+
+      const progressWrap = document.createElement('div');
+      progressWrap.className = 'audio-progress-wrap';
+
+      const bar = document.createElement('div');
+      bar.className = 'audio-progress-bar';
+      const fill = document.createElement('div');
+      fill.className = 'audio-progress-fill';
+      bar.appendChild(fill);
+
+      const timeRow = document.createElement('div');
+      timeRow.className = 'audio-time-row';
+      const curEl = document.createElement('span');
+      curEl.innerText = '0:00';
+      const durEl = document.createElement('span');
+      durEl.innerText = '0:00';
+      timeRow.appendChild(curEl);
+      timeRow.appendChild(durEl);
+
+      progressWrap.appendChild(bar);
+      progressWrap.appendChild(timeRow);
+
+      wrap.appendChild(playBtn);
+      wrap.appendChild(progressWrap);
+
+      // Клик по прогресс-бару — перемотка
+      const seekAt = (clientX) => {
+        const rect = bar.getBoundingClientRect();
+        let ratio = (clientX - rect.left) / rect.width;
+        if (ratio < 0) ratio = 0;
+        if (ratio > 1) ratio = 1;
+        const dur = audioEl.duration;
+        if (isFinite(dur) && dur > 0) {
+          audioEl.currentTime = ratio * dur;
+          fill.style.width = (ratio * 100) + '%';
+          curEl.innerText = formatTime(audioEl.currentTime);
+        }
+      };
+      bar.addEventListener('click', (e) => { e.stopPropagation(); seekAt(e.clientX); });
+      bar.addEventListener('touchstart', (e) => {
+        e.stopPropagation();
+        if (e.touches && e.touches[0]) seekAt(e.touches[0].clientX);
+      }, { passive: true });
+
+      // Обновление UI
+      const onTime = () => {
+        const cur = audioEl.currentTime || 0;
+        const dur = audioEl.duration || 0;
+        curEl.innerText = formatTime(cur);
+        durEl.innerText = formatTime(dur);
+        if (dur > 0) fill.style.width = ((cur / dur) * 100) + '%';
+      };
+      const onLoaded = () => {
+        durEl.innerText = formatTime(audioEl.duration || 0);
+      };
+      const onPlay = () => {
+        playBtn.innerText = '❚❚';
+        playBtn.classList.add('playing');
+      };
+      const onPause = () => {
+        playBtn.innerText = '▶';
+        playBtn.classList.remove('playing');
+      };
+      const onEnded = () => {
+        playBtn.innerText = '▶';
+        playBtn.classList.remove('playing');
+        fill.style.width = '0%';
+        curEl.innerText = '0:00';
+      };
+
+      // Привязываем слушателей один раз на элемент, помечаем
+      if (!audioEl._uiBound) {
+        audioEl._uiBound = true;
+        audioEl.addEventListener('timeupdate', onTime);
+        audioEl.addEventListener('loadedmetadata', onLoaded);
+        audioEl.addEventListener('play', onPlay);
+        audioEl.addEventListener('pause', onPause);
+        audioEl.addEventListener('ended', onEnded);
+      }
+      // Но каждый рендер может создать новый UI-контейнер, поэтому
+      // заново синхронизируем текущее состояние
+      if (!audioEl.paused && !audioEl.ended) {
+        playBtn.innerText = '❚❚';
+        playBtn.classList.add('playing');
+      } else {
+        playBtn.innerText = '▶';
+        playBtn.classList.remove('playing');
+      }
+      onTime();
+      if (audioEl.duration) onLoaded();
+
+      // Привязываем ссылку UI к элементу, чтобы onPlay/onPause могли её найти
+      audioEl._uiRefs = { playBtn, fill, curEl, durEl };
+      // Обновим замыкания — заменим обработчики, чтобы работали с текущими refs
+      if (audioEl._uiBound) {
+        // Убираем старые, добавляем новые
+        audioEl.removeEventListener('play', audioEl._onPlay);
+        audioEl.removeEventListener('pause', audioEl._onPause);
+        audioEl.removeEventListener('ended', audioEl._onEnded);
+        audioEl.removeEventListener('timeupdate', audioEl._onTime);
+        audioEl.removeEventListener('loadedmetadata', audioEl._onLoaded);
+      }
+      audioEl._onTime = () => {
+        const r = audioEl._uiRefs;
+        if (!r) return;
+        const cur = audioEl.currentTime || 0;
+        const dur = audioEl.duration || 0;
+        r.curEl.innerText = formatTime(cur);
+        r.durEl.innerText = formatTime(dur);
+        if (dur > 0) r.fill.style.width = ((cur / dur) * 100) + '%';
+      };
+      audioEl._onLoaded = () => {
+        const r = audioEl._uiRefs;
+        if (!r) return;
+        r.durEl.innerText = formatTime(audioEl.duration || 0);
+      };
+      audioEl._onPlay = () => {
+        const r = audioEl._uiRefs;
+        if (!r) return;
+        r.playBtn.innerText = '❚❚';
+        r.playBtn.classList.add('playing');
+      };
+      audioEl._onPause = () => {
+        const r = audioEl._uiRefs;
+        if (!r) return;
+        r.playBtn.innerText = '▶';
+        r.playBtn.classList.remove('playing');
+      };
+      audioEl._onEnded = () => {
+        const r = audioEl._uiRefs;
+        if (!r) return;
+        r.playBtn.innerText = '▶';
+        r.playBtn.classList.remove('playing');
+        r.fill.style.width = '0%';
+        r.curEl.innerText = '0:00';
+      };
+      audioEl.addEventListener('timeupdate', audioEl._onTime);
+      audioEl.addEventListener('loadedmetadata', audioEl._onLoaded);
+      audioEl.addEventListener('play', audioEl._onPlay);
+      audioEl.addEventListener('pause', audioEl._onPause);
+      audioEl.addEventListener('ended', audioEl._onEnded);
+
+      return wrap;
+    }
+
+    function toggleAudioPlay(audioEl, playBtn) {
+      // Если у пользователя играет другое аудио — остановим его
+      if (audioEl.paused) {
+        for (const entry of audioPool.values()) {
+          if (entry.element !== audioEl && !entry.element.paused) {
+            try { entry.element.pause(); } catch(e) {}
+          }
+        }
+        const p = audioEl.play();
+        if (p && typeof p.catch === 'function') {
+          p.catch(err => {
+            console.error('play error', err);
+            // На iOS/Android бывает, что нужно ещё раз нажать
+            if (playBtn) playBtn.innerText = '▶';
+          });
+        }
+      } else {
+        audioEl.pause();
+      }
+    }
+
+    // ==================== ОБЩЕЕ ====================
     window.addEventListener('DOMContentLoaded', () => {
       const savedUser = localStorage.getItem('messenger_user');
       if (savedUser) {
@@ -982,7 +1154,6 @@ app.get('*', (req, res) => {
       Array.from(el.childNodes).forEach(node => {
         if (node !== indicator) el.removeChild(node);
       });
-
       if (userObj && userObj.avatar) {
         const img = document.createElement('img');
         img.src = userObj.avatar;
@@ -996,7 +1167,6 @@ app.get('*', (req, res) => {
         span.innerText = '?';
         el.insertBefore(span, indicator);
       }
-
       if (indicator) {
         if (isOnline) indicator.classList.add('visible');
         else indicator.classList.remove('visible');
@@ -1007,13 +1177,11 @@ app.get('*', (req, res) => {
       const nameInput = document.getElementById('auth-name');
       const name = nameInput.value.trim();
       const errBox = document.getElementById('auth-error');
-
       if (!name) {
         errBox.innerText = 'Введите ваше имя.';
         errBox.style.display = 'block';
         return;
       }
-
       try {
         const res = await fetch('/api/register', {
           method: 'POST',
@@ -1038,13 +1206,11 @@ app.get('*', (req, res) => {
     function startApp() {
       document.getElementById('auth-screen').classList.remove('active');
       document.getElementById('app-screen').classList.add('active');
-
       updateMyProfileUI();
       sendPing();
       loadDialogs();
-      
       setInterval(() => {
-        if (currentUser && !isRecording) {
+        if (currentUser) {
           sendPing();
           loadDialogsQuiet();
           if (activePeer) {
@@ -1102,7 +1268,6 @@ app.get('*', (req, res) => {
           activePeer.isOnline = info.isOnline;
           activePeer.name = info.name;
           activePeer.avatar = info.avatar;
-          
           const statusEl = document.getElementById('active-peer-status');
           if (info.isOnline) {
             statusEl.innerText = 'в сети';
@@ -1136,11 +1301,9 @@ app.get('*', (req, res) => {
       renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
       document.getElementById('my-profile-name-view').innerText = currentUser.name;
       document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
-      
       const removeLinkBtn = document.getElementById('remove-avatar-link-btn');
       if (currentUser.avatar) removeLinkBtn.style.display = 'block';
       else removeLinkBtn.style.display = 'none';
-
       document.getElementById('my-profile-modal').classList.add('active');
     }
 
@@ -1175,7 +1338,6 @@ app.get('*', (req, res) => {
     async function saveMyProfileChanges() {
       const newName = document.getElementById('edit-my-name-input').value.trim();
       if (newName) currentUser.name = newName;
-
       try {
         const res = await fetch('/api/profile/update', {
           method: 'POST',
@@ -1199,17 +1361,14 @@ app.get('*', (req, res) => {
       renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
       document.getElementById('peer-profile-name-view').innerText = activePeer.name;
       document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
-
       const blockBtn = document.getElementById('block-peer-btn');
       const isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.includes(activePeer.id);
       blockBtn.innerText = isBlocked ? 'Разблокировать' : 'Заблокировать';
       blockBtn.className = isBlocked ? 'btn btn-secondary' : 'btn btn-danger';
-
       const muteBtn = document.getElementById('mute-peer-btn');
       const isMuted = mutedPeers.includes(activePeer.id);
       muteBtn.innerText = isMuted ? 'Включить звуковой сигнал' : 'Выключить звуковой сигнал';
       muteBtn.className = isMuted ? 'btn' : 'btn btn-secondary';
-
       document.getElementById('peer-profile-modal').classList.add('active');
     }
 
@@ -1235,7 +1394,6 @@ app.get('*', (req, res) => {
       if (!activePeer) return;
       const isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.includes(activePeer.id);
       const nextBlock = !isBlocked;
-
       try {
         const res = await fetch('/api/users/block', {
           method: 'POST',
@@ -1315,7 +1473,6 @@ app.get('*', (req, res) => {
         const res = await fetch('/api/dialogs/' + currentUser.id);
         const dialogs = await res.json();
         dialogs.forEach(d => cacheUser(d));
-        
         const currentHash = JSON.stringify(dialogs);
         if (currentHash !== lastDialogsHash) {
           lastDialogsHash = currentHash;
@@ -1327,13 +1484,11 @@ app.get('*', (req, res) => {
     async function onSearchInput() {
       const q = document.getElementById('search-input').value.trim();
       const clearBtn = document.getElementById('clear-search-btn');
-
       if (!q) {
         clearBtn.style.display = 'none';
         loadDialogs();
         return;
       }
-
       clearBtn.style.display = 'block';
       try {
         const res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
@@ -1353,20 +1508,16 @@ app.get('*', (req, res) => {
       const container = document.getElementById('chat-list');
       const currentActiveId = activePeer ? activePeer.id : null;
       container.innerHTML = '';
-
       if (!list || list.length === 0) {
         container.innerHTML = '<div style="padding:15px; color:var(--text-muted); font-size:12px; text-align:center;">Ничего не найдено</div>';
         return;
       }
-
       list.forEach(item => {
         const div = document.createElement('div');
         div.className = 'chat-item ' + (currentActiveId === item.id ? 'active' : '');
         div.onclick = () => openChat(item);
-
         const avatarId = 'chat_av_' + item.id;
         const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-
         div.innerHTML = \`
           <div class="avatar-circle" id="\${avatarId}">
             <div class="online-indicator \${item.isOnline ? 'visible' : ''}"></div>
@@ -1386,7 +1537,6 @@ app.get('*', (req, res) => {
       activePeer = peer;
       lastMessagesHash = '';
       document.getElementById('active-peer-name').innerText = peer.name;
-      
       const statusEl = document.getElementById('active-peer-status');
       if (peer.isOnline) {
         statusEl.innerText = 'в сети';
@@ -1395,24 +1545,19 @@ app.get('*', (req, res) => {
         statusEl.innerText = 'не в сети';
         statusEl.style.color = 'var(--text-muted)';
       }
-
       renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), peer, peer.isOnline);
       document.getElementById('input-bar').style.display = 'flex';
-      
       if (!currentUser.contacts) currentUser.contacts = [];
       if (!currentUser.contacts.includes(peer.id)) {
         currentUser.contacts.push(peer.id);
         localStorage.setItem('messenger_user', JSON.stringify(currentUser));
       }
-
       const chatItems = document.querySelectorAll('.chat-item');
       chatItems.forEach(el => el.classList.remove('active'));
-      
       if (window.innerWidth <= 600) {
         document.getElementById('app-screen').classList.add('app-mobile-chat');
         document.getElementById('back-to-list-btn').style.display = 'block';
       }
-
       loadMessages();
     }
 
@@ -1426,17 +1571,12 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
-        
         messages.forEach(msg => {
           let idx = localMessagesCache.findIndex(m => m.id === msg.id);
-          if (idx !== -1) {
-            localMessagesCache[idx] = msg;
-          } else {
-            localMessagesCache.push(msg);
-          }
+          if (idx !== -1) localMessagesCache[idx] = msg;
+          else localMessagesCache.push(msg);
         });
         localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
-        
         renderMessagesContainer(getPeerMessages(activePeer.id));
         checkVisibleMessages();
       } catch(e) {
@@ -1449,19 +1589,16 @@ app.get('*', (req, res) => {
       try {
         const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
-        
         let hasNewMsg = false;
         messages.forEach(msg => {
           let idx = localMessagesCache.findIndex(m => m.id === msg.id);
-          if (idx !== -1) {
-            localMessagesCache[idx] = msg;
-          } else {
+          if (idx !== -1) localMessagesCache[idx] = msg;
+          else {
             localMessagesCache.push(msg);
             if (msg.senderId === activePeer.id) hasNewMsg = true;
           }
         });
         localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
-        
         const peerMsgs = getPeerMessages(activePeer.id);
         const currentHash = JSON.stringify(peerMsgs.map(m => m.id + '_' + m.isRead + '_' + m.isDeleted));
         if (currentHash !== lastMessagesHash) {
@@ -1487,16 +1624,13 @@ app.get('*', (req, res) => {
     function renderMessagesContainer(messages) {
       const container = document.getElementById('messages-container');
       const isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
-
       container.innerHTML = '';
       if (!messages || messages.length === 0) {
         cleanupAudioPool([]);
         container.innerHTML = '<div class="empty-state">Нет сообщений. Напишите первыми!</div>';
         return;
       }
-
       const validIds = [];
-
       messages.forEach(m => {
         const div = document.createElement('div');
         div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
@@ -1504,12 +1638,12 @@ app.get('*', (req, res) => {
         div.setAttribute('data-sender-id', m.senderId);
 
         div.oncontextmenu = (e) => {
-          if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
+          if (e.target.closest && e.target.closest('.audio-msg-player')) return;
           e.preventDefault();
           openMsgActions(m, div);
         };
         div.ontouchstart = (e) => {
-          if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
+          if (e.target.closest && e.target.closest('.audio-msg-player')) return;
           longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
         };
         div.ontouchend = () => clearTimeout(longTouchTimer);
@@ -1519,13 +1653,16 @@ app.get('*', (req, res) => {
         if (m.text) html += \`<div>\${m.text}</div>\`;
 
         const fileType = m.fileType || '';
+        const isAudio = fileType.startsWith('audio/') || (m.fileName && /\\.(webm|ogg|mp3|m4a|aac|wav|opus)$/i.test(m.fileName));
+
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
             html += \`<img src="\${m.fileData}" class="media-preview" onclick="openImageViewer('\${m.fileData}')">\`;
           } else if (fileType.startsWith('video/')) {
             html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
-          } else if (fileType.startsWith('audio/')) {
-            html += \`<div class="audio-slot" data-audio-msg-id="\${m.id}"></div>\`;
+          } else if (isAudio) {
+            // Плейсхолдер: реальный плеер вставим ниже через buildAudioPlayer
+            html += \`<div class="audio-player-slot" data-audio-msg-id="\${m.id}"></div>\`;
             validIds.push(m.id);
           } else {
             html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
@@ -1548,20 +1685,16 @@ app.get('*', (req, res) => {
 
         div.innerHTML = html;
 
-        const slot = div.querySelector('.audio-slot');
+        const slot = div.querySelector('.audio-player-slot');
         if (slot) {
-          const audioEl = getOrCreateAudioElement(m);
-          slot.replaceWith(audioEl);
+          const playerEl = buildAudioPlayer(m);
+          slot.replaceWith(playerEl);
         }
 
         container.appendChild(div);
       });
-
       cleanupAudioPool(validIds);
-
-      if (isScrolledToBottom) {
-        container.scrollTop = container.scrollHeight;
-      }
+      if (isScrolledToBottom) container.scrollTop = container.scrollHeight;
     }
 
     function checkVisibleMessages() {
@@ -1569,13 +1702,10 @@ app.get('*', (req, res) => {
       const container = document.getElementById('messages-container');
       const msgElements = container.querySelectorAll('.msg');
       const containerRect = container.getBoundingClientRect();
-
       let unreadMsgIds = [];
-
       msgElements.forEach(el => {
         const senderId = el.getAttribute('data-sender-id');
         const msgId = el.getAttribute('data-msg-id');
-        
         if (senderId === activePeer.id) {
           const rect = el.getBoundingClientRect();
           if (rect.top >= containerRect.top && rect.bottom <= containerRect.bottom) {
@@ -1587,7 +1717,6 @@ app.get('*', (req, res) => {
           }
         }
       });
-
       if (unreadMsgIds.length > 0) {
         localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
         fetch('/api/messages/read', {
@@ -1601,19 +1730,14 @@ app.get('*', (req, res) => {
     function openMsgActions(msg, element) {
       selectedMsgId = msg.id;
       selectedMsgObj = msg;
-
       document.querySelectorAll('.msg').forEach(el => el.classList.remove('selected-msg'));
       element.classList.add('selected-msg');
-
       const copyBtn = document.getElementById('action-btn-copy');
       const downloadBtn = document.getElementById('action-btn-download');
-
       if (msg.text && !msg.fileData) copyBtn.style.display = 'block';
       else copyBtn.style.display = 'none';
-
       if (msg.fileData) downloadBtn.style.display = 'block';
       else downloadBtn.style.display = 'none';
-
       document.getElementById('msg-actions-sheet').classList.add('active');
     }
 
@@ -1652,7 +1776,6 @@ app.get('*', (req, res) => {
           if (m.id === selectedMsgId) m.isDeleted = true;
         });
         localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
-        
         closeMsgActions();
         lastMessagesHash = '';
         if (activePeer) renderMessagesContainer(getPeerMessages(activePeer.id));
@@ -1671,21 +1794,23 @@ app.get('*', (req, res) => {
       const reader = new FileReader();
       reader.onload = function(evt) {
         selectedFile = { data: evt.target.result, name: file.name, type: file.type };
-        
         const previewContainer = document.getElementById('attachment-preview-container');
         const thumbImg = document.getElementById('attachment-thumb-img');
         const nameLabel = document.getElementById('attachment-name-label');
         const typeLabel = document.getElementById('attachment-type-label');
-
         nameLabel.innerText = file.name;
         if (file.type.startsWith('image/')) {
           thumbImg.src = evt.target.result;
           thumbImg.style.display = 'block';
           typeLabel.innerText = 'Фото';
+        } else if (file.type.startsWith('audio/')) {
+          thumbImg.src = '';
+          thumbImg.style.display = 'none';
+          typeLabel.innerText = 'Аудио';
         } else {
           thumbImg.src = '';
           thumbImg.style.display = 'none';
-          typeLabel.innerText = file.type.startsWith('video/') ? 'Видео' : (file.type.startsWith('audio/') ? 'Аудио' : 'Файл');
+          typeLabel.innerText = file.type.startsWith('video/') ? 'Видео' : 'Файл';
         }
         previewContainer.classList.add('active');
       };
@@ -1698,249 +1823,17 @@ app.get('*', (req, res) => {
       document.getElementById('attachment-preview-container').classList.remove('active');
     }
 
-    // ==================== ЗАПИСЬ ГОЛОСОВЫХ ====================
-
-    function getSupportedMimeType() {
-      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-      const candidates = isIOS
-        ? ['audio/mp4', 'audio/aac', 'audio/mpeg', 'audio/webm;codecs=opus', 'audio/webm']
-        : [
-            'audio/webm;codecs=opus',
-            'audio/ogg;codecs=opus',
-            'audio/webm',
-            'audio/mp4',
-            'audio/aac',
-            'audio/mpeg'
-          ];
-      for (const t of candidates) {
-        try {
-          if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
-        } catch (e) {}
-      }
-      return '';
-    }
-
-    // Ждём, пока поток реально начнёт отдавать звук (на Android первые ~300мс — тишина)
-    function waitForAudioWarmup(stream, ms = 300) {
-      return new Promise(resolve => {
-        try {
-          const ctx = new (window.AudioContext || window.webkitAudioContext)();
-          const src = ctx.createMediaStreamSource(stream);
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 512;
-          src.connect(analyser);
-          const data = new Uint8Array(analyser.fftSize);
-          const started = Date.now();
-
-          function tick() {
-            analyser.getByteTimeDomainData(data);
-            let maxDev = 0;
-            for (let i = 0; i < data.length; i++) {
-              const v = Math.abs(data[i] - 128);
-              if (v > maxDev) maxDev = v;
-            }
-            // Если появился хоть какой-то сигнал или прошло ms — продолжаем
-            if (maxDev > 2 || Date.now() - started > ms) {
-              try { src.disconnect(); } catch(e) {}
-              try { ctx.close(); } catch(e) {}
-              resolve(true);
-            } else {
-              requestAnimationFrame(tick);
-            }
-          }
-          requestAnimationFrame(tick);
-        } catch (e) {
-          setTimeout(() => resolve(true), ms);
-        }
-      });
-    }
-
-    function startRecordingTimer() {
-      recordStartedAt = Date.now();
-      const indicator = document.getElementById('recording-indicator');
-      const timerEl = document.getElementById('recording-timer');
-      indicator.classList.add('active');
-      if (recordingTimerInterval) clearInterval(recordingTimerInterval);
-      recordingTimerInterval = setInterval(() => {
-        const s = Math.floor((Date.now() - recordStartedAt) / 1000);
-        const mm = Math.floor(s / 60);
-        const ss = (s % 60).toString().padStart(2, '0');
-        timerEl.innerText = mm + ':' + ss;
-      }, 200);
-    }
-
-    function stopRecordingTimer() {
-      const indicator = document.getElementById('recording-indicator');
-      indicator.classList.remove('active');
-      if (recordingTimerInterval) {
-        clearInterval(recordingTimerInterval);
-        recordingTimerInterval = null;
-      }
-    }
-
-    async function toggleVoiceRecord() {
-      const micBtn = document.getElementById('mic-btn');
-
-      // -------- ОСТАНОВКА ЗАПИСИ --------
-      if (isRecording) {
-        isRecording = false;
-        micBtn.innerText = '🎙️';
-        stopRecordingTimer();
-
-        try {
-          if (mediaRecorder && mediaRecorder.state === 'recording') {
-            try { mediaRecorder.requestData && mediaRecorder.requestData(); } catch(e) {}
-            mediaRecorder.stop();
-          }
-        } catch (e) {
-          console.error('stop error', e);
-        }
-        return;
-      }
-
-      // -------- СТАРТ ЗАПИСИ --------
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        alert('Ваш браузер не поддерживает запись с микрофона.');
-        return;
-      }
-
-      try {
-        // 1) Запрашиваем разрешение и получаем поток
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            channelCount: 1
-          },
-          video: false
-        });
-
-        activeStream = stream;
-
-        // 2) Ждём прогрева микрофона (важно для Android)
-        await waitForAudioWarmup(stream, 300);
-
-        // 3) Создаём MediaRecorder
-        const mimeType = getSupportedMimeType();
-
-        let options = {};
-        if (mimeType) options.mimeType = mimeType;
-        options.audioBitsPerSecond = 32000;
-
-        try {
-          mediaRecorder = new MediaRecorder(stream, options);
-        } catch (e) {
-          try {
-            mediaRecorder = mimeType
-              ? new MediaRecorder(stream, { mimeType })
-              : new MediaRecorder(stream);
-          } catch (e2) {
-            alert('Не удалось создать рекордер: ' + e2.message);
-            try { stream.getTracks().forEach(t => t.stop()); } catch(_) {}
-            activeStream = null;
-            return;
-          }
-        }
-
-        audioChunks = [];
-
-        // 4) ВАЖНО: собираем чанки каждые 250мс
-        mediaRecorder.ondataavailable = e => {
-          if (e.data && e.data.size > 0) {
-            audioChunks.push(e.data);
-          }
-        };
-
-        mediaRecorder.onerror = e => {
-          console.error('MediaRecorder error', e);
-          if (Date.now() - lastRecordErrorShown > 3000) {
-            lastRecordErrorShown = Date.now();
-            alert('Ошибка записи аудио: ' + (e.error ? e.error.name : 'unknown'));
-          }
-        };
-
-        mediaRecorder.onstop = () => {
-          const actualType = (mediaRecorder && mediaRecorder.mimeType) || mimeType || 'audio/webm';
-          const totalSize = audioChunks.reduce((s, c) => s + c.size, 0);
-          const durationMs = Date.now() - recordStartedAt;
-
-          // Освобождаем поток микрофона
-          try {
-            if (activeStream) activeStream.getTracks().forEach(t => t.stop());
-          } catch (e) {}
-          activeStream = null;
-
-          // Слишком короткая или пустая запись — не отправляем
-          if (totalSize < 500 || audioChunks.length === 0) {
-            alert('Запись получилась пустой или слишком короткой. Попробуйте ещё раз.');
-            return;
-          }
-
-          const audioBlob = new Blob(audioChunks, { type: actualType });
-
-          const reader = new FileReader();
-          reader.onload = function(evt) {
-            const ext = actualType.includes('mp4') ? 'm4a'
-                      : actualType.includes('aac') ? 'aac'
-                      : actualType.includes('ogg') ? 'ogg'
-                      : 'webm';
-
-            selectedFile = {
-              data: evt.target.result,
-              name: 'voice_' + Date.now() + '.' + ext,
-              type: actualType
-            };
-
-            const previewContainer = document.getElementById('attachment-preview-container');
-            document.getElementById('attachment-thumb-img').style.display = 'none';
-            document.getElementById('attachment-name-label').innerText = 'Голосовое сообщение (' +
-              Math.max(1, Math.round(durationMs / 1000)) + 'с)';
-            document.getElementById('attachment-type-label').innerText = 'Аудио (нажмите ➤ чтобы отправить)';
-            previewContainer.classList.add('active');
-          };
-          reader.onerror = () => {
-            alert('Не удалось прочитать записанное аудио. Попробуйте ещё раз.');
-          };
-          reader.readAsDataURL(audioBlob);
-        };
-
-        // 5) Стартуем с timeslice — ключевой момент для Android
-        mediaRecorder.start(250);
-        isRecording = true;
-        micBtn.innerText = '🔴';
-        startRecordingTimer();
-
-      } catch (err) {
-        console.error('getUserMedia error', err);
-        let msg = 'Нет доступа к микрофону.';
-        if (err && err.name === 'NotAllowedError') msg = 'Вы отклонили доступ к микрофону. Разрешите в настройках браузера.';
-        else if (err && err.name === 'NotFoundError') msg = 'Микрофон не найден на устройстве.';
-        else if (err && err.name === 'NotReadableError') msg = 'Микрофон занят другим приложением.';
-        alert(msg);
-        try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e) {}
-        activeStream = null;
-        isRecording = false;
-        micBtn.innerText = '🎙️';
-        stopRecordingTimer();
-      }
-    }
-
     async function sendMsg() {
       if (!activePeer) return;
       const input = document.getElementById('msg-input');
       const text = input.value.trim();
       const fileToSend = selectedFile;
-
       if (!text && !fileToSend) return;
-
       input.value = '';
       cancelAttachment();
 
       const isVideo = fileToSend && fileToSend.type && fileToSend.type.startsWith('video/');
       const container = document.getElementById('messages-container');
-      
       let tempDiv = null;
       if (isVideo) {
         tempDiv = document.createElement('div');
@@ -1972,7 +1865,6 @@ app.get('*', (req, res) => {
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(body)
         });
-
         if (res.status === 403) {
           alert('Сообщение не доставлено: чат заблокирован.');
         } else if (res.ok) {
@@ -1982,7 +1874,6 @@ app.get('*', (req, res) => {
             localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
           }
         }
-
         if (tempDiv) tempDiv.remove();
         lastMessagesHash = '';
         loadMessages();
