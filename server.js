@@ -603,16 +603,6 @@ app.get('*', (req, res) => {
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
 
-    /* Скрытое фоновое хранилище обрабатываемых аудиофайлов */
-    #hidden-audio-processor-container {
-      display: none !important;
-      position: absolute;
-      width: 0;
-      height: 0;
-      opacity: 0;
-      pointer-events: none;
-    }
-
     @media (min-width: 601px) {
       .menu-dots-btn { display: flex !important; }
     }
@@ -767,9 +757,6 @@ app.get('*', (req, res) => {
     <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
-
-  <!-- Скрытый контейнер для фоновой ("теневой") обработки аудио без дергания интерфейса -->
-  <div id="hidden-audio-processor-container"></div>
 
   <script>
     let currentUser = null;
@@ -1245,15 +1232,14 @@ app.get('*', (req, res) => {
         const avatarId = 'chat_av_' + item.id;
         const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
 
-        div.innerHTML = `
-          <div class="avatar-circle" id="${avatarId}">
-            <div class="online-indicator ${item.isOnline ? 'visible' : ''}"></div>
-          </div>
-          <div>
-            <div style="font-weight:bold;">${item.name}</div>
-            <div style="font-size:11px;">${onlineText}</div>
-          </div>
-        `;
+        div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' +
+            '<div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div>' +
+          '</div>' +
+          '<div>' +
+            '<div style="font-weight:bold;">' + item.name + '</div>' +
+            '<div style="font-size:11px;">' + onlineText + '</div>' +
+          '</div>';
+
         container.appendChild(div);
         renderAvatarIntoElement(document.getElementById(avatarId), item, item.isOnline);
       });
@@ -1300,7 +1286,7 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
+        const res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
         const messages = await res.json();
         
         messages.forEach(msg => {
@@ -1323,7 +1309,7 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
+        const res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
         const messages = await res.json();
         
         let hasNewMsg = false;
@@ -1360,48 +1346,6 @@ app.get('*', (req, res) => {
       document.getElementById('image-viewer-modal').classList.remove('active');
     }
 
-    // ТЕНЕВАЯ ФОНОВАЯ ОБРАБОТКА И СРАВНЕНИЕ АУДИОФАЙЛОВ
-    function processAudioInBackground(msgId, incomingFileData) {
-      if (!incomingFileData) return;
-
-      const shadowContainer = document.getElementById('hidden-audio-processor-container');
-      let shadowAudio = document.getElementById(`shadow-audio-${msgId}`);
-      
-      const newHash = String(incomingFileData.length) + '_' + incomingFileData.slice(-30);
-
-      if (!shadowAudio) {
-        shadowAudio = document.createElement('audio');
-        shadowAudio.id = `shadow-audio-${msgId}`;
-        shadowAudio.preload = 'auto';
-        shadowAudio.setAttribute('data-audio-hash', '');
-        shadowContainer.appendChild(shadowAudio);
-      }
-
-      const currentHash = shadowAudio.getAttribute('data-audio-hash');
-
-      if (currentHash === newHash) {
-        return;
-      }
-
-      shadowAudio.setAttribute('data-audio-hash', newHash);
-      shadowAudio.src = incomingFileData;
-
-      shadowAudio.oncanplaythrough = () => {
-        const visibleAudio = document.getElementById(`audio-player-${msgId}`);
-        if (visibleAudio) {
-          const wasPlaying = !visibleAudio.paused;
-          const currentTime = visibleAudio.currentTime;
-
-          visibleAudio.src = incomingFileData;
-
-          if (wasPlaying) {
-            visibleAudio.currentTime = currentTime;
-            visibleAudio.play().catch(() => {});
-          }
-        }
-      };
-    }
-
     function renderMessagesContainer(messages) {
       const container = document.getElementById('messages-container');
       const isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
@@ -1429,19 +1373,18 @@ app.get('*', (req, res) => {
         div.ontouchmove = () => clearTimeout(longTouchTimer);
 
         let html = '';
-        if (m.text) html += `<div>${m.text}</div>`;
+        if (m.text) html += '<div>' + m.text + '</div>';
 
         const fileType = m.fileType || '';
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
-            html += `<img src="${m.fileData}" class="media-preview" onclick="openImageViewer('${m.fileData}')">`;
+            html += '<img src="' + m.fileData + '" class="media-preview" onclick="openImageViewer(\'' + m.fileData + '\')">';
           } else if (fileType.startsWith('video/')) {
-            html += `<video src="${m.fileData}" controls class="video-preview"></video>`;
+            html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
           } else if (fileType.startsWith('audio/')) {
-            html += `<audio id="audio-player-${m.id}" controls class="audio-preview"></audio>`;
-            setTimeout(() => processAudioInBackground(m.id, m.fileData), 0);
+            html += '<audio src="' + m.fileData + '" controls class="audio-preview"></audio>';
           } else {
-            html += `<a class="file-link" onclick="event.stopPropagation()">📁 ${m.fileName || 'Файл'}</a>`;
+            html += '<a class="file-link" onclick="event.stopPropagation()">📁 ' + (m.fileName || 'Файл') + '</a>';
           }
         }
 
@@ -1449,16 +1392,13 @@ app.get('*', (req, res) => {
         if (m.senderId === currentUser.id) {
           const isReadClass = m.isRead ? 'ticks read' : 'ticks';
           const ticksSymbol = m.isRead ? '✓✓' : '✓';
-          ticksHtml = `<span class="${isReadClass}">${ticksSymbol}</span>`;
+          ticksHtml = '<span class="' + isReadClass + '">' + ticksSymbol + '</span>';
         }
 
-        const msgTimestamp = m.timestamp || '';
-
-        html += `
-          <div class="msg-footer">
-            <span>${msgTimestamp}</span>${ticksHtml}
-          </div>
-        `;
+        html += '<div class="msg-footer">' +
+            '<span>' + (m.timestamp || '') + '</span>' +
+            ticksHtml +
+          '</div>';
 
         div.innerHTML = html;
         container.appendChild(div);
@@ -1597,6 +1537,12 @@ app.get('*', (req, res) => {
       reader.readAsDataURL(file);
     }
 
+    function cancelAttachment() {
+      selectedFile = null;
+      document.getElementById('file-input').value = '';
+      document.getElementById('attachment-preview-container').classList.remove('active');
+    }
+
     function getSupportedMimeType() {
       const types = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/aac', 'audio/webm'];
       for (let t of types) {
@@ -1647,12 +1593,6 @@ app.get('*', (req, res) => {
       }
     }
 
-    function cancelAttachment() {
-      selectedFile = null;
-      document.getElementById('file-input').value = '';
-      document.getElementById('attachment-preview-container').classList.remove('active');
-    }
-
     async function sendMsg() {
       if (!activePeer) return;
       const input = document.getElementById('msg-input');
@@ -1671,14 +1611,12 @@ app.get('*', (req, res) => {
       if (isVideo) {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
-        tempDiv.innerHTML = `
-          ${text ? '<div>' + text + '</div>' : ''}
-          <div class="uploading-box">
-            <div class="spinner"></div>
-            <div>Загрузка видео... (${fileToSend.name})</div>
-          </div>
-          <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
-        `;
+        tempDiv.innerHTML = (text ? '<div>' + text + '</div>' : '') +
+          '<div class="uploading-box">' +
+            '<div class="spinner"></div>' +
+            '<div>Загрузка видео... (' + fileToSend.name + ')</div>' +
+          '</div>' +
+          '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>';
         container.appendChild(tempDiv);
         container.scrollTop = container.scrollHeight;
       }
@@ -1725,3 +1663,4 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`[СЕРВЕР УСПЕШНО ЗАПУЩЕН] Порт: ${PORT}`));
+, 
