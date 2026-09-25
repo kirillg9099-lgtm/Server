@@ -604,6 +604,11 @@ app.get('*', (req, res) => {
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
 
+    .recording-indicator { display: none; align-items: center; gap: 6px; font-size: 12px; color: #e53935; margin-left: 6px; }
+    .recording-indicator.active { display: inline-flex; }
+    .recording-dot { width: 8px; height: 8px; border-radius: 50%; background: #e53935; animation: recpulse 1s infinite; }
+    @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
     @media (min-width: 601px) {
       .menu-dots-btn { display: flex !important; }
     }
@@ -699,6 +704,11 @@ app.get('*', (req, res) => {
           <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
           
           <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
+          <div class="recording-indicator" id="recording-indicator">
+            <span class="recording-dot"></span>
+            <span id="recording-timer">0:00</span>
+          </div>
+          
           <input type="text" id="msg-input" placeholder="Напишите сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" style="width:auto; padding:10px 18px; border-radius:20px;" onclick="sendMsg()">➤</button>
         </div>
@@ -770,6 +780,10 @@ app.get('*', (req, res) => {
     let mediaRecorder = null;
     let audioChunks = [];
     let isRecording = false;
+    let activeStream = null;
+    let recordStartedAt = 0;
+    let recordingTimerInterval = null;
+    let lastRecordErrorShown = 0;
 
     let lastDialogsHash = '';
     let lastMessagesHash = '';
@@ -789,6 +803,7 @@ app.get('*', (req, res) => {
     // ==================== ПУЛ АУДИО-ПЛЕЕРОВ ====================
     // Аудио-элементы хранятся в скрытом #audio-pool и переиспользуются по msgId.
     // Если контент не изменился — элемент НЕ пересоздаётся, воспроизведение не прерывается.
+    // data:URL → Blob URL — стабильнее на Android для воспроизведения.
     const audioPool = new Map();
 
     function quickHash(str) {
@@ -812,6 +827,32 @@ app.get('*', (req, res) => {
       ].join('|');
     }
 
+    // Конвертируем data:URL в Blob URL (стабильное воспроизведение на Android)
+    function dataUrlToBlobUrl(dataUrl) {
+      try {
+        const commaIdx = dataUrl.indexOf(',');
+        if (commaIdx === -1) return null;
+        const meta = dataUrl.substring(5, commaIdx);
+        const isBase64 = meta.includes(';base64');
+        const mime = meta.split(';')[0] || 'audio/webm';
+        let blob;
+        if (isBase64) {
+          const b64 = dataUrl.substring(commaIdx + 1);
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          blob = new Blob([bytes], { type: mime });
+        } else {
+          const decoded = decodeURIComponent(dataUrl.substring(commaIdx + 1));
+          blob = new Blob([decoded], { type: mime });
+        }
+        return URL.createObjectURL(blob);
+      } catch (e) {
+        console.error('dataUrlToBlobUrl error', e);
+        return null;
+      }
+    }
+
     function getOrCreateAudioElement(msg) {
       const existing = audioPool.get(msg.id);
       const signature = getAudioSignature(msg);
@@ -821,6 +862,9 @@ app.get('*', (req, res) => {
           return existing.element;
         }
         try { existing.element.pause(); } catch(e) {}
+        if (existing.element.dataset && existing.element.dataset.objectUrl) {
+          try { URL.revokeObjectURL(existing.element.dataset.objectUrl); } catch(e) {}
+        }
         if (existing.element.parentNode) existing.element.parentNode.removeChild(existing.element);
         audioPool.delete(msg.id);
       }
@@ -829,7 +873,19 @@ app.get('*', (req, res) => {
       audio.controls = true;
       audio.className = 'audio-preview';
       audio.preload = 'metadata';
-      audio.src = msg.fileData;
+
+      // Android Chrome плохо играет audio с data: URL — конвертируем в Blob URL.
+      if (msg.fileData && msg.fileData.startsWith('data:')) {
+        const blobUrl = dataUrlToBlobUrl(msg.fileData);
+        if (blobUrl) {
+          audio.src = blobUrl;
+          audio.dataset.objectUrl = blobUrl;
+        } else {
+          audio.src = msg.fileData;
+        }
+      } else {
+        audio.src = msg.fileData;
+      }
 
       audio.addEventListener('click', e => e.stopPropagation());
       audio.addEventListener('contextmenu', e => e.stopPropagation());
@@ -845,6 +901,9 @@ app.get('*', (req, res) => {
       for (const [msgId, entry] of Array.from(audioPool.entries())) {
         if (!validSet.has(msgId)) {
           try { entry.element.pause(); } catch(e) {}
+          if (entry.element.dataset && entry.element.dataset.objectUrl) {
+            try { URL.revokeObjectURL(entry.element.dataset.objectUrl); } catch(e) {}
+          }
           if (entry.element.parentNode) entry.element.parentNode.removeChild(entry.element);
           audioPool.delete(msgId);
         }
@@ -1639,53 +1698,232 @@ app.get('*', (req, res) => {
       document.getElementById('attachment-preview-container').classList.remove('active');
     }
 
+    // ==================== ЗАПИСЬ ГОЛОСОВЫХ ====================
+
     function getSupportedMimeType() {
-      const types = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/aac', 'audio/webm'];
-      for (let t of types) {
-        if (MediaRecorder.isTypeSupported(t)) return t;
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      const candidates = isIOS
+        ? ['audio/mp4', 'audio/aac', 'audio/mpeg', 'audio/webm;codecs=opus', 'audio/webm']
+        : [
+            'audio/webm;codecs=opus',
+            'audio/ogg;codecs=opus',
+            'audio/webm',
+            'audio/mp4',
+            'audio/aac',
+            'audio/mpeg'
+          ];
+      for (const t of candidates) {
+        try {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+        } catch (e) {}
       }
       return '';
     }
 
+    // Ждём, пока поток реально начнёт отдавать звук (на Android первые ~300мс — тишина)
+    function waitForAudioWarmup(stream, ms = 300) {
+      return new Promise(resolve => {
+        try {
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const src = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 512;
+          src.connect(analyser);
+          const data = new Uint8Array(analyser.fftSize);
+          const started = Date.now();
+
+          function tick() {
+            analyser.getByteTimeDomainData(data);
+            let maxDev = 0;
+            for (let i = 0; i < data.length; i++) {
+              const v = Math.abs(data[i] - 128);
+              if (v > maxDev) maxDev = v;
+            }
+            // Если появился хоть какой-то сигнал или прошло ms — продолжаем
+            if (maxDev > 2 || Date.now() - started > ms) {
+              try { src.disconnect(); } catch(e) {}
+              try { ctx.close(); } catch(e) {}
+              resolve(true);
+            } else {
+              requestAnimationFrame(tick);
+            }
+          }
+          requestAnimationFrame(tick);
+        } catch (e) {
+          setTimeout(() => resolve(true), ms);
+        }
+      });
+    }
+
+    function startRecordingTimer() {
+      recordStartedAt = Date.now();
+      const indicator = document.getElementById('recording-indicator');
+      const timerEl = document.getElementById('recording-timer');
+      indicator.classList.add('active');
+      if (recordingTimerInterval) clearInterval(recordingTimerInterval);
+      recordingTimerInterval = setInterval(() => {
+        const s = Math.floor((Date.now() - recordStartedAt) / 1000);
+        const mm = Math.floor(s / 60);
+        const ss = (s % 60).toString().padStart(2, '0');
+        timerEl.innerText = mm + ':' + ss;
+      }, 200);
+    }
+
+    function stopRecordingTimer() {
+      const indicator = document.getElementById('recording-indicator');
+      indicator.classList.remove('active');
+      if (recordingTimerInterval) {
+        clearInterval(recordingTimerInterval);
+        recordingTimerInterval = null;
+      }
+    }
+
     async function toggleVoiceRecord() {
       const micBtn = document.getElementById('mic-btn');
-      if (!isRecording) {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          const mimeType = getSupportedMimeType();
-          
-          mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-          audioChunks = [];
 
-          mediaRecorder.ondataavailable = e => {
-            if (e.data.size > 0) audioChunks.push(e.data);
-          };
-
-          mediaRecorder.onstop = async () => {
-            const actualType = mediaRecorder.mimeType || 'audio/mp4';
-            const audioBlob = new Blob(audioChunks, { type: actualType });
-            const reader = new FileReader();
-            reader.onload = function(evt) {
-              selectedFile = { data: evt.target.result, name: 'голосовое_сообщение.wav', type: actualType };
-              
-              const previewContainer = document.getElementById('attachment-preview-container');
-              document.getElementById('attachment-thumb-img').style.display = 'none';
-              document.getElementById('attachment-name-label').innerText = 'Голосовое сообщение';
-              document.getElementById('attachment-type-label').innerText = 'Аудио (нажмите Отправить)';
-              previewContainer.classList.add('active');
-            };
-            reader.readAsDataURL(audioBlob);
-            stream.getTracks().forEach(track => track.stop());
-          };
-
-          mediaRecorder.start();
-          isRecording = true;
-          micBtn.innerText = '🔴';
-        } catch (e) { alert('Нет доступа к микрофону.'); }
-      } else {
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+      // -------- ОСТАНОВКА ЗАПИСИ --------
+      if (isRecording) {
         isRecording = false;
         micBtn.innerText = '🎙️';
+        stopRecordingTimer();
+
+        try {
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            try { mediaRecorder.requestData && mediaRecorder.requestData(); } catch(e) {}
+            mediaRecorder.stop();
+          }
+        } catch (e) {
+          console.error('stop error', e);
+        }
+        return;
+      }
+
+      // -------- СТАРТ ЗАПИСИ --------
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('Ваш браузер не поддерживает запись с микрофона.');
+        return;
+      }
+
+      try {
+        // 1) Запрашиваем разрешение и получаем поток
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1
+          },
+          video: false
+        });
+
+        activeStream = stream;
+
+        // 2) Ждём прогрева микрофона (важно для Android)
+        await waitForAudioWarmup(stream, 300);
+
+        // 3) Создаём MediaRecorder
+        const mimeType = getSupportedMimeType();
+
+        let options = {};
+        if (mimeType) options.mimeType = mimeType;
+        options.audioBitsPerSecond = 32000;
+
+        try {
+          mediaRecorder = new MediaRecorder(stream, options);
+        } catch (e) {
+          try {
+            mediaRecorder = mimeType
+              ? new MediaRecorder(stream, { mimeType })
+              : new MediaRecorder(stream);
+          } catch (e2) {
+            alert('Не удалось создать рекордер: ' + e2.message);
+            try { stream.getTracks().forEach(t => t.stop()); } catch(_) {}
+            activeStream = null;
+            return;
+          }
+        }
+
+        audioChunks = [];
+
+        // 4) ВАЖНО: собираем чанки каждые 250мс
+        mediaRecorder.ondataavailable = e => {
+          if (e.data && e.data.size > 0) {
+            audioChunks.push(e.data);
+          }
+        };
+
+        mediaRecorder.onerror = e => {
+          console.error('MediaRecorder error', e);
+          if (Date.now() - lastRecordErrorShown > 3000) {
+            lastRecordErrorShown = Date.now();
+            alert('Ошибка записи аудио: ' + (e.error ? e.error.name : 'unknown'));
+          }
+        };
+
+        mediaRecorder.onstop = () => {
+          const actualType = (mediaRecorder && mediaRecorder.mimeType) || mimeType || 'audio/webm';
+          const totalSize = audioChunks.reduce((s, c) => s + c.size, 0);
+          const durationMs = Date.now() - recordStartedAt;
+
+          // Освобождаем поток микрофона
+          try {
+            if (activeStream) activeStream.getTracks().forEach(t => t.stop());
+          } catch (e) {}
+          activeStream = null;
+
+          // Слишком короткая или пустая запись — не отправляем
+          if (totalSize < 500 || audioChunks.length === 0) {
+            alert('Запись получилась пустой или слишком короткой. Попробуйте ещё раз.');
+            return;
+          }
+
+          const audioBlob = new Blob(audioChunks, { type: actualType });
+
+          const reader = new FileReader();
+          reader.onload = function(evt) {
+            const ext = actualType.includes('mp4') ? 'm4a'
+                      : actualType.includes('aac') ? 'aac'
+                      : actualType.includes('ogg') ? 'ogg'
+                      : 'webm';
+
+            selectedFile = {
+              data: evt.target.result,
+              name: 'voice_' + Date.now() + '.' + ext,
+              type: actualType
+            };
+
+            const previewContainer = document.getElementById('attachment-preview-container');
+            document.getElementById('attachment-thumb-img').style.display = 'none';
+            document.getElementById('attachment-name-label').innerText = 'Голосовое сообщение (' +
+              Math.max(1, Math.round(durationMs / 1000)) + 'с)';
+            document.getElementById('attachment-type-label').innerText = 'Аудио (нажмите ➤ чтобы отправить)';
+            previewContainer.classList.add('active');
+          };
+          reader.onerror = () => {
+            alert('Не удалось прочитать записанное аудио. Попробуйте ещё раз.');
+          };
+          reader.readAsDataURL(audioBlob);
+        };
+
+        // 5) Стартуем с timeslice — ключевой момент для Android
+        mediaRecorder.start(250);
+        isRecording = true;
+        micBtn.innerText = '🔴';
+        startRecordingTimer();
+
+      } catch (err) {
+        console.error('getUserMedia error', err);
+        let msg = 'Нет доступа к микрофону.';
+        if (err && err.name === 'NotAllowedError') msg = 'Вы отклонили доступ к микрофону. Разрешите в настройках браузера.';
+        else if (err && err.name === 'NotFoundError') msg = 'Микрофон не найден на устройстве.';
+        else if (err && err.name === 'NotReadableError') msg = 'Микрофон занят другим приложением.';
+        alert(msg);
+        try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e) {}
+        activeStream = null;
+        isRecording = false;
+        micBtn.innerText = '🎙️';
+        stopRecordingTimer();
       }
     }
 
