@@ -46,7 +46,7 @@ function safeReadJSON(filePath, fallback = []) {
 function safeWriteJSON(filePath, data) {
   const tmpPath = filePath + '.tmp';
   try {
-    const str = JSON.stringify(data);
+    const str = JSON.stringify(data, null, 2);
     fs.writeFileSync(tmpPath, str, 'utf8');
     fs.renameSync(tmpPath, filePath);
   } catch (e) {
@@ -77,7 +77,7 @@ function decryptText(text) {
   return text;
 }
 
-// Регистрация с авто-разрешением коллизий ID
+// Регистрация
 app.post('/api/register', (req, res) => {
   let { id, name, avatar, contacts } = req.body;
   const accounts = readAccounts();
@@ -1220,15 +1220,15 @@ app.get('*', (req, res) => {
         const avatarId = 'chat_av_' + item.id;
         const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
 
-        div.innerHTML = `
-          <div class="avatar-circle" id="${avatarId}">
-            <div class="online-indicator ${item.isOnline ? 'visible' : ''}"></div>
+        div.innerHTML = \`
+          <div class="avatar-circle" id="\${avatarId}">
+            <div class="online-indicator \${item.isOnline ? 'visible' : ''}"></div>
           </div>
           <div>
-            <div style="font-weight:bold;">${item.name}</div>
-            <div style="font-size:11px;">${onlineText}</div>
+            <div style="font-weight:bold;">\${item.name}</div>
+            <div style="font-size:11px;">\${onlineText}</div>
           </div>
-        `;
+        \`;
         container.appendChild(div);
         renderAvatarIntoElement(document.getElementById(avatarId), item, item.isOnline);
       });
@@ -1385,7 +1385,7 @@ app.get('*', (req, res) => {
 
         innerContentHtml += `
           <div class="msg-footer">
-            <span>${m.timestamp \vert{}\vert{} ''}</span>${ticksHtml}
+            <span>\${m.timestamp || ''}</span>\${ticksHtml}
           </div>
         `;
 
@@ -1626,14 +1626,14 @@ app.get('*', (req, res) => {
       if (isVideo) {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
-        tempDiv.innerHTML = `
+        tempDiv.innerHTML = \`
           \${text ? '<div>' + text + '</div>' : ''}
           <div class="uploading-box">
             <div class="spinner"></div>
             <div>Загрузка видео... (\${fileToSend.name})</div>
           </div>
           <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
-        `;
+        \`;
         container.appendChild(tempDiv);
         container.scrollTop = container.scrollHeight;
       }
