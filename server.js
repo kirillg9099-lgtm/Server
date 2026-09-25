@@ -1369,7 +1369,6 @@ app.get('*', (req, res) => {
       
       const newHash = String(incomingFileData.length) + '_' + incomingFileData.slice(-30);
 
-      // 1. Создаем фоновый элемент, если его еще нет
       if (!shadowAudio) {
         shadowAudio = document.createElement('audio');
         shadowAudio.id = `shadow-audio-${msgId}`;
@@ -1380,23 +1379,19 @@ app.get('*', (req, res) => {
 
       const currentHash = shadowAudio.getAttribute('data-audio-hash');
 
-      // 2. Если данные НЕ изменились, ничего не перерисовываем
       if (currentHash === newHash) {
         return;
       }
 
-      // 3. Если данные ИЗМЕНИЛИСЬ или загружаются впервые — фоново обновляем shadow-элемент
       shadowAudio.setAttribute('data-audio-hash', newHash);
       shadowAudio.src = incomingFileData;
 
       shadowAudio.oncanplaythrough = () => {
         const visibleAudio = document.getElementById(`audio-player-${msgId}`);
         if (visibleAudio) {
-          // Если главный плеер сейчас проигрывает звук, сохраняем позицию
           const wasPlaying = !visibleAudio.paused;
           const currentTime = visibleAudio.currentTime;
 
-          // Плавно заменяем фоновый стабильный файл
           visibleAudio.src = incomingFileData;
 
           if (wasPlaying) {
@@ -1443,7 +1438,6 @@ app.get('*', (req, res) => {
           } else if (fileType.startsWith('video/')) {
             html += `<video src="${m.fileData}" controls class="video-preview"></video>`;
           } else if (fileType.startsWith('audio/')) {
-            // Разделение: Видимый аудиофайл без лагов + активация скрытого обработчика
             html += `<audio id="audio-player-${m.id}" controls class="audio-preview"></audio>`;
             setTimeout(() => processAudioInBackground(m.id, m.fileData), 0);
           } else {
@@ -1458,9 +1452,11 @@ app.get('*', (req, res) => {
           ticksHtml = `<span class="${isReadClass}">${ticksSymbol}</span>`;
         }
 
+        const msgTimestamp = m.timestamp || '';
+
         html += `
           <div class="msg-footer">
-            <span>${m.timestamp \vert{}\vert{} ''}</span>${ticksHtml}
+            <span>${msgTimestamp}</span>${ticksHtml}
           </div>
         `;
 
@@ -1601,12 +1597,6 @@ app.get('*', (req, res) => {
       reader.readAsDataURL(file);
     }
 
-    function cancelAttachment() {
-      selectedFile = null;
-      document.getElementById('file-input').value = '';
-      document.getElementById('attachment-preview-container').classList.remove('active');
-    }
-
     function getSupportedMimeType() {
       const types = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/aac', 'audio/webm'];
       for (let t of types) {
@@ -1655,6 +1645,12 @@ app.get('*', (req, res) => {
         isRecording = false;
         micBtn.innerText = '🎙️';
       }
+    }
+
+    function cancelAttachment() {
+      selectedFile = null;
+      document.getElementById('file-input').value = '';
+      document.getElementById('attachment-preview-container').classList.remove('active');
     }
 
     async function sendMsg() {
