@@ -76,7 +76,7 @@ function decryptText(text) {
   return text;
 }
 
-// ==================== API MARШРУТЫ ====================
+// ==================== API МАРШРУТЫ ====================
 
 // 1. Регистрация / авторизация
 app.post('/api/register', (req, res) => {
@@ -559,7 +559,8 @@ app.get('*', (req, res) => {
     
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
-    .audio-preview { width: 240px; margin-top: 5px; }
+    .audio-preview { width: 240px; max-width: 100%; margin-top: 5px; display: block; }
+    .audio-slot { width: 240px; max-width: 100%; height: 40px; margin-top: 5px; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
     .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
@@ -758,6 +759,9 @@ app.get('*', (req, res) => {
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
 
+  <!-- Скрытое хранилище аудио-плееров (чтобы не прерывать воспроизведение при синхронизации) -->
+  <div id="audio-pool" style="display:none; position:absolute; width:0; height:0; overflow:hidden;"></div>
+
   <script>
     let currentUser = null;
     let activePeer = null;
@@ -781,6 +785,77 @@ app.get('*', (req, res) => {
     const savedTheme = localStorage.getItem('app_theme') || 'dark';
     document.documentElement.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
+
+    // ==================== ПУЛ АУДИО-ПЛЕЕРОВ ====================
+    // Аудио-элементы хранятся в скрытом #audio-pool и переиспользуются по msgId.
+    // Если контент не изменился — элемент НЕ пересоздаётся, воспроизведение не прерывается.
+    const audioPool = new Map();
+
+    function quickHash(str) {
+      if (!str) return '0';
+      const len = str.length;
+      const head = str.substring(0, 64);
+      const tail = str.substring(Math.max(0, len - 64));
+      let h = 0;
+      const sample = head + '|' + tail + '|' + len;
+      for (let i = 0; i < sample.length; i++) {
+        h = ((h << 5) - h + sample.charCodeAt(i)) | 0;
+      }
+      return len + '_' + (h >>> 0).toString(36);
+    }
+
+    function getAudioSignature(msg) {
+      return [
+        msg.fileType || '',
+        msg.fileName || '',
+        quickHash(msg.fileData || '')
+      ].join('|');
+    }
+
+    function getOrCreateAudioElement(msg) {
+      const existing = audioPool.get(msg.id);
+      const signature = getAudioSignature(msg);
+
+      if (existing) {
+        if (existing.signature === signature) {
+          return existing.element;
+        }
+        try { existing.element.pause(); } catch(e) {}
+        if (existing.element.parentNode) existing.element.parentNode.removeChild(existing.element);
+        audioPool.delete(msg.id);
+      }
+
+      const audio = document.createElement('audio');
+      audio.controls = true;
+      audio.className = 'audio-preview';
+      audio.preload = 'metadata';
+      audio.src = msg.fileData;
+
+      audio.addEventListener('click', e => e.stopPropagation());
+      audio.addEventListener('contextmenu', e => e.stopPropagation());
+      audio.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
+
+      document.getElementById('audio-pool').appendChild(audio);
+      audioPool.set(msg.id, { element: audio, signature });
+      return audio;
+    }
+
+    function cleanupAudioPool(validMsgIds) {
+      const validSet = new Set(validMsgIds);
+      for (const [msgId, entry] of Array.from(audioPool.entries())) {
+        if (!validSet.has(msgId)) {
+          try { entry.element.pause(); } catch(e) {}
+          if (entry.element.parentNode) entry.element.parentNode.removeChild(entry.element);
+          audioPool.delete(msgId);
+        }
+      }
+    }
+
+    function pauseAllAudio() {
+      for (const entry of audioPool.values()) {
+        try { entry.element.pause(); } catch(e) {}
+      }
+    }
 
     function playNotificationSound() {
       try {
@@ -1151,6 +1226,7 @@ app.get('*', (req, res) => {
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id })
         });
+        pauseAllAudio();
         closeMobileChat();
         activePeer = null;
         document.getElementById('input-bar').style.display = 'none';
@@ -1247,6 +1323,7 @@ app.get('*', (req, res) => {
     }
 
     function openChat(peer) {
+      pauseAllAudio();
       activePeer = peer;
       lastMessagesHash = '';
       document.getElementById('active-peer-name').innerText = peer.name;
@@ -1281,6 +1358,7 @@ app.get('*', (req, res) => {
     }
 
     function closeMobileChat() {
+      pauseAllAudio();
       document.getElementById('app-screen').classList.remove('app-mobile-chat');
     }
 
@@ -1350,12 +1428,15 @@ app.get('*', (req, res) => {
     function renderMessagesContainer(messages) {
       const container = document.getElementById('messages-container');
       const isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
-      
+
       container.innerHTML = '';
       if (!messages || messages.length === 0) {
+        cleanupAudioPool([]);
         container.innerHTML = '<div class="empty-state">Нет сообщений. Напишите первыми!</div>';
         return;
       }
+
+      const validIds = [];
 
       messages.forEach(m => {
         const div = document.createElement('div');
@@ -1364,10 +1445,12 @@ app.get('*', (req, res) => {
         div.setAttribute('data-sender-id', m.senderId);
 
         div.oncontextmenu = (e) => {
+          if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
           e.preventDefault();
           openMsgActions(m, div);
         };
-        div.ontouchstart = () => {
+        div.ontouchstart = (e) => {
+          if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
           longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
         };
         div.ontouchend = () => clearTimeout(longTouchTimer);
@@ -1383,7 +1466,8 @@ app.get('*', (req, res) => {
           } else if (fileType.startsWith('video/')) {
             html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
           } else if (fileType.startsWith('audio/')) {
-            html += \`<audio src="\${m.fileData}" controls class="audio-preview"></audio>\`;
+            html += \`<div class="audio-slot" data-audio-msg-id="\${m.id}"></div>\`;
+            validIds.push(m.id);
           } else {
             html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
           }
@@ -1404,8 +1488,17 @@ app.get('*', (req, res) => {
         \`;
 
         div.innerHTML = html;
+
+        const slot = div.querySelector('.audio-slot');
+        if (slot) {
+          const audioEl = getOrCreateAudioElement(m);
+          slot.replaceWith(audioEl);
+        }
+
         container.appendChild(div);
       });
+
+      cleanupAudioPool(validIds);
 
       if (isScrolledToBottom) {
         container.scrollTop = container.scrollHeight;
