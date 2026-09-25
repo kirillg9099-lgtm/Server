@@ -11,7 +11,6 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 process.on('uncaughtException', (err) => {
   console.error('[ОШИБКА СЕРВЕРА]:', err);
 });
-
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[ОШИБКА ПРОМИСА]:', reason);
 });
@@ -46,11 +45,11 @@ function safeReadJSON(filePath, fallback = []) {
 function safeWriteJSON(filePath, data) {
   const tmpPath = filePath + '.tmp';
   try {
-    const str = JSON.stringify(data, null, 2);
+    const str = JSON.stringify(data);
     fs.writeFileSync(tmpPath, str, 'utf8');
     fs.renameSync(tmpPath, filePath);
   } catch (e) {
-    console.error('[ОШИБКА ЗАПИСИ]:', e);
+    console.error(`[ОШИБКА ЗАПИСИ]:`, e);
   }
 }
 
@@ -77,7 +76,7 @@ function decryptText(text) {
   return text;
 }
 
-// Регистрация
+// Регистрация с автоматическим разрешением коллизий ID
 app.post('/api/register', (req, res) => {
   let { id, name, avatar, contacts } = req.body;
   const accounts = readAccounts();
@@ -116,7 +115,7 @@ app.post('/api/register', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Глобальный пинг
+// Глобальный пинг, синхронизация аккаунтов, статусов прочтения, удалений и бэкап информации
 app.post('/api/ping', (req, res) => {
   const { id, name, avatar, contacts, knownUsers, syncMessages, readMsgIds, deletedMsgIds } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
@@ -124,6 +123,7 @@ app.post('/api/ping', (req, res) => {
   const accounts = readAccounts();
   const serverMessages = readMessages();
 
+  // Синхронизация статусов прочтения сообщений со всех клиентов
   if (Array.isArray(readMsgIds) && readMsgIds.length > 0) {
     let changed = false;
     serverMessages.forEach(m => {
@@ -135,6 +135,7 @@ app.post('/api/ping', (req, res) => {
     if (changed) writeMessages(serverMessages);
   }
 
+  // Синхронизация удаленных сообщений со всех клиентов (глобальное удаление у всех)
   if (Array.isArray(deletedMsgIds) && deletedMsgIds.length > 0) {
     let changed = false;
     serverMessages.forEach(m => {
@@ -238,7 +239,7 @@ app.post('/api/profile/update', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Получение профиля
+// Получение профиля пользователя
 app.get('/api/users/:userId', (req, res) => {
   const accounts = readAccounts();
   const user = accounts.find(u => u.id === req.params.userId);
@@ -247,7 +248,7 @@ app.get('/api/users/:userId', (req, res) => {
   res.json({ id: user.id, name: user.name, avatar: user.avatar || '', isOnline, updatedAt: user.updatedAt });
 });
 
-// Блокировка
+// Блокировка/разблокировка пользователя
 app.post('/api/users/block', (req, res) => {
   const { userId, peerId, block } = req.body;
   const accounts = readAccounts();
@@ -265,7 +266,7 @@ app.post('/api/users/block', (req, res) => {
   res.json({ success: true, blockedContacts: user.blockedContacts });
 });
 
-// Скрытие диалога
+// Скрытие (удаление) чата для конкретного пользователя
 app.post('/api/chat/hide', (req, res) => {
   const { userId, peerId } = req.body;
   const accounts = readAccounts();
@@ -279,7 +280,7 @@ app.post('/api/chat/hide', (req, res) => {
   res.json({ success: true, hiddenDialogs: user.hiddenDialogs });
 });
 
-// Поиск
+// Поиск аккаунтов
 app.get('/api/users/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
   if (!q) return res.json([]);
@@ -312,6 +313,7 @@ app.post('/api/messages/send', (req, res) => {
     return res.status(403).json({ error: 'Вы заблокированы получателем' });
   }
 
+  // Если чат был скрыт ранее, при новом сообщении снова показываем его
   if (sender && sender.hiddenDialogs) {
     sender.hiddenDialogs = sender.hiddenDialogs.filter(id => id !== receiverId);
   }
@@ -351,12 +353,12 @@ app.post('/api/messages/send', (req, res) => {
       updated = true;
     }
   }
-  if (updated) writeAccounts(accounts);
+  if (updated || sender || receiver) writeAccounts(accounts);
 
   res.json({ success: true, message: { ...newMsg, text: text } });
 });
 
-// Прочтение
+// Отметка сообщения как прочитанного
 app.post('/api/messages/read', (req, res) => {
   const { msgIds } = req.body;
   if (!Array.isArray(msgIds) || msgIds.length === 0) return res.json({ success: true });
@@ -373,7 +375,7 @@ app.post('/api/messages/read', (req, res) => {
   res.json({ success: true });
 });
 
-// Удаление сообщения
+// Удаление сообщения (пометка у всех)
 app.delete('/api/messages/:msgId', (req, res) => {
   const { msgId } = req.params;
   let messages = readMessages();
@@ -388,7 +390,7 @@ app.delete('/api/messages/:msgId', (req, res) => {
   res.json({ success: true });
 });
 
-// Очистка чата
+// Очистка всей истории чата между двумя пользователями
 app.post('/api/chat/clear', (req, res) => {
   const { userId, peerId } = req.body;
   let messages = readMessages();
@@ -451,9 +453,10 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
-// Отдача фронтенда
+// HTML клиентская часть
 app.get('*', (req, res) => {
-  res.send(`<!DOCTYPE html>
+  res.send(`
+<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
   <meta charset="UTF-8">
@@ -550,9 +553,7 @@ app.get('*', (req, res) => {
     
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
-    
-    .audio-preview { width: 250px; min-width: 200px; margin-top: 5px; display: block; outline: none; }
-    
+    .audio-preview { width: 240px; margin-top: 5px; }
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
     .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
@@ -611,6 +612,7 @@ app.get('*', (req, res) => {
 </head>
 <body onclick="onBodyGlobalClick(event)">
 
+  <!-- Авторизация -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход в мессенджер</h2>
@@ -622,6 +624,7 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
+  <!-- Основной экран -->
   <div id="app-screen" class="screen">
     <div id="app-container">
       
@@ -695,6 +698,7 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
+  <!-- Модальное окно своего профиля -->
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="my-profile-avatar-view">
@@ -718,6 +722,7 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
+  <!-- Модальное окно профиля собеседника -->
   <div class="modal-overlay" id="peer-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="peer-profile-avatar-view">
@@ -734,11 +739,13 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
+  <!-- Полноэкранный просмотр изображений -->
   <div id="image-viewer-modal" onclick="closeImageViewer()">
     <button class="viewer-close" onclick="closeImageViewer()">✕</button>
     <img id="full-screen-img" src="" alt="">
   </div>
 
+  <!-- Лист действий с сообщением -->
   <div class="msg-actions-sheet" id="msg-actions-sheet">
     <button class="btn" id="action-btn-copy" onclick="actionCopyText()" style="display:none;">Копировать текст</button>
     <button class="btn" id="action-btn-download" onclick="actionDownloadFile()" style="display:none;">Скачать файл</button>
@@ -1220,15 +1227,15 @@ app.get('*', (req, res) => {
         const avatarId = 'chat_av_' + item.id;
         const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
 
-        div.innerHTML = \`
-          <div class="avatar-circle" id="\${avatarId}">
-            <div class="online-indicator \${item.isOnline ? 'visible' : ''}"></div>
+        div.innerHTML = `
+          <div class="avatar-circle" id="${avatarId}">
+            <div class="online-indicator ${item.isOnline ? 'visible' : ''}"></div>
           </div>
           <div>
-            <div style="font-weight:bold;">\${item.name}</div>
-            <div style="font-size:11px;">\${onlineText}</div>
+            <div style="font-weight:bold;">${item.name}</div>
+            <div style="font-size:11px;">${onlineText}</div>
           </div>
-        \`;
+        `;
         container.appendChild(div);
         renderAvatarIntoElement(document.getElementById(avatarId), item, item.isOnline);
       });
@@ -1275,7 +1282,7 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
+        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
         const messages = await res.json();
         
         messages.forEach(msg => {
@@ -1298,7 +1305,7 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
+        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
         const messages = await res.json();
         
         let hasNewMsg = false;
@@ -1339,27 +1346,44 @@ app.get('*', (req, res) => {
       const container = document.getElementById('messages-container');
       const isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
       
+      container.innerHTML = '';
       if (!messages || messages.length === 0) {
         container.innerHTML = '<div class="empty-state">Нет сообщений. Напишите первыми!</div>';
         return;
       }
 
-      const emptyState = container.querySelector('.empty-state');
-      if (emptyState) emptyState.remove();
-
-      const existingElements = Array.from(container.querySelectorAll('.msg[data-msg-id]'));
-      const existingMap = new Map();
-      existingElements.forEach(el => existingMap.set(el.getAttribute('data-msg-id'), el));
-
-      const currentIds = new Set(messages.map(m => m.id));
-      existingElements.forEach(el => {
-        const id = el.getAttribute('data-msg-id');
-        if (!currentIds.has(id)) el.remove();
-      });
-
       messages.forEach(m => {
-        const existingEl = existingMap.get(m.id);
-        
+        const div = document.createElement('div');
+        div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
+        div.setAttribute('data-msg-id', m.id);
+        div.setAttribute('data-sender-id', m.senderId);
+
+        div.oncontextmenu = (e) => {
+          e.preventDefault();
+          openMsgActions(m, div);
+        };
+        div.ontouchstart = () => {
+          longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
+        };
+        div.ontouchend = () => clearTimeout(longTouchTimer);
+        div.ontouchmove = () => clearTimeout(longTouchTimer);
+
+        let html = '';
+        if (m.text) html += `<div>${m.text}</div>`;
+
+        const fileType = m.fileType || '';
+        if (m.fileData) {
+          if (fileType.startsWith('image/')) {
+            html += `<img src="${m.fileData}" class="media-preview" onclick="openImageViewer('${m.fileData}')">`;
+          } else if (fileType.startsWith('video/')) {
+            html += `<video src="${m.fileData}" controls class="video-preview"></video>`;
+          } else if (fileType.startsWith('audio/')) {
+            html += `<audio src="${m.fileData}" controls class="audio-preview"></audio>`;
+          } else {
+            html += `<a class="file-link" onclick="event.stopPropagation()">📁 ${m.fileName || 'Файл'}</a>`;
+          }
+        }
+
         let ticksHtml = '';
         if (m.senderId === currentUser.id) {
           const isReadClass = m.isRead ? 'ticks read' : 'ticks';
@@ -1367,56 +1391,14 @@ app.get('*', (req, res) => {
           ticksHtml = `<span class="${isReadClass}">${ticksSymbol}</span>`;
         }
 
-        let innerContentHtml = '';
-        if (m.text) innerContentHtml += `<div>${m.text}</div>`;
-
-        const fileType = m.fileType || '';
-        if (m.fileData) {
-          if (fileType.startsWith('image/')) {
-            innerContentHtml += `<img src="${m.fileData}" class="media-preview" onclick="openImageViewer('${m.fileData}')">`;
-          } else if (fileType.startsWith('video/')) {
-            innerContentHtml += `<video src="${m.fileData}" controls class="video-preview"></video>`;
-          } else if (fileType.startsWith('audio/')) {
-            innerContentHtml += `<audio src="${m.fileData}" controls controlsList="nodownload" class="audio-preview"></audio>`;
-          } else {
-            innerContentHtml += `<a class="file-link" onclick="event.stopPropagation()">📁 ${m.fileName || 'Файл'}</a>`;
-          }
-        }
-
-        innerContentHtml += `
+        html += `
           <div class="msg-footer">
-            <span>\${m.timestamp || ''}</span>\${ticksHtml}
+            <span>${m.timestamp \vert{}\vert{} ''}</span>${ticksHtml}
           </div>
         `;
 
-        if (existingEl) {
-          const footer = existingEl.querySelector('.msg-footer');
-          if (footer) {
-            const oldTicks = footer.querySelector('.ticks');
-            if (oldTicks && m.senderId === currentUser.id) {
-              oldTicks.className = m.isRead ? 'ticks read' : 'ticks';
-              oldTicks.innerText = m.isRead ? '✓✓' : '✓';
-            }
-          }
-        } else {
-          const div = document.createElement('div');
-          div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
-          div.setAttribute('data-msg-id', m.id);
-          div.setAttribute('data-sender-id', m.senderId);
-
-          div.oncontextmenu = (e) => {
-            e.preventDefault();
-            openMsgActions(m, div);
-          };
-          div.ontouchstart = () => {
-            longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
-          };
-          div.ontouchend = () => clearTimeout(longTouchTimer);
-          div.ontouchmove = () => clearTimeout(longTouchTimer);
-
-          div.innerHTML = innerContentHtml;
-          container.appendChild(div);
-        }
+        div.innerHTML = html;
+        container.appendChild(div);
       });
 
       if (isScrolledToBottom) {
@@ -1626,14 +1608,14 @@ app.get('*', (req, res) => {
       if (isVideo) {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
-        tempDiv.innerHTML = \`
-          \${text ? '<div>' + text + '</div>' : ''}
+        tempDiv.innerHTML = `
+          ${text ? '<div>' + text + '</div>' : ''}
           <div class="uploading-box">
             <div class="spinner"></div>
-            <div>Загрузка видео... (\${fileToSend.name})</div>
+            <div>Загрузка видео... (${fileToSend.name})</div>
           </div>
           <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
-        \`;
+        `;
         container.appendChild(tempDiv);
         container.scrollTop = container.scrollHeight;
       }
@@ -1675,7 +1657,8 @@ app.get('*', (req, res) => {
     }
   </script>
 </body>
-</html>`);
+</html>
+  `);
 });
 
 app.listen(PORT, () => console.log(`[СЕРВЕР ЗАПУЩЕН] Порт: ${PORT}`));
