@@ -513,69 +513,9 @@ app.get('*', (req, res) => {
 
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
-    .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; cursor: pointer; }
-
-    /* ==== НОВЫЙ КАСТОМНЫЙ АУДИО-ПЛЕЕР ==== */
-    .audio-msg-player {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-top: 6px;
-      padding: 8px 12px;
-      background: rgba(0,0,0,0.18);
-      border-radius: 20px;
-      min-width: 220px;
-      max-width: 100%;
-    }
-    .audio-play-btn {
-      width: 36px;
-      height: 36px;
-      min-width: 36px;
-      border-radius: 50%;
-      background: var(--accent);
-      color: #fff;
-      border: none;
-      cursor: pointer;
-      font-size: 14px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 0;
-      padding-left: 3px;
-      user-select: none;
-    }
-    .audio-play-btn.playing { padding-left: 0; }
-    .audio-progress-wrap {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-      min-width: 0;
-    }
-    .audio-progress-bar {
-      width: 100%;
-      height: 4px;
-      background: rgba(255,255,255,0.25);
-      border-radius: 2px;
-      position: relative;
-      cursor: pointer;
-      overflow: hidden;
-    }
-    .audio-progress-fill {
-      position: absolute;
-      left: 0; top: 0; bottom: 0;
-      width: 0%;
-      background: #fff;
-      border-radius: 2px;
-      transition: width 0.1s linear;
-    }
-    .audio-time-row {
-      display: flex;
-      justify-content: space-between;
-      font-size: 10px;
-      color: var(--text-muted);
-    }
-    .audio-hidden-audio { display: none; }
+    .audio-preview { width: 240px; max-width: 100%; margin-top: 5px; display: block; }
+    .audio-slot { width: 240px; max-width: 100%; height: 40px; margin-top: 5px; }
+    .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
     .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
     .ticks { font-size: 11px; letter-spacing: -3px; font-weight: bold; }
@@ -616,6 +556,11 @@ app.get('*', (req, res) => {
 
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
+
+    .recording-indicator { display: none; align-items: center; gap: 6px; font-size: 12px; color: #e53935; margin-left: 6px; }
+    .recording-indicator.active { display: inline-flex; }
+    .recording-dot { width: 8px; height: 8px; border-radius: 50%; background: #e53935; animation: recpulse 1s infinite; }
+    @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
     @media (min-width: 601px) {
       .menu-dots-btn { display: flex !important; }
@@ -701,6 +646,11 @@ app.get('*', (req, res) => {
         <div class="input-bar" id="input-bar" style="display:none;">
           <button class="icon-btn" onclick="triggerFileInput()">📎</button>
           <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
+          <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
+          <div class="recording-indicator" id="recording-indicator">
+            <span class="recording-dot"></span>
+            <span id="recording-timer">0:00</span>
+          </div>
           <input type="text" id="msg-input" placeholder="Напишите сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" style="width:auto; padding:10px 18px; border-radius:20px;" onclick="sendMsg()">➤</button>
         </div>
@@ -755,13 +705,20 @@ app.get('*', (req, res) => {
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
 
-  <!-- Скрытое хранилище аудио-элементов -->
+  <!-- Скрытое хранилище аудио-плееров (не пересоздаются при синхронизации) -->
   <div id="audio-pool" style="display:none; position:absolute; width:0; height:0; overflow:hidden;"></div>
 
   <script>
     let currentUser = null;
     let activePeer = null;
     let selectedFile = null;
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+    let activeStream = null;
+    let recordStartedAt = 0;
+    let recordingTimerInterval = null;
 
     let lastDialogsHash = '';
     let lastMessagesHash = '';
@@ -779,11 +736,10 @@ app.get('*', (req, res) => {
     updateThemeIcon(savedTheme);
 
     // ==================== ПУЛ АУДИО ====================
-    // Каждый аудио-элемент создаётся один раз и переиспользуется по msgId.
-    // data:URL → Blob URL — стабильнее на Android/iOS.
-    // Blob URL кэшируется в Map, чтобы не создавать его заново при каждом рендере.
-    const audioPool = new Map(); // msgId -> { element, signature, objectUrl }
-    const blobUrlCache = new Map(); // signature -> objectUrl (шарим между совпадающими данными)
+    // Стабильное воспроизведение: элементы переиспользуются по msgId.
+    // data:URL → Blob URL (Android не играет webm прямо из data:URL).
+    const audioPool = new Map();      // msgId -> { element, signature }
+    const blobUrlCache = new Map();   // signature -> Blob URL
 
     function quickHash(str) {
       if (!str) return '0';
@@ -826,7 +782,6 @@ app.get('*', (req, res) => {
       return URL.createObjectURL(blob);
     }
 
-    // Возвращаем стабильный Blob URL для одних и тех же данных
     function getOrCreateBlobUrl(signature, fileData) {
       if (blobUrlCache.has(signature)) return blobUrlCache.get(signature);
       try {
@@ -843,8 +798,6 @@ app.get('*', (req, res) => {
       return fileData;
     }
 
-    // Возвращает готовый <audio> для скрытого пула.
-    // Если контент не изменился — возвращает тот же элемент (не прерывает воспроизведение).
     function getOrCreateAudioElement(msg) {
       const existing = audioPool.get(msg.id);
       const signature = getAudioSignature(msg);
@@ -852,18 +805,17 @@ app.get('*', (req, res) => {
       if (existing && existing.signature === signature) {
         return existing.element;
       }
-
       if (existing) {
-        // Контент изменился — заменяем
         try { existing.element.pause(); } catch(e) {}
         if (existing.element.parentNode) existing.element.parentNode.removeChild(existing.element);
         audioPool.delete(msg.id);
       }
 
       const audio = document.createElement('audio');
+      audio.controls = true;
+      audio.className = 'audio-preview';
       audio.preload = 'metadata';
       audio.src = getOrCreateBlobUrl(signature, msg.fileData);
-      audio.className = 'audio-hidden-audio';
 
       audio.addEventListener('click', e => e.stopPropagation());
       audio.addEventListener('contextmenu', e => e.stopPropagation());
@@ -883,7 +835,6 @@ app.get('*', (req, res) => {
           audioPool.delete(msgId);
         }
       }
-      // Чистим Blob URL, которые больше не используются ни одним элементом
       const usedSignatures = new Set(Array.from(audioPool.values()).map(v => v.signature));
       for (const [sig, url] of Array.from(blobUrlCache.entries())) {
         if (!usedSignatures.has(sig)) {
@@ -914,198 +865,6 @@ app.get('*', (req, res) => {
         osc.start();
         osc.stop(audioCtx.currentTime + 0.3);
       } catch(e) {}
-    }
-
-    // ==================== КАСТОМНЫЙ ПЛЕЕР ====================
-    // Создаёт UI-обёртку поверх скрытого <audio>. Управляет воспроизведением,
-    // обновляет прогресс и время. Отслеживает состояние play/pause.
-    function formatTime(sec) {
-      if (!isFinite(sec) || sec < 0) sec = 0;
-      const s = Math.floor(sec);
-      const mm = Math.floor(s / 60);
-      const ss = (s % 60).toString().padStart(2, '0');
-      return mm + ':' + ss;
-    }
-
-    function buildAudioPlayer(msg) {
-      const audioEl = getOrCreateAudioElement(msg);
-
-      const wrap = document.createElement('div');
-      wrap.className = 'audio-msg-player';
-
-      const playBtn = document.createElement('button');
-      playBtn.className = 'audio-play-btn';
-      playBtn.type = 'button';
-      playBtn.innerText = '▶';
-      playBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggleAudioPlay(audioEl, playBtn);
-      });
-      playBtn.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
-
-      const progressWrap = document.createElement('div');
-      progressWrap.className = 'audio-progress-wrap';
-
-      const bar = document.createElement('div');
-      bar.className = 'audio-progress-bar';
-      const fill = document.createElement('div');
-      fill.className = 'audio-progress-fill';
-      bar.appendChild(fill);
-
-      const timeRow = document.createElement('div');
-      timeRow.className = 'audio-time-row';
-      const curEl = document.createElement('span');
-      curEl.innerText = '0:00';
-      const durEl = document.createElement('span');
-      durEl.innerText = '0:00';
-      timeRow.appendChild(curEl);
-      timeRow.appendChild(durEl);
-
-      progressWrap.appendChild(bar);
-      progressWrap.appendChild(timeRow);
-
-      wrap.appendChild(playBtn);
-      wrap.appendChild(progressWrap);
-
-      // Клик по прогресс-бару — перемотка
-      const seekAt = (clientX) => {
-        const rect = bar.getBoundingClientRect();
-        let ratio = (clientX - rect.left) / rect.width;
-        if (ratio < 0) ratio = 0;
-        if (ratio > 1) ratio = 1;
-        const dur = audioEl.duration;
-        if (isFinite(dur) && dur > 0) {
-          audioEl.currentTime = ratio * dur;
-          fill.style.width = (ratio * 100) + '%';
-          curEl.innerText = formatTime(audioEl.currentTime);
-        }
-      };
-      bar.addEventListener('click', (e) => { e.stopPropagation(); seekAt(e.clientX); });
-      bar.addEventListener('touchstart', (e) => {
-        e.stopPropagation();
-        if (e.touches && e.touches[0]) seekAt(e.touches[0].clientX);
-      }, { passive: true });
-
-      // Обновление UI
-      const onTime = () => {
-        const cur = audioEl.currentTime || 0;
-        const dur = audioEl.duration || 0;
-        curEl.innerText = formatTime(cur);
-        durEl.innerText = formatTime(dur);
-        if (dur > 0) fill.style.width = ((cur / dur) * 100) + '%';
-      };
-      const onLoaded = () => {
-        durEl.innerText = formatTime(audioEl.duration || 0);
-      };
-      const onPlay = () => {
-        playBtn.innerText = '❚❚';
-        playBtn.classList.add('playing');
-      };
-      const onPause = () => {
-        playBtn.innerText = '▶';
-        playBtn.classList.remove('playing');
-      };
-      const onEnded = () => {
-        playBtn.innerText = '▶';
-        playBtn.classList.remove('playing');
-        fill.style.width = '0%';
-        curEl.innerText = '0:00';
-      };
-
-      // Привязываем слушателей один раз на элемент, помечаем
-      if (!audioEl._uiBound) {
-        audioEl._uiBound = true;
-        audioEl.addEventListener('timeupdate', onTime);
-        audioEl.addEventListener('loadedmetadata', onLoaded);
-        audioEl.addEventListener('play', onPlay);
-        audioEl.addEventListener('pause', onPause);
-        audioEl.addEventListener('ended', onEnded);
-      }
-      // Но каждый рендер может создать новый UI-контейнер, поэтому
-      // заново синхронизируем текущее состояние
-      if (!audioEl.paused && !audioEl.ended) {
-        playBtn.innerText = '❚❚';
-        playBtn.classList.add('playing');
-      } else {
-        playBtn.innerText = '▶';
-        playBtn.classList.remove('playing');
-      }
-      onTime();
-      if (audioEl.duration) onLoaded();
-
-      // Привязываем ссылку UI к элементу, чтобы onPlay/onPause могли её найти
-      audioEl._uiRefs = { playBtn, fill, curEl, durEl };
-      // Обновим замыкания — заменим обработчики, чтобы работали с текущими refs
-      if (audioEl._uiBound) {
-        // Убираем старые, добавляем новые
-        audioEl.removeEventListener('play', audioEl._onPlay);
-        audioEl.removeEventListener('pause', audioEl._onPause);
-        audioEl.removeEventListener('ended', audioEl._onEnded);
-        audioEl.removeEventListener('timeupdate', audioEl._onTime);
-        audioEl.removeEventListener('loadedmetadata', audioEl._onLoaded);
-      }
-      audioEl._onTime = () => {
-        const r = audioEl._uiRefs;
-        if (!r) return;
-        const cur = audioEl.currentTime || 0;
-        const dur = audioEl.duration || 0;
-        r.curEl.innerText = formatTime(cur);
-        r.durEl.innerText = formatTime(dur);
-        if (dur > 0) r.fill.style.width = ((cur / dur) * 100) + '%';
-      };
-      audioEl._onLoaded = () => {
-        const r = audioEl._uiRefs;
-        if (!r) return;
-        r.durEl.innerText = formatTime(audioEl.duration || 0);
-      };
-      audioEl._onPlay = () => {
-        const r = audioEl._uiRefs;
-        if (!r) return;
-        r.playBtn.innerText = '❚❚';
-        r.playBtn.classList.add('playing');
-      };
-      audioEl._onPause = () => {
-        const r = audioEl._uiRefs;
-        if (!r) return;
-        r.playBtn.innerText = '▶';
-        r.playBtn.classList.remove('playing');
-      };
-      audioEl._onEnded = () => {
-        const r = audioEl._uiRefs;
-        if (!r) return;
-        r.playBtn.innerText = '▶';
-        r.playBtn.classList.remove('playing');
-        r.fill.style.width = '0%';
-        r.curEl.innerText = '0:00';
-      };
-      audioEl.addEventListener('timeupdate', audioEl._onTime);
-      audioEl.addEventListener('loadedmetadata', audioEl._onLoaded);
-      audioEl.addEventListener('play', audioEl._onPlay);
-      audioEl.addEventListener('pause', audioEl._onPause);
-      audioEl.addEventListener('ended', audioEl._onEnded);
-
-      return wrap;
-    }
-
-    function toggleAudioPlay(audioEl, playBtn) {
-      // Если у пользователя играет другое аудио — остановим его
-      if (audioEl.paused) {
-        for (const entry of audioPool.values()) {
-          if (entry.element !== audioEl && !entry.element.paused) {
-            try { entry.element.pause(); } catch(e) {}
-          }
-        }
-        const p = audioEl.play();
-        if (p && typeof p.catch === 'function') {
-          p.catch(err => {
-            console.error('play error', err);
-            // На iOS/Android бывает, что нужно ещё раз нажать
-            if (playBtn) playBtn.innerText = '▶';
-          });
-        }
-      } else {
-        audioEl.pause();
-      }
     }
 
     // ==================== ОБЩЕЕ ====================
@@ -1210,7 +969,7 @@ app.get('*', (req, res) => {
       sendPing();
       loadDialogs();
       setInterval(() => {
-        if (currentUser) {
+        if (currentUser && !isRecording) {
           sendPing();
           loadDialogsQuiet();
           if (activePeer) {
@@ -1638,12 +1397,12 @@ app.get('*', (req, res) => {
         div.setAttribute('data-sender-id', m.senderId);
 
         div.oncontextmenu = (e) => {
-          if (e.target.closest && e.target.closest('.audio-msg-player')) return;
+          if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
           e.preventDefault();
           openMsgActions(m, div);
         };
         div.ontouchstart = (e) => {
-          if (e.target.closest && e.target.closest('.audio-msg-player')) return;
+          if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
           longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
         };
         div.ontouchend = () => clearTimeout(longTouchTimer);
@@ -1653,16 +1412,13 @@ app.get('*', (req, res) => {
         if (m.text) html += \`<div>\${m.text}</div>\`;
 
         const fileType = m.fileType || '';
-        const isAudio = fileType.startsWith('audio/') || (m.fileName && /\\.(webm|ogg|mp3|m4a|aac|wav|opus)$/i.test(m.fileName));
-
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
             html += \`<img src="\${m.fileData}" class="media-preview" onclick="openImageViewer('\${m.fileData}')">\`;
           } else if (fileType.startsWith('video/')) {
             html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
-          } else if (isAudio) {
-            // Плейсхолдер: реальный плеер вставим ниже через buildAudioPlayer
-            html += \`<div class="audio-player-slot" data-audio-msg-id="\${m.id}"></div>\`;
+          } else if (fileType.startsWith('audio/')) {
+            html += \`<div class="audio-slot" data-audio-msg-id="\${m.id}"></div>\`;
             validIds.push(m.id);
           } else {
             html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
@@ -1685,10 +1441,10 @@ app.get('*', (req, res) => {
 
         div.innerHTML = html;
 
-        const slot = div.querySelector('.audio-player-slot');
+        const slot = div.querySelector('.audio-slot');
         if (slot) {
-          const playerEl = buildAudioPlayer(m);
-          slot.replaceWith(playerEl);
+          const audioEl = getOrCreateAudioElement(m);
+          slot.replaceWith(audioEl);
         }
 
         container.appendChild(div);
@@ -1803,14 +1559,10 @@ app.get('*', (req, res) => {
           thumbImg.src = evt.target.result;
           thumbImg.style.display = 'block';
           typeLabel.innerText = 'Фото';
-        } else if (file.type.startsWith('audio/')) {
-          thumbImg.src = '';
-          thumbImg.style.display = 'none';
-          typeLabel.innerText = 'Аудио';
         } else {
           thumbImg.src = '';
           thumbImg.style.display = 'none';
-          typeLabel.innerText = file.type.startsWith('video/') ? 'Видео' : 'Файл';
+          typeLabel.innerText = file.type.startsWith('video/') ? 'Видео' : (file.type.startsWith('audio/') ? 'Аудио' : 'Файл');
         }
         previewContainer.classList.add('active');
       };
@@ -1821,6 +1573,230 @@ app.get('*', (req, res) => {
       selectedFile = null;
       document.getElementById('file-input').value = '';
       document.getElementById('attachment-preview-container').classList.remove('active');
+    }
+
+    // ==================== ЗАПИСЬ ГОЛОСОВЫХ ====================
+    // Логика переделана для стабильной работы на Android:
+    //  1. getUserMedia с channelCount:1, echoCancellation, noiseSuppression
+    //  2. Прогрев микрофона через Web Audio API (первые ~300мс Android отдаёт тишину)
+    //  3. Выбор MIME: audio/webm;codecs=opus на Android, audio/mp4 на iOS
+    //  4. mediaRecorder.start(250) — timeslice, чтобы данные шли чанками
+    //  5. requestData() перед stop(), чтобы финализировать последний кусок
+
+    function getSupportedMimeType() {
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      const candidates = isIOS
+        ? ['audio/mp4', 'audio/aac', 'audio/mpeg', 'audio/webm;codecs=opus', 'audio/webm']
+        : [
+            'audio/webm;codecs=opus',
+            'audio/ogg;codecs=opus',
+            'audio/webm',
+            'audio/mp4',
+            'audio/aac',
+            'audio/mpeg'
+          ];
+      for (const t of candidates) {
+        try {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+        } catch (e) {}
+      }
+      return '';
+    }
+
+    function waitForAudioWarmup(stream, ms) {
+      ms = ms || 300;
+      return new Promise(resolve => {
+        try {
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const src = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 512;
+          src.connect(analyser);
+          const data = new Uint8Array(analyser.fftSize);
+          const started = Date.now();
+          function tick() {
+            analyser.getByteTimeDomainData(data);
+            let maxDev = 0;
+            for (let i = 0; i < data.length; i++) {
+              const v = Math.abs(data[i] - 128);
+              if (v > maxDev) maxDev = v;
+            }
+            if (maxDev > 2 || Date.now() - started > ms) {
+              try { src.disconnect(); } catch(e) {}
+              try { ctx.close(); } catch(e) {}
+              resolve(true);
+            } else {
+              requestAnimationFrame(tick);
+            }
+          }
+          requestAnimationFrame(tick);
+        } catch (e) {
+          setTimeout(() => resolve(true), ms);
+        }
+      });
+    }
+
+    function startRecordingTimer() {
+      recordStartedAt = Date.now();
+      const indicator = document.getElementById('recording-indicator');
+      const timerEl = document.getElementById('recording-timer');
+      indicator.classList.add('active');
+      if (recordingTimerInterval) clearInterval(recordingTimerInterval);
+      recordingTimerInterval = setInterval(() => {
+        const s = Math.floor((Date.now() - recordStartedAt) / 1000);
+        const mm = Math.floor(s / 60);
+        const ss = (s % 60).toString().padStart(2, '0');
+        timerEl.innerText = mm + ':' + ss;
+      }, 200);
+    }
+
+    function stopRecordingTimer() {
+      const indicator = document.getElementById('recording-indicator');
+      indicator.classList.remove('active');
+      if (recordingTimerInterval) {
+        clearInterval(recordingTimerInterval);
+        recordingTimerInterval = null;
+      }
+    }
+
+    async function toggleVoiceRecord() {
+      const micBtn = document.getElementById('mic-btn');
+
+      // --- СТОП ---
+      if (isRecording) {
+        isRecording = false;
+        micBtn.innerText = '🎙️';
+        stopRecordingTimer();
+        try {
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            try { mediaRecorder.requestData && mediaRecorder.requestData(); } catch(e) {}
+            mediaRecorder.stop();
+          }
+        } catch (e) {
+          console.error('stop error', e);
+        }
+        return;
+      }
+
+      // --- СТАРТ ---
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('Ваш браузер не поддерживает запись с микрофона.');
+        return;
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1
+          },
+          video: false
+        });
+
+        activeStream = stream;
+
+        // Ждём прогрева микрофона (на Android первые ~300мс — тишина)
+        await waitForAudioWarmup(stream, 300);
+
+        const mimeType = getSupportedMimeType();
+        let options = {};
+        if (mimeType) options.mimeType = mimeType;
+        options.audioBitsPerSecond = 32000;
+
+        try {
+          mediaRecorder = new MediaRecorder(stream, options);
+        } catch (e) {
+          // Ретрай без audioBitsPerSecond
+          try {
+            mediaRecorder = mimeType
+              ? new MediaRecorder(stream, { mimeType })
+              : new MediaRecorder(stream);
+          } catch (e2) {
+            alert('Не удалось создать рекордер: ' + e2.message);
+            try { stream.getTracks().forEach(t => t.stop()); } catch(_) {}
+            activeStream = null;
+            return;
+          }
+        }
+
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = e => {
+          if (e.data && e.data.size > 0) {
+            audioChunks.push(e.data);
+          }
+        };
+
+        mediaRecorder.onerror = e => {
+          console.error('MediaRecorder error', e);
+          alert('Ошибка записи аудио: ' + (e.error ? e.error.name : 'unknown'));
+        };
+
+        mediaRecorder.onstop = () => {
+          const actualType = (mediaRecorder && mediaRecorder.mimeType) || mimeType || 'audio/webm';
+          const totalSize = audioChunks.reduce((s, c) => s + c.size, 0);
+          const durationMs = Date.now() - recordStartedAt;
+
+          // Освобождаем поток микрофона
+          try {
+            if (activeStream) activeStream.getTracks().forEach(t => t.stop());
+          } catch (e) {}
+          activeStream = null;
+
+          if (totalSize < 500 || audioChunks.length === 0) {
+            alert('Запись получилась пустой или слишком короткой. Попробуйте ещё раз.');
+            return;
+          }
+
+          const audioBlob = new Blob(audioChunks, { type: actualType });
+          const reader = new FileReader();
+          reader.onload = function(evt) {
+            const ext = actualType.indexOf('mp4') !== -1 ? 'm4a'
+                      : actualType.indexOf('aac') !== -1 ? 'aac'
+                      : actualType.indexOf('ogg') !== -1 ? 'ogg'
+                      : 'webm';
+
+            selectedFile = {
+              data: evt.target.result,
+              name: 'voice_' + Date.now() + '.' + ext,
+              type: actualType
+            };
+
+            const previewContainer = document.getElementById('attachment-preview-container');
+            document.getElementById('attachment-thumb-img').style.display = 'none';
+            document.getElementById('attachment-name-label').innerText = 'Голосовое сообщение (' +
+              Math.max(1, Math.round(durationMs / 1000)) + 'с)';
+            document.getElementById('attachment-type-label').innerText = 'Аудио (нажмите ➤ чтобы отправить)';
+            previewContainer.classList.add('active');
+          };
+          reader.onerror = () => {
+            alert('Не удалось прочитать записанное аудио. Попробуйте ещё раз.');
+          };
+          reader.readAsDataURL(audioBlob);
+        };
+
+        // Timeslice 250мс — критично для Android
+        mediaRecorder.start(250);
+        isRecording = true;
+        micBtn.innerText = '🔴';
+        startRecordingTimer();
+
+      } catch (err) {
+        console.error('getUserMedia error', err);
+        let msg = 'Нет доступа к микрофону.';
+        if (err && err.name === 'NotAllowedError') msg = 'Вы отклонили доступ к микрофону. Разрешите в настройках браузера.';
+        else if (err && err.name === 'NotFoundError') msg = 'Микрофон не найден на устройстве.';
+        else if (err && err.name === 'NotReadableError') msg = 'Микрофон занят другим приложением.';
+        alert(msg);
+        try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e) {}
+        activeStream = null;
+        isRecording = false;
+        micBtn.innerText = '🎙️';
+        stopRecordingTimer();
+      }
     }
 
     async function sendMsg() {
