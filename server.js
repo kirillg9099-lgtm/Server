@@ -11,6 +11,7 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 process.on('uncaughtException', (err) => {
   console.error('[ОШИБКА СЕРВЕРА]:', err);
 });
+
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[ОШИБКА ПРОМИСА]:', reason);
 });
@@ -49,7 +50,7 @@ function safeWriteJSON(filePath, data) {
     fs.writeFileSync(tmpPath, str, 'utf8');
     fs.renameSync(tmpPath, filePath);
   } catch (e) {
-    console.error(`[ОШИБКА ЗАПИСИ]:`, e);
+    console.error('[ОШИБКА ЗАПИСИ]:', e);
   }
 }
 
@@ -76,7 +77,7 @@ function decryptText(text) {
   return text;
 }
 
-// Регистрация с автоматическим разрешением коллизий ID
+// Регистрация с авто-разрешением коллизий ID
 app.post('/api/register', (req, res) => {
   let { id, name, avatar, contacts } = req.body;
   const accounts = readAccounts();
@@ -115,7 +116,7 @@ app.post('/api/register', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Глобальный пинг, синхронизация аккаунтов, статусов прочтения, удалений и бэкап информации
+// Глобальный пинг
 app.post('/api/ping', (req, res) => {
   const { id, name, avatar, contacts, knownUsers, syncMessages, readMsgIds, deletedMsgIds } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
@@ -123,7 +124,6 @@ app.post('/api/ping', (req, res) => {
   const accounts = readAccounts();
   const serverMessages = readMessages();
 
-  // Синхронизация статусов прочтения сообщений со всех клиентов
   if (Array.isArray(readMsgIds) && readMsgIds.length > 0) {
     let changed = false;
     serverMessages.forEach(m => {
@@ -135,7 +135,6 @@ app.post('/api/ping', (req, res) => {
     if (changed) writeMessages(serverMessages);
   }
 
-  // Синхронизация удаленных сообщений со всех клиентов (глобальное удаление у всех)
   if (Array.isArray(deletedMsgIds) && deletedMsgIds.length > 0) {
     let changed = false;
     serverMessages.forEach(m => {
@@ -239,7 +238,7 @@ app.post('/api/profile/update', (req, res) => {
   res.json({ success: true, user });
 });
 
-// Получение профиля пользователя
+// Получение профиля
 app.get('/api/users/:userId', (req, res) => {
   const accounts = readAccounts();
   const user = accounts.find(u => u.id === req.params.userId);
@@ -248,7 +247,7 @@ app.get('/api/users/:userId', (req, res) => {
   res.json({ id: user.id, name: user.name, avatar: user.avatar || '', isOnline, updatedAt: user.updatedAt });
 });
 
-// Блокировка/разблокировка пользователя
+// Блокировка
 app.post('/api/users/block', (req, res) => {
   const { userId, peerId, block } = req.body;
   const accounts = readAccounts();
@@ -266,7 +265,7 @@ app.post('/api/users/block', (req, res) => {
   res.json({ success: true, blockedContacts: user.blockedContacts });
 });
 
-// Скрытие (удаление) чата для конкретного пользователя
+// Скрытие диалога
 app.post('/api/chat/hide', (req, res) => {
   const { userId, peerId } = req.body;
   const accounts = readAccounts();
@@ -280,7 +279,7 @@ app.post('/api/chat/hide', (req, res) => {
   res.json({ success: true, hiddenDialogs: user.hiddenDialogs });
 });
 
-// Поиск аккаунтов
+// Поиск
 app.get('/api/users/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
   if (!q) return res.json([]);
@@ -313,7 +312,6 @@ app.post('/api/messages/send', (req, res) => {
     return res.status(403).json({ error: 'Вы заблокированы получателем' });
   }
 
-  // Если чат был скрыт ранее, при новом сообщении снова показываем его
   if (sender && sender.hiddenDialogs) {
     sender.hiddenDialogs = sender.hiddenDialogs.filter(id => id !== receiverId);
   }
@@ -353,12 +351,12 @@ app.post('/api/messages/send', (req, res) => {
       updated = true;
     }
   }
-  if (updated || sender || receiver) writeAccounts(accounts);
+  if (updated) writeAccounts(accounts);
 
   res.json({ success: true, message: { ...newMsg, text: text } });
 });
 
-// Отметка сообщения как прочитанного
+// Прочтение
 app.post('/api/messages/read', (req, res) => {
   const { msgIds } = req.body;
   if (!Array.isArray(msgIds) || msgIds.length === 0) return res.json({ success: true });
@@ -375,7 +373,7 @@ app.post('/api/messages/read', (req, res) => {
   res.json({ success: true });
 });
 
-// Удаление сообщения (пометка у всех)
+// Удаление сообщения
 app.delete('/api/messages/:msgId', (req, res) => {
   const { msgId } = req.params;
   let messages = readMessages();
@@ -390,7 +388,7 @@ app.delete('/api/messages/:msgId', (req, res) => {
   res.json({ success: true });
 });
 
-// Очистка всей истории чата между двумя пользователями
+// Очистка чата
 app.post('/api/chat/clear', (req, res) => {
   const { userId, peerId } = req.body;
   let messages = readMessages();
@@ -453,10 +451,9 @@ app.get('/api/dialogs/:userId', (req, res) => {
   res.json(dialogs);
 });
 
-// HTML клиентская часть
+// Отдача фронтенда
 app.get('*', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
+  res.send(`<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
   <meta charset="UTF-8">
@@ -539,7 +536,6 @@ app.get('*', (req, res) => {
     .menu-dots-btn { background: transparent; border: none; color: var(--text-main); font-size: 20px; cursor: pointer; padding: 8px; border-radius: 50%; display: none; align-items: center; justify-content: center; }
     .menu-dots-btn:hover { background: var(--bg-input); }
 
-    /* Выпадающий мини-список по клику */
     .chat-dropdown-menu { position: absolute; right: 0; top: 45px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 220px; display: none; flex-direction: column; z-index: 1000; overflow: hidden; }
     .chat-dropdown-menu.active { display: flex; }
     .menu-item { padding: 12px 16px; font-size: 14px; cursor: pointer; border-bottom: 1px solid var(--border); text-align: left; background: none; border-top: none; border-left: none; border-right: none; color: var(--text-main); width: 100%; }
@@ -555,12 +551,10 @@ app.get('*', (req, res) => {
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
     
-    /* Доработка стиля для постоянного и плавного отображения аудио */
     .audio-preview { width: 250px; min-width: 200px; margin-top: 5px; display: block; outline: none; }
     
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
-    /* Мелкие галочки под сообщением */
     .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
     .ticks { font-size: 11px; letter-spacing: -3px; font-weight: bold; }
     .ticks.read { color: var(--accent); }
@@ -582,7 +576,6 @@ app.get('*', (req, res) => {
 
     .empty-state { margin: auto; text-align: center; color: var(--text-muted); font-size: 14px; }
 
-    /* Модальные окна */
     .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: none; align-items: center; justify-content: center; }
     .modal-overlay.active { display: flex; }
     .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); position: relative; }
@@ -618,7 +611,6 @@ app.get('*', (req, res) => {
 </head>
 <body onclick="onBodyGlobalClick(event)">
 
-  <!-- Авторизация -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход в мессенджер</h2>
@@ -630,7 +622,6 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Основной экран -->
   <div id="app-screen" class="screen">
     <div id="app-container">
       
@@ -704,7 +695,6 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Модальное окно своего профиля -->
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="my-profile-avatar-view">
@@ -728,7 +718,6 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Модальное окно профиля собеседника -->
   <div class="modal-overlay" id="peer-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="peer-profile-avatar-view">
@@ -745,13 +734,11 @@ app.get('*', (req, res) => {
     </div>
   </div>
 
-  <!-- Полноэкранный просмотр изображений -->
   <div id="image-viewer-modal" onclick="closeImageViewer()">
     <button class="viewer-close" onclick="closeImageViewer()">✕</button>
     <img id="full-screen-img" src="" alt="">
   </div>
 
-  <!-- Лист действий с сообщением -->
   <div class="msg-actions-sheet" id="msg-actions-sheet">
     <button class="btn" id="action-btn-copy" onclick="actionCopyText()" style="display:none;">Копировать текст</button>
     <button class="btn" id="action-btn-download" onclick="actionDownloadFile()" style="display:none;">Скачать файл</button>
@@ -1288,7 +1275,7 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
+        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
         
         messages.forEach(msg => {
@@ -1311,7 +1298,7 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
+        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
         
         let hasNewMsg = false;
@@ -1348,7 +1335,6 @@ app.get('*', (req, res) => {
       document.getElementById('image-viewer-modal').classList.remove('active');
     }
 
-    // Оптимизированная отрисовка: не пересоздает элементы, если они не изменились (чтобы медиа не прерывалось)
     function renderMessagesContainer(messages) {
       const container = document.getElementById('messages-container');
       const isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
@@ -1358,7 +1344,6 @@ app.get('*', (req, res) => {
         return;
       }
 
-      // Удаляем пустой холст, если он остался
       const emptyState = container.querySelector('.empty-state');
       if (emptyState) emptyState.remove();
 
@@ -1366,7 +1351,6 @@ app.get('*', (req, res) => {
       const existingMap = new Map();
       existingElements.forEach(el => existingMap.set(el.getAttribute('data-msg-id'), el));
 
-      // Находим удаленные элементы
       const currentIds = new Set(messages.map(m => m.id));
       existingElements.forEach(el => {
         const id = el.getAttribute('data-msg-id');
@@ -1376,7 +1360,6 @@ app.get('*', (req, res) => {
       messages.forEach(m => {
         const existingEl = existingMap.get(m.id);
         
-        // Галочки статуса
         let ticksHtml = '';
         if (m.senderId === currentUser.id) {
           const isReadClass = m.isRead ? 'ticks read' : 'ticks';
@@ -1384,7 +1367,6 @@ app.get('*', (req, res) => {
           ticksHtml = `<span class="${isReadClass}">${ticksSymbol}</span>`;
         }
 
-        // Вычисляем innerHTML сообщения
         let innerContentHtml = '';
         if (m.text) innerContentHtml += `<div>${m.text}</div>`;
 
@@ -1395,7 +1377,6 @@ app.get('*', (req, res) => {
           } else if (fileType.startsWith('video/')) {
             innerContentHtml += `<video src="${m.fileData}" controls class="video-preview"></video>`;
           } else if (fileType.startsWith('audio/')) {
-            // controlsList="nodownload" обеспечивает постоянное наличие меню настроек и точек
             innerContentHtml += `<audio src="${m.fileData}" controls controlsList="nodownload" class="audio-preview"></audio>`;
           } else {
             innerContentHtml += `<a class="file-link" onclick="event.stopPropagation()">📁 ${m.fileName || 'Файл'}</a>`;
@@ -1409,7 +1390,6 @@ app.get('*', (req, res) => {
         `;
 
         if (existingEl) {
-          // Если элемент существует, обновляем только статус прочтения (не затрагивая HTML медиа-плеера)
           const footer = existingEl.querySelector('.msg-footer');
           if (footer) {
             const oldTicks = footer.querySelector('.ticks');
@@ -1419,7 +1399,6 @@ app.get('*', (req, res) => {
             }
           }
         } else {
-          // Создаем новый DOM-элемент
           const div = document.createElement('div');
           div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
           div.setAttribute('data-msg-id', m.id);
@@ -1445,7 +1424,6 @@ app.get('*', (req, res) => {
       }
     }
 
-    // Проверка видимости сообщений на экране получателя для фиксации прочтения
     function checkVisibleMessages() {
       if (!activePeer) return;
       const container = document.getElementById('messages-container');
@@ -1649,10 +1627,10 @@ app.get('*', (req, res) => {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
         tempDiv.innerHTML = `
-          ${text ? '<div>' + text + '</div>' : ''}
+          \${text ? '<div>' + text + '</div>' : ''}
           <div class="uploading-box">
             <div class="spinner"></div>
-            <div>Загрузка видео... (${fileToSend.name})</div>
+            <div>Загрузка видео... (\${fileToSend.name})</div>
           </div>
           <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
         `;
@@ -1697,8 +1675,7 @@ app.get('*', (req, res) => {
     }
   </script>
 </body>
-</html>
-  `);
+</html>`);
 });
 
 app.listen(PORT, () => console.log(`[СЕРВЕР ЗАПУЩЕН] Порт: ${PORT}`));
