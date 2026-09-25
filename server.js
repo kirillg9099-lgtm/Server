@@ -554,7 +554,10 @@ app.get('*', (req, res) => {
     
     .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
     .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
-    .audio-preview { width: 240px; margin-top: 5px; }
+    
+    /* Доработка стиля для постоянного и плавного отображения аудио */
+    .audio-preview { width: 250px; min-width: 200px; margin-top: 5px; display: block; outline: none; }
+    
     .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
 
     /* Мелкие галочки под сообщением */
@@ -949,7 +952,6 @@ app.get('*', (req, res) => {
             updateMyProfileUI();
           }
           if (Array.isArray(data.serverMessages)) {
-            // Синхронизируем локальный кэш с актуальным состоянием сервера (включая удаления и прочтения)
             localMessagesCache = data.serverMessages;
             localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
             if (activePeer) renderMessagesContainer(getPeerMessages(activePeer.id));
@@ -1231,15 +1233,15 @@ app.get('*', (req, res) => {
         const avatarId = 'chat_av_' + item.id;
         const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
 
-        div.innerHTML = \`
-          <div class="avatar-circle" id="\${avatarId}">
-            <div class="online-indicator \${item.isOnline ? 'visible' : ''}"></div>
+        div.innerHTML = `
+          <div class="avatar-circle" id="${avatarId}">
+            <div class="online-indicator ${item.isOnline ? 'visible' : ''}"></div>
           </div>
           <div>
-            <div style="font-weight:bold;">\${item.name}</div>
-            <div style="font-size:11px;">\${onlineText}</div>
+            <div style="font-weight:bold;">${item.name}</div>
+            <div style="font-size:11px;">${onlineText}</div>
           </div>
-        \`;
+        `;
         container.appendChild(div);
         renderAvatarIntoElement(document.getElementById(avatarId), item, item.isOnline);
       });
@@ -1286,10 +1288,9 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
+        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
         const messages = await res.json();
         
-        // Обновляем локальный кэш
         messages.forEach(msg => {
           let idx = localMessagesCache.findIndex(m => m.id === msg.id);
           if (idx !== -1) {
@@ -1310,7 +1311,7 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
+        const res = await fetch(`/api/messages/${currentUser.id}/${activePeer.id}`);
         const messages = await res.json();
         
         let hasNewMsg = false;
@@ -1344,69 +1345,99 @@ app.get('*', (req, res) => {
     }
 
     function closeImageViewer() {
-      document.getElementById('image-viewer-modal').classList.add('active') ? document.getElementById('image-viewer-modal').classList.remove('active') : null;
       document.getElementById('image-viewer-modal').classList.remove('active');
     }
 
+    // Оптимизированная отрисовка: не пересоздает элементы, если они не изменились (чтобы медиа не прерывалось)
     function renderMessagesContainer(messages) {
       const container = document.getElementById('messages-container');
       const isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
       
-      container.innerHTML = '';
       if (!messages || messages.length === 0) {
         container.innerHTML = '<div class="empty-state">Нет сообщений. Напишите первыми!</div>';
         return;
       }
 
+      // Удаляем пустой холст, если он остался
+      const emptyState = container.querySelector('.empty-state');
+      if (emptyState) emptyState.remove();
+
+      const existingElements = Array.from(container.querySelectorAll('.msg[data-msg-id]'));
+      const existingMap = new Map();
+      existingElements.forEach(el => existingMap.set(el.getAttribute('data-msg-id'), el));
+
+      // Находим удаленные элементы
+      const currentIds = new Set(messages.map(m => m.id));
+      existingElements.forEach(el => {
+        const id = el.getAttribute('data-msg-id');
+        if (!currentIds.has(id)) el.remove();
+      });
+
       messages.forEach(m => {
-        const div = document.createElement('div');
-        div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
-        div.setAttribute('data-msg-id', m.id);
-        div.setAttribute('data-sender-id', m.senderId);
-
-        div.oncontextmenu = (e) => {
-          e.preventDefault();
-          openMsgActions(m, div);
-        };
-        div.ontouchstart = () => {
-          longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
-        };
-        div.ontouchend = () => clearTimeout(longTouchTimer);
-        div.ontouchmove = () => clearTimeout(longTouchTimer);
-
-        let html = '';
-        if (m.text) html += \`<div>\${m.text}</div>\`;
-
-        const fileType = m.fileType || '';
-        if (m.fileData) {
-          if (fileType.startsWith('image/')) {
-            html += \`<img src="\${m.fileData}" class="media-preview" onclick="openImageViewer('\${m.fileData}')">\`;
-          } else if (fileType.startsWith('video/')) {
-            html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
-          } else if (fileType.startsWith('audio/')) {
-            html += \`<audio src="\${m.fileData}" controls class="audio-preview"></audio>\`;
-          } else {
-            html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
-          }
-        }
-
-        // Галочки под сообщением: одна галочка, если не прочитано, две — если прочитано
+        const existingEl = existingMap.get(m.id);
+        
+        // Галочки статуса
         let ticksHtml = '';
         if (m.senderId === currentUser.id) {
           const isReadClass = m.isRead ? 'ticks read' : 'ticks';
           const ticksSymbol = m.isRead ? '✓✓' : '✓';
-          ticksHtml = \`<span class="\${isReadClass}">\${ticksSymbol}</span>\`;
+          ticksHtml = `<span class="${isReadClass}">${ticksSymbol}</span>`;
         }
 
-        html += \`
-          <div class="msg-footer">
-            <span>\${m.timestamp || ''}</span>
-            \${ticksHtml}
-          </div>
-        \`;
+        // Вычисляем innerHTML сообщения
+        let innerContentHtml = '';
+        if (m.text) innerContentHtml += `<div>${m.text}</div>`;
 
-        div.innerHTML = html;
-        container.appendChild(div);
+        const fileType = m.fileType || '';
+        if (m.fileData) {
+          if (fileType.startsWith('image/')) {
+            innerContentHtml += `<img src="${m.fileData}" class="media-preview" onclick="openImageViewer('${m.fileData}')">`;
+          } else if (fileType.startsWith('video/')) {
+            innerContentHtml += `<video src="${m.fileData}" controls class="video-preview"></video>`;
+          } else if (fileType.startsWith('audio/')) {
+            // controlsList="nodownload" обеспечивает постоянное наличие меню настроек и точек
+            innerContentHtml += `<audio src="${m.fileData}" controls controlsList="nodownload" class="audio-preview"></audio>`;
+          } else {
+            innerContentHtml += `<a class="file-link" onclick="event.stopPropagation()">📁 ${m.fileName || 'Файл'}</a>`;
+          }
+        }
+
+        innerContentHtml += `
+          <div class="msg-footer">
+            <span>${m.timestamp \vert{}\vert{} ''}</span>${ticksHtml}
+          </div>
+        `;
+
+        if (existingEl) {
+          // Если элемент существует, обновляем только статус прочтения (не затрагивая HTML медиа-плеера)
+          const footer = existingEl.querySelector('.msg-footer');
+          if (footer) {
+            const oldTicks = footer.querySelector('.ticks');
+            if (oldTicks && m.senderId === currentUser.id) {
+              oldTicks.className = m.isRead ? 'ticks read' : 'ticks';
+              oldTicks.innerText = m.isRead ? '✓✓' : '✓';
+            }
+          }
+        } else {
+          // Создаем новый DOM-элемент
+          const div = document.createElement('div');
+          div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
+          div.setAttribute('data-msg-id', m.id);
+          div.setAttribute('data-sender-id', m.senderId);
+
+          div.oncontextmenu = (e) => {
+            e.preventDefault();
+            openMsgActions(m, div);
+          };
+          div.ontouchstart = () => {
+            longTouchTimer = setTimeout(() => openMsgActions(m, div), 500);
+          };
+          div.ontouchend = () => clearTimeout(longTouchTimer);
+          div.ontouchmove = () => clearTimeout(longTouchTimer);
+
+          div.innerHTML = innerContentHtml;
+          container.appendChild(div);
+        }
       });
 
       if (isScrolledToBottom) {
@@ -1427,7 +1458,6 @@ app.get('*', (req, res) => {
         const senderId = el.getAttribute('data-sender-id');
         const msgId = el.getAttribute('data-msg-id');
         
-        // Если сообщение от собеседника и попало в кадр видимости
         if (senderId === activePeer.id) {
           const rect = el.getBoundingClientRect();
           if (rect.top >= containerRect.top && rect.bottom <= containerRect.bottom) {
@@ -1618,14 +1648,14 @@ app.get('*', (req, res) => {
       if (isVideo) {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
-        tempDiv.innerHTML = \`
-          \${text ? '<div>' + text + '</div>' : ''}
+        tempDiv.innerHTML = `
+          ${text ? '<div>' + text + '</div>' : ''}
           <div class="uploading-box">
             <div class="spinner"></div>
-            <div>Загрузка видео... (\${fileToSend.name})</div>
+            <div>Загрузка видео... (${fileToSend.name})</div>
           </div>
           <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
-        \`;
+        `;
         container.appendChild(tempDiv);
         container.scrollTop = container.scrollHeight;
       }
