@@ -76,7 +76,7 @@ function decryptText(text) {
   return text;
 }
 
-// ==================== API МАРШРУТЫ ====================
+// ==================== API MARШРУТЫ ====================
 
 // 1. Регистрация / авторизация
 app.post('/api/register', (req, res) => {
@@ -1232,14 +1232,15 @@ app.get('*', (req, res) => {
         const avatarId = 'chat_av_' + item.id;
         const onlineText = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
 
-        div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' +
-            '<div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div>' +
-          '</div>' +
-          '<div>' +
-            '<div style="font-weight:bold;">' + item.name + '</div>' +
-            '<div style="font-size:11px;">' + onlineText + '</div>' +
-          '</div>';
-
+        div.innerHTML = \`
+          <div class="avatar-circle" id="\${avatarId}">
+            <div class="online-indicator \${item.isOnline ? 'visible' : ''}"></div>
+          </div>
+          <div>
+            <div style="font-weight:bold;">\${item.name}</div>
+            <div style="font-size:11px;">\${onlineText}</div>
+          </div>
+        \`;
         container.appendChild(div);
         renderAvatarIntoElement(document.getElementById(avatarId), item, item.isOnline);
       });
@@ -1286,7 +1287,7 @@ app.get('*', (req, res) => {
     async function loadMessages() {
       if (!activePeer) return;
       try {
-        const res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
+        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
         
         messages.forEach(msg => {
@@ -1309,7 +1310,7 @@ app.get('*', (req, res) => {
     async function loadMessagesQuiet() {
       if (!activePeer) return;
       try {
-        const res = await fetch('/api/messages/' + currentUser.id + '/' + activePeer.id);
+        const res = await fetch(\`/api/messages/\${currentUser.id}/\${activePeer.id}\`);
         const messages = await res.json();
         
         let hasNewMsg = false;
@@ -1373,18 +1374,18 @@ app.get('*', (req, res) => {
         div.ontouchmove = () => clearTimeout(longTouchTimer);
 
         let html = '';
-        if (m.text) html += '<div>' + m.text + '</div>';
+        if (m.text) html += \`<div>\${m.text}</div>\`;
 
         const fileType = m.fileType || '';
         if (m.fileData) {
           if (fileType.startsWith('image/')) {
-            html += '<img src="' + m.fileData + '" class="media-preview" onclick="openImageViewer(\'' + m.fileData + '\')">';
+            html += \`<img src="\${m.fileData}" class="media-preview" onclick="openImageViewer('\${m.fileData}')">\`;
           } else if (fileType.startsWith('video/')) {
-            html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
+            html += \`<video src="\${m.fileData}" controls class="video-preview"></video>\`;
           } else if (fileType.startsWith('audio/')) {
-            html += '<audio src="' + m.fileData + '" controls class="audio-preview"></audio>';
+            html += \`<audio src="\${m.fileData}" controls class="audio-preview"></audio>\`;
           } else {
-            html += '<a class="file-link" onclick="event.stopPropagation()">📁 ' + (m.fileName || 'Файл') + '</a>';
+            html += \`<a class="file-link" onclick="event.stopPropagation()">📁 \${m.fileName || 'Файл'}</a>\`;
           }
         }
 
@@ -1392,13 +1393,15 @@ app.get('*', (req, res) => {
         if (m.senderId === currentUser.id) {
           const isReadClass = m.isRead ? 'ticks read' : 'ticks';
           const ticksSymbol = m.isRead ? '✓✓' : '✓';
-          ticksHtml = '<span class="' + isReadClass + '">' + ticksSymbol + '</span>';
+          ticksHtml = \`<span class="\${isReadClass}">\${ticksSymbol}</span>\`;
         }
 
-        html += '<div class="msg-footer">' +
-            '<span>' + (m.timestamp || '') + '</span>' +
-            ticksHtml +
-          '</div>';
+        html += \`
+          <div class="msg-footer">
+            <span>\${m.timestamp || ''}</span>
+            \${ticksHtml}
+          </div>
+        \`;
 
         div.innerHTML = html;
         container.appendChild(div);
@@ -1611,12 +1614,14 @@ app.get('*', (req, res) => {
       if (isVideo) {
         tempDiv = document.createElement('div');
         tempDiv.className = 'msg my';
-        tempDiv.innerHTML = (text ? '<div>' + text + '</div>' : '') +
-          '<div class="uploading-box">' +
-            '<div class="spinner"></div>' +
-            '<div>Загрузка видео... (' + fileToSend.name + ')</div>' +
-          '</div>' +
-          '<div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>';
+        tempDiv.innerHTML = \`
+          \${text ? '<div>' + text + '</div>' : ''}
+          <div class="uploading-box">
+            <div class="spinner"></div>
+            <div>Загрузка видео... (\${fileToSend.name})</div>
+          </div>
+          <div style="font-size:9px; color:var(--text-muted); text-align:right; margin-top:3px;">только что</div>
+        \`;
         container.appendChild(tempDiv);
         container.scrollTop = container.scrollHeight;
       }
@@ -1663,4 +1668,3 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`[СЕРВЕР УСПЕШНО ЗАПУЩЕН] Порт: ${PORT}`));
-, 
