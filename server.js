@@ -265,6 +265,30 @@ app.post('/api/groups/add', function (req, res) {
   res.json({ success: true, group: groupWithDetails(g) });
 });
 
+app.post('/api/groups/kick', function (req, res) {
+  const groupId = req.body.groupId, userId = req.body.userId, memberId = req.body.memberId;
+  const groups = readGroups();
+  const g = groups.find(function (x) { return x.id === groupId; });
+  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
+  if (g.ownerId !== userId) return res.status(403).json({ error: 'Только создатель может выгонять' });
+  if (memberId === userId) return res.status(400).json({ error: 'Нельзя выгнать себя' });
+  if (g.members.indexOf(memberId) === -1) return res.status(404).json({ error: 'Участник не найден' });
+  g.members = g.members.filter(function (m) { return m !== memberId; });
+  writeGroups(groups);
+  res.json({ success: true, group: groupWithDetails(g) });
+});
+
+app.post('/api/groups/delete', function (req, res) {
+  const groupId = req.body.groupId, userId = req.body.userId;
+  let groups = readGroups();
+  const g = groups.find(function (x) { return x.id === groupId; });
+  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
+  if (g.ownerId !== userId) return res.status(403).json({ error: 'Только создатель может удалить группу' });
+  groups = groups.filter(function (x) { return x.id !== groupId; });
+  writeGroups(groups);
+  res.json({ success: true });
+});
+
 app.post('/api/groups/leave', function (req, res) {
   const groupId = req.body.groupId, userId = req.body.userId;
   let groups = readGroups();
@@ -498,9 +522,10 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
   .user-profile-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px; cursor: pointer; }
   .user-info-brief { display: flex; flex-direction: column; overflow: hidden; margin-left: 10px; flex: 1; }
-  .avatar-circle { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; position: relative; overflow: hidden; }
-  .avatar-circle img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
-  .online-indicator { position: absolute; bottom: 0; right: 0; width: 12px; height: 12px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; z-index: 10; pointer-events: none; }
+  .avatar-circle { width: 40px; height: 40px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-weight: bold; flex-shrink: 0; font-size: 16px; position: relative; }
+  .avatar-circle img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; display: block; position: relative; z-index: 1; }
+  .avatar-circle > span { position: relative; z-index: 1; }
+  .online-indicator { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; z-index: 999; pointer-events: none; box-sizing: content-box; }
   .online-indicator.visible { display: block; }
   .header-actions { display: flex; gap: 6px; }
   .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; transition: opacity 0.15s; }
@@ -565,15 +590,24 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: opacity 0.15s, visibility 0.15s; pointer-events: none; }
   .modal-overlay.active { visibility: visible; opacity: 1; pointer-events: auto; }
   .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); position: relative; max-height: 90dvh; overflow-y: auto; }
-  .profile-avatar-big { width: 90px; height: 90px; border-radius: 50%; object-fit: cover; background: var(--accent); margin-bottom: 15px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 32px; font-weight: bold; overflow: hidden; position: relative; }
-  .profile-avatar-big img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+  .profile-avatar-big { width: 90px; height: 90px; border-radius: 50%; background: var(--accent); margin-bottom: 15px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 32px; font-weight: bold; position: relative; }
+  .profile-avatar-big img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; display: block; position: relative; z-index: 1; }
+  .profile-avatar-big > span { position: relative; z-index: 1; }
   .profile-name { font-size: 20px; font-weight: bold; margin-bottom: 5px; }
   .profile-id { font-size: 13px; color: var(--accent); margin-bottom: 20px; }
   .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
   .profile-link-btn { background: none; border: none; color: var(--accent); font-size: 14px; font-weight: 500; cursor: pointer; padding: 5px; text-align: center; }
   .profile-link-btn:hover { text-decoration: underline; }
   .check-row { display: flex; align-items: center; gap: 10px; padding: 8px; cursor: pointer; border-bottom: 1px solid var(--border); }
-  .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; }
+  .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; cursor: pointer; border-radius: 8px; position: relative; transition: background 0.15s; }
+  .member-row:hover { background: var(--bg-hover); }
+  .member-menu-btn { background: transparent; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer; padding: 4px 8px; border-radius: 50%; flex-shrink: 0; line-height: 1; }
+  .member-menu-btn:hover { background: var(--bg-input); color: var(--text-main); }
+  .member-dropdown { position: absolute; right: 8px; top: 90%; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 180px; z-index: 1500; overflow: hidden; display: none; }
+  .member-dropdown.active { display: block; }
+  .member-dropdown .menu-item { padding: 10px 14px; font-size: 13px; text-align: left; width: 100%; background: none; border: none; color: var(--text-main); cursor: pointer; display: block; }
+  .member-dropdown .menu-item:hover { background: var(--bg-active); }
+  .member-dropdown .menu-item.danger { color: #e53935; }
   #image-viewer-modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: opacity 0.15s, visibility 0.15s; pointer-events: none; }
   #image-viewer-modal.active { visibility: visible; opacity: 1; pointer-events: auto; }
   #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; object-fit: contain; }
@@ -752,7 +786,8 @@ const CLIENT_HTML = `<!DOCTYPE html>
       <div style="width:100%; text-align:left; font-size:13px; color:var(--text-muted); margin:6px 0 5px;">Участники:</div>
       <div id="group-members-list" style="width:100%; max-height:180px; overflow-y:auto; margin-bottom:10px;"></div>
       <div class="profile-actions">
-        <button class="btn btn-danger" onclick="leaveGroup()">Покинуть группу</button>
+        <button class="btn btn-danger" id="delete-group-btn" style="display:none;" onclick="deleteGroup()">Удалить группу</button>
+        <button class="btn btn-danger" id="leave-group-btn" onclick="leaveGroup()">Покинуть группу</button>
         <button class="btn btn-secondary" onclick="closeGroupProfile()">Закрыть</button>
       </div>
     </div>
@@ -812,7 +847,9 @@ var blobUrlCache = new Map();
 var visibleMsgDebounce = null;
 var busyButtons = {};
 var dialogsPollingTimer = null;
-var pendingAvatarUpload = false;
+var draftAvatar = null;
+var activeMemberDropdown = null;
+var profileTargetId = null;
 
 /* ---------- ЗАЩИТА КНОПОК ---------- */
 function lockButton(id, ms) {
@@ -1036,7 +1073,7 @@ document.addEventListener('click', function (e) {
   }
 });
 
-/* ---------- АВАТАРЫ (УНИВЕРСАЛЬНАЯ ФУНКЦИЯ) ---------- */
+/* ---------- АВАТАРЫ ---------- */
 function renderAvatarIntoElement(el, userObj, isOnline) {
   if (!el) return;
   var indicator = el.querySelector('.online-indicator');
@@ -1233,6 +1270,7 @@ async function refreshActivePeerStatus() {
 /* ---------- МОЙ ПРОФИЛЬ ---------- */
 function openMyProfile() {
   if (isModalOpen('my-profile-modal')) return;
+  draftAvatar = null;
   document.getElementById('edit-my-name-input').value = currentUser.name;
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
@@ -1240,7 +1278,10 @@ function openMyProfile() {
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
   safeOpenModal('my-profile-modal');
 }
-function closeMyProfile() { safeCloseModal('my-profile-modal'); }
+function closeMyProfile() {
+  draftAvatar = null;
+  safeCloseModal('my-profile-modal');
+}
 function triggerAvatarInput() { var i = document.getElementById('avatar-file-input'); i.value = ''; i.click(); }
 function handleAvatarSelect(e) {
   var file = e.target.files[0];
@@ -1251,24 +1292,24 @@ function handleAvatarSelect(e) {
   }
   compressImage(file, 200, 0.85, function (compressed) {
     if (!compressed) { alert('Не удалось обработать изображение.'); return; }
-    currentUser.avatar = compressed;
-    pendingAvatarUpload = true;
-    renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
-    renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
+    draftAvatar = compressed;
+    renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { avatar: draftAvatar, name: currentUser.name }, true);
     document.getElementById('remove-avatar-link-btn').style.display = 'block';
   });
 }
 function removeMyAvatar() {
-  currentUser.avatar = '';
-  pendingAvatarUpload = true;
-  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
-  renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
+  draftAvatar = '';
+  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { avatar: '', name: currentUser.name }, true);
   document.getElementById('remove-avatar-link-btn').style.display = 'none';
 }
 async function saveMyProfileChanges() {
   if (!lockButton('save-my-profile-btn', 3000)) return;
   var newName = document.getElementById('edit-my-name-input').value.trim();
   if (newName) currentUser.name = newName;
+  if (draftAvatar !== null) {
+    currentUser.avatar = draftAvatar;
+    draftAvatar = null;
+  }
   try {
     var res = await fetch('/api/profile/update', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1278,7 +1319,6 @@ async function saveMyProfileChanges() {
     if (data.success) {
       currentUser = data.user;
       localStorage.setItem('messenger_user', JSON.stringify(currentUser));
-      pendingAvatarUpload = false;
       updateMyProfileUI();
       lastDialogsHash = '';
       await loadDialogs();
@@ -1293,37 +1333,51 @@ async function saveMyProfileChanges() {
 function openPeerProfile() {
   if (!activePeer) return;
   if (activePeer.type === 'group') { openGroupProfile(); return; }
+  profileTargetId = activePeer.id;
   if (isModalOpen('peer-profile-modal')) return;
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
   document.getElementById('peer-profile-name-view').innerText = activePeer.name;
   document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
+  updatePeerProfileButtons(activePeer);
+  safeOpenModal('peer-profile-modal');
+}
+function updatePeerProfileButtons(user) {
   var blockBtn = document.getElementById('block-peer-btn');
-  var isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(activePeer.id) !== -1;
+  var isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(user.id) !== -1;
   blockBtn.innerText = isBlocked ? 'Разблокировать' : 'Заблокировать';
   blockBtn.className = isBlocked ? 'btn btn-secondary' : 'btn btn-danger';
   var muteBtn = document.getElementById('mute-peer-btn');
-  var isMuted = mutedPeers.indexOf(activePeer.id) !== -1;
+  var isMuted = mutedPeers.indexOf(user.id) !== -1;
   muteBtn.innerText = isMuted ? 'Включить звуковой сигнал' : 'Выключить звуковой сигнал';
   muteBtn.className = isMuted ? 'btn' : 'btn btn-secondary';
+}
+function openMemberProfile(member) {
+  profileTargetId = member.id;
+  if (isModalOpen('peer-profile-modal')) return;
+  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, member.isOnline);
+  document.getElementById('peer-profile-name-view').innerText = member.name;
+  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + member.id;
+  updatePeerProfileButtons(member);
   safeOpenModal('peer-profile-modal');
 }
 function closePeerProfile() { safeCloseModal('peer-profile-modal'); }
 function toggleMutePeer() {
-  if (!activePeer) return;
-  var index = mutedPeers.indexOf(activePeer.id);
-  if (index > -1) { mutedPeers.splice(index, 1); } else { mutedPeers.push(activePeer.id); }
+  if (!profileTargetId) return;
+  var index = mutedPeers.indexOf(profileTargetId);
+  if (index > -1) { mutedPeers.splice(index, 1); } else { mutedPeers.push(profileTargetId); }
   localStorage.setItem('messenger_muted_peers', JSON.stringify(mutedPeers));
-  openPeerProfile();
+  var user = { id: profileTargetId };
+  updatePeerProfileButtons(user);
 }
 async function toggleBlockPeer() {
-  if (!activePeer) return;
+  if (!profileTargetId) return;
   if (!lockButton('block-peer-btn', 2000)) return;
-  var isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(activePeer.id) !== -1;
+  var isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(profileTargetId) !== -1;
   var nextBlock = !isBlocked;
   try {
     var res = await fetch('/api/users/block', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id, block: nextBlock })
+      body: JSON.stringify({ userId: currentUser.id, peerId: profileTargetId, block: nextBlock })
     });
     var data = await res.json();
     if (data.success) {
@@ -2054,26 +2108,120 @@ async function openGroupProfile() {
   var isOwner = g.ownerId === currentUser.id;
   var ownerControls = document.getElementById('group-owner-controls');
   ownerControls.style.display = isOwner ? 'block' : 'none';
+  document.getElementById('delete-group-btn').style.display = isOwner ? 'block' : 'none';
   if (isOwner) { document.getElementById('edit-group-name').value = g.name; editGroupDraftAvatar = ''; }
   renderMembersList('group-members-list', g.memberDetails || [], g.ownerId);
   safeOpenModal('group-profile-modal');
 }
-function closeGroupProfile() { safeCloseModal('group-profile-modal'); }
+function closeGroupProfile() { safeCloseModal('group-profile-modal'); closeMemberDropdown(); }
 function renderMembersList(containerId, memberDetails, ownerId) {
   var c = document.getElementById(containerId); c.innerHTML = '';
+  var amIOwner = ownerId === currentUser.id;
   memberDetails.forEach(function (u) {
     var row = document.createElement('div'); row.className = 'member-row';
     var isOwner = u.id === ownerId;
     var isMe = u.id === currentUser.id;
-    row.innerHTML =
+
+    var info = document.createElement('div');
+    info.style.cssText = 'display:flex; align-items:center; gap:10px; flex:1; overflow:hidden;';
+    info.innerHTML =
       '<div class="avatar-circle" style="width:32px;height:32px;font-size:13px;"></div>' +
       '<div style="flex:1; text-align:left; overflow:hidden;">' +
         '<div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(u.name) + (isMe ? ' (вы)' : '') + '</div>' +
         (isOwner ? '<div style="font-size:11px; color:var(--accent);">создатель</div>' : '') +
       '</div>';
+    info.onclick = function (e) {
+      e.stopPropagation();
+      if (isMe) { closeGroupProfile(); openMyProfile(); }
+      else { openMemberProfile(u); }
+    };
+    row.appendChild(info);
+    renderAvatarIntoElement(info.querySelector('.avatar-circle'), u, u.isOnline);
+
+    if (amIOwner && !isMe && !isOwner) {
+      var dotsBtn = document.createElement('button');
+      dotsBtn.className = 'member-menu-btn';
+      dotsBtn.innerText = '⋮';
+      dotsBtn.onclick = function (e) {
+        e.stopPropagation();
+        if (activeMemberDropdown && activeMemberDropdown.dataset.memberId === u.id) {
+          closeMemberDropdown();
+        } else {
+          openMemberDropdown(row, u);
+        }
+      };
+      row.appendChild(dotsBtn);
+    }
+
     c.appendChild(row);
-    renderAvatarIntoElement(row.querySelector('.avatar-circle'), u, false);
   });
+}
+function openMemberDropdown(rowEl, member) {
+  closeMemberDropdown();
+  var dd = document.createElement('div');
+  dd.className = 'member-dropdown active';
+  dd.dataset.memberId = member.id;
+  dd.innerHTML =
+    '<button class="menu-item" data-action="profile">Открыть профиль</button>' +
+    '<button class="menu-item danger" data-action="kick">Выгнать из группы</button>';
+  dd.addEventListener('click', function (e) {
+    e.stopPropagation();
+    var action = e.target.getAttribute('data-action');
+    if (action === 'profile') { closeMemberDropdown(); openMemberProfile(member); }
+    else if (action === 'kick') { closeMemberDropdown(); kickMember(member); }
+  });
+  rowEl.appendChild(dd);
+  activeMemberDropdown = dd;
+  setTimeout(function () {
+    document.addEventListener('click', outsideMemberDropdownHandler, { once: true });
+  }, 0);
+}
+function outsideMemberDropdownHandler(e) {
+  if (activeMemberDropdown && !activeMemberDropdown.contains(e.target)) {
+    closeMemberDropdown();
+  }
+}
+function closeMemberDropdown() {
+  if (activeMemberDropdown && activeMemberDropdown.parentNode) {
+    activeMemberDropdown.parentNode.removeChild(activeMemberDropdown);
+  }
+  activeMemberDropdown = null;
+}
+async function kickMember(member) {
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (!confirm('Выгнать ' + member.name + ' из группы «' + activePeer.name + '»?')) return;
+  try {
+    var res = await fetch('/api/groups/kick', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id, memberId: member.id })
+    });
+    var data = await res.json();
+    if (data.success) {
+      await refreshGroupInfo();
+      renderMembersList('group-members-list', activePeer.memberDetails || [], activePeer.ownerId);
+      document.getElementById('group-profile-count').innerText = (activePeer.members ? activePeer.members.length : 0) + ' участников';
+      lastDialogsHash = '';
+      loadDialogsQuiet();
+    } else { alert(data.error || 'Не удалось выгнать участника'); }
+  } catch (e) { alert('Ошибка при выгоне участника'); }
+}
+async function deleteGroup() {
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (!confirm('Удалить группу «' + activePeer.name + '»? Это действие нельзя отменить.')) return;
+  if (!lockButton('delete-group-btn', 3000)) return;
+  try {
+    var res = await fetch('/api/groups/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id })
+    });
+    var data = await res.json();
+    if (data.success) {
+      closeGroupProfile();
+      resetActiveChat();
+      lastDialogsHash = '';
+      loadDialogs();
+    } else { alert(data.error || 'Не удалось удалить группу'); }
+  } catch (e) { alert('Ошибка при удалении группы'); }
 }
 function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
 function handleEditGroupAvatarSelect(e) {
