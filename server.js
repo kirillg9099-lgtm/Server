@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
+app.use('/api/upload/chunk', express.raw({ type: 'application/octet-stream', limit: '5mb' }));
 
 process.on('uncaughtException', function (err) { console.error('[ОШИБКА СЕРВЕРА]:', err); });
 process.on('unhandledRejection', function (reason) { console.error('[ОШИБКА ПРОМИСА]:', reason); });
@@ -16,14 +17,20 @@ const ARXIV_DIR = path.join(SERV_DIR, 'arxiv');
 const ACCOUNTS_DIR = path.join(ARXIV_DIR, 'accounts');
 const MESSAGES_DIR = path.join(ARXIV_DIR, 'messages');
 const GROUPS_DIR = path.join(ARXIV_DIR, 'groups');
+const FILES_DIR = path.join(ARXIV_DIR, 'files');
 
-[ARXIV_DIR, ACCOUNTS_DIR, MESSAGES_DIR, GROUPS_DIR].forEach(function (dir) {
+[ARXIV_DIR, ACCOUNTS_DIR, MESSAGES_DIR, GROUPS_DIR, FILES_DIR].forEach(function (dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
 const ACCOUNTS_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
 const MESSAGES_FILE = path.join(MESSAGES_DIR, 'messages.json');
 const GROUPS_FILE = path.join(GROUPS_DIR, 'groups.json');
+
+const CHUNK_SIZE_LIMIT = 1024 * 1024;
+const MAX_FILE_SIZE = 200 * 1024 * 1024;
+
+const uploads = new Map();
 
 function safeReadJSON(filePath, fallback) {
   if (fallback === undefined) fallback = [];
@@ -504,6 +511,195 @@ app.get('/api/dialogs/:userId', function (req, res) {
   res.json(all);
 });
 
+/* ==================== ЧАНКОВАННАЯ ЗАГРУЗКА ФАЙЛОВ ==================== */
+
+app.post('/api/upload/init', function (req, res) {
+  const fileName = req.body.fileName, fileSize = req.body.fileSize, fileType = req.body.fileType;
+  const senderId = req.body.senderId, receiverId = req.body.receiverId, groupId = req.body.groupId, clientId = req.body.clientId;
+  
+  if (!fileName || !fileSize || !senderId) {
+    return res.status(400).json({ error: 'Недостаточно данных' });
+  }
+  if (fileSize > MAX_FILE_SIZE) {
+    return res.status(413).json({ error: 'Файл слишком большой (макс. 200 МБ)' });
+  }
+  
+  const fileId = 'file_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE_LIMIT);
+  
+  uploads.set(fileId, {
+    fileId: fileId,
+    fileName: fileName,
+    fileSize: fileSize,
+    fileType: fileType,
+    senderId: senderId,
+    receiverId: receiverId || '',
+    groupId: groupId || '',
+    clientId: clientId || '',
+    totalChunks: totalChunks,
+    receivedChunks: 0,
+    startedAt: Date.now(),
+    chunks: []
+  });
+  
+  res.json({ success: true, fileId: fileId, totalChunks: totalChunks, chunkSize: CHUNK_SIZE_LIMIT });
+});
+
+app.post('/api/upload/chunk', function (req, res) {
+  const fileId = req.query.fileId;
+  const chunkIndex = parseInt(req.query.chunkIndex, 10);
+  
+  if (!fileId || isNaN(chunkIndex)) {
+    return res.status(400).json({ error: 'fileId и chunkIndex обязательны' });
+  }
+  
+  const upload = uploads.get(fileId);
+  if (!upload) return res.status(404).json({ error: 'Загрузка не найдена или истекла' });
+  if (chunkIndex < 0 || chunkIndex >= upload.totalChunks) {
+    return res.status(400).json({ error: 'Неверный индекс чанка' });
+  }
+  
+  upload.chunks[chunkIndex] = Buffer.from(req.body);
+  upload.receivedChunks = upload.chunks.filter(function (c) { return c; }).length;
+  
+  res.json({ success: true, received: upload.receivedChunks, total: upload.totalChunks });
+});
+
+app.post('/api/upload/finish', function (req, res) {
+  const fileId = req.body.fileId;
+  const text = req.body.text || '';
+  const upload = uploads.get(fileId);
+  if (!upload) return res.status(404).json({ error: 'Загрузка не найдена' });
+  
+  for (let i = 0; i < upload.totalChunks; i++) {
+    if (!upload.chunks[i]) {
+      return res.status(400).json({ error: 'Не все чанки получены (отсутствует ' + i + ')' });
+    }
+  }
+  
+  const fullBuffer = Buffer.concat(upload.chunks);
+  const safeFileName = upload.fileId + '_' + upload.fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const filePath = path.join(FILES_DIR, safeFileName);
+  
+  try {
+    fs.writeFileSync(filePath, fullBuffer);
+  } catch (e) {
+    uploads.delete(fileId);
+    return res.status(500).json({ error: 'Не удалось сохранить файл' });
+  }
+  
+  const accounts = readAccounts();
+  const messages = readMessages();
+  const sender = accounts.find(function (u) { return u.id === upload.senderId; });
+  
+  if (upload.groupId) {
+    const groups = readGroups();
+    const g = groups.find(function (x) { return x.id === upload.groupId; });
+    if (!g || g.members.indexOf(upload.senderId) === -1) {
+      uploads.delete(fileId);
+      try { fs.unlinkSync(filePath); } catch (e) {}
+      return res.status(403).json({ error: 'Вы не участник группы' });
+    }
+  } else {
+    if (sender) {
+      if (!sender.contacts) sender.contacts = [];
+      if (sender.contacts.indexOf(upload.receiverId) === -1) sender.contacts.push(upload.receiverId);
+    }
+    const receiver = accounts.find(function (u) { return u.id === upload.receiverId; });
+    if (receiver) {
+      if (!receiver.contacts) receiver.contacts = [];
+      if (receiver.contacts.indexOf(upload.senderId) === -1) receiver.contacts.push(upload.senderId);
+    }
+    writeAccounts(accounts);
+  }
+  
+  const newMsg = {
+    id: genId('msg_'), clientId: upload.clientId || '',
+    senderId: upload.senderId,
+    receiverId: upload.groupId ? '' : upload.receiverId,
+    groupId: upload.groupId || '',
+    text: encryptText(text),
+    fileData: '',
+    fileUrl: '/files/' + safeFileName,
+    fileName: upload.fileName,
+    fileType: upload.fileType,
+    fileSize: upload.fileSize,
+    timestamp: timeStr(),
+    ts: Date.now(),
+    isRead: false, readBy: [], isDeleted: false,
+    clearedFor: []
+  };
+  
+  messages.push(newMsg);
+  writeMessages(messages);
+  uploads.delete(fileId);
+  
+  const copyMsg = Object.assign({}, newMsg);
+  copyMsg.text = text;
+  res.json({ success: true, message: copyMsg });
+});
+
+app.get('/files/:fileName', function (req, res) {
+  const fileName = req.params.fileName;
+  if (fileName.indexOf('..') !== -1 || fileName.indexOf('/') !== -1 || fileName.indexOf('\\') !== -1) {
+    return res.status(400).send('Invalid file name');
+  }
+  const filePath = path.join(FILES_DIR, fileName);
+  if (!fs.existsSync(filePath)) return res.status(404).send('File not found');
+  
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+  
+  const ext = path.extname(fileName).toLowerCase();
+  const mimeMap = {
+    '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg',
+    '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.gif': 'image/gif', '.webp': 'image/webp',
+    '.pdf': 'application/pdf', '.txt': 'text/plain'
+  };
+  const contentType = mimeMap[ext] || 'application/octet-stream';
+  
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    
+    if (start >= fileSize) {
+      res.status(416).set('Content-Range', 'bytes */' + fileSize).end();
+      return;
+    }
+    
+    const chunkSize = (end - start) + 1;
+    const file = fs.createReadStream(filePath, { start: start, end: end });
+    
+    res.writeHead(206, {
+      'Content-Range': 'bytes ' + start + '-' + end + '/' + fileSize,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type': contentType
+    });
+    file.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': contentType,
+      'Accept-Ranges': 'bytes'
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
+setInterval(function () {
+  const now = Date.now();
+  uploads.forEach(function (upload, fileId) {
+    if (now - upload.startedAt > 60 * 60 * 1000) {
+      uploads.delete(fileId);
+    }
+  });
+}, 10 * 60 * 1000);
+
 /* ==================== HTML КЛИЕНТ ==================== */
 const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
@@ -628,6 +824,10 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .member-dropdown .menu-item { padding: 10px 14px; font-size: 13px; text-align: left; width: 100%; background: none; border: none; color: var(--text-main); cursor: pointer; display: block; }
   .member-dropdown .menu-item:hover { background: var(--bg-active); }
   .member-dropdown .menu-item.danger { color: #e53935; }
+  .upload-progress-container { flex: 1; display: flex; align-items: center; gap: 10px; }
+  .upload-progress-track { flex: 1; background: var(--bg-input); border-radius: 10px; overflow: hidden; height: 8px; }
+  .upload-progress-bar { height: 100%; background: var(--accent); width: 0%; transition: width 0.15s; }
+  .upload-progress-text { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
   #image-viewer-modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: opacity 0.15s, visibility 0.15s; pointer-events: none; }
   #image-viewer-modal.active { visibility: visible; opacity: 1; pointer-events: auto; }
   #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; object-fit: contain; }
@@ -870,6 +1070,10 @@ var dialogsPollingTimer = null;
 var draftAvatar = null;
 var activeMemberDropdown = null;
 var profileTargetId = null;
+var isUploading = false;
+
+var CHUNK_SIZE = 500 * 1024;
+var MAX_FILE_SIZE = 200 * 1024 * 1024;
 
 /* ---------- ЗАЩИТА КНОПОК ---------- */
 function lockButton(id, ms) {
@@ -910,6 +1114,12 @@ function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
     return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
   });
+}
+function formatBytes(bytes) {
+  if (!bytes || bytes < 1024) return (bytes || 0) + ' Б';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' КБ';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' МБ';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' ГБ';
 }
 function saveCache() { try { localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache)); } catch (e) {} }
 function saveKnownUsers() { try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {} }
@@ -1184,7 +1394,7 @@ function startApp() {
   loadDialogs();
   if (dialogsPollingTimer) clearInterval(dialogsPollingTimer);
   dialogsPollingTimer = setInterval(function () {
-    if (currentUser && !isRecording) {
+    if (currentUser && !isRecording && !isUploading) {
       sendPing();
       loadDialogsQuiet();
       if (activePeer) {
@@ -1663,11 +1873,11 @@ function renderMessagesContainer(messages) {
     div.setAttribute('data-msg-id', m.id);
     div.setAttribute('data-sender-id', m.senderId);
     div.oncontextmenu = function (e) {
-      if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
+      if (e.target.tagName === 'AUDIO' || e.target.tagName === 'VIDEO' || (e.target.closest && (e.target.closest('audio') || e.target.closest('video')))) return;
       e.preventDefault(); openMsgActions(m, div);
     };
     div.ontouchstart = function (e) {
-      if (e.target.tagName === 'AUDIO' || (e.target.closest && e.target.closest('audio'))) return;
+      if (e.target.tagName === 'AUDIO' || e.target.tagName === 'VIDEO' || (e.target.closest && (e.target.closest('audio') || e.target.closest('video')))) return;
       longTouchTimer = setTimeout(function () { openMsgActions(m, div); }, 500);
     };
     div.ontouchend = function () { clearTimeout(longTouchTimer); };
@@ -1678,7 +1888,19 @@ function renderMessagesContainer(messages) {
     }
     if (m.text) html += '<div>' + escapeHtml(m.text) + '</div>';
     var fileType = m.fileType || '';
-    if (m.fileData) {
+    
+    if (m.fileUrl) {
+      // Файл с сервера (видео/большие файлы, загруженные чанками)
+      if (fileType.indexOf('image/') === 0) {
+        html += '<img src="' + m.fileUrl + '" class="media-preview" data-full="1">';
+      } else if (fileType.indexOf('video/') === 0) {
+        html += '<video src="' + m.fileUrl + '" controls class="video-preview" preload="metadata"></video>';
+      } else if (fileType.indexOf('audio/') === 0) {
+        html += '<audio src="' + m.fileUrl + '" controls class="audio-preview" preload="metadata"></audio>';
+      } else {
+        html += '<a class="file-link" href="' + m.fileUrl + '" download="' + escapeHtml(m.fileName || 'file') + '" target="_blank">📁 ' + escapeHtml(m.fileName || 'Файл') + (m.fileSize ? ' (' + formatBytes(m.fileSize) + ')' : '') + '</a>';
+      }
+    } else if (m.fileData) {
       if (fileType.indexOf('image/') === 0) {
         html += '<img src="' + m.fileData + '" class="media-preview" data-full="1">';
       } else if (fileType.indexOf('video/') === 0) {
@@ -1690,6 +1912,7 @@ function renderMessagesContainer(messages) {
         html += '<a class="file-link" data-download="1">📁 ' + escapeHtml(m.fileName || 'Файл') + '</a>';
       }
     }
+    
     var ticksHtml = '';
     if (m.senderId === currentUser.id) {
       var read = isGroupMsgRead(m);
@@ -1700,7 +1923,7 @@ function renderMessagesContainer(messages) {
     html += '<div class="msg-footer"><span>' + escapeHtml(m.timestamp || '') + '</span>' + ticksHtml + '</div>';
     div.innerHTML = html;
     var imgEl = div.querySelector('img[data-full]');
-    if (imgEl) imgEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(m.fileData); });
+    if (imgEl) imgEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(m.fileUrl || m.fileData); });
     var dl = div.querySelector('a[data-download]');
     if (dl) dl.addEventListener('click', function (e) { e.stopPropagation(); downloadData(m.fileData, m.fileName); });
     var slot = div.querySelector('.audio-slot');
@@ -1755,8 +1978,8 @@ function openMsgActions(msg, element) {
   selectedMsgId = msg.id; selectedMsgObj = msg;
   document.querySelectorAll('.msg').forEach(function (el) { el.classList.remove('selected-msg'); });
   element.classList.add('selected-msg');
-  document.getElementById('action-btn-copy').style.display = (msg.text && !msg.fileData) ? 'block' : 'none';
-  document.getElementById('action-btn-download').style.display = msg.fileData ? 'block' : 'none';
+  document.getElementById('action-btn-copy').style.display = (msg.text && !msg.fileData && !msg.fileUrl) ? 'block' : 'none';
+  document.getElementById('action-btn-download').style.display = (msg.fileData || msg.fileUrl) ? 'block' : 'none';
   document.getElementById('msg-actions-sheet').classList.add('active');
 }
 function closeMsgActions() {
@@ -1772,7 +1995,14 @@ function actionCopyText() {
 function actionDownloadFile() {
   var obj = selectedMsgObj;
   closeMsgActions();
-  if (obj && obj.fileData) downloadData(obj.fileData, obj.fileName);
+  if (obj && obj.fileUrl) {
+    var a = document.createElement('a');
+    a.href = obj.fileUrl;
+    a.download = obj.fileName || 'download';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  } else if (obj && obj.fileData) {
+    downloadData(obj.fileData, obj.fileName);
+  }
 }
 async function deleteSelectedMessage() {
   var id = selectedMsgId;
@@ -1787,12 +2017,52 @@ async function deleteSelectedMessage() {
 }
 
 /* ---------- ВЛОЖЕНИЯ ---------- */
-function triggerFileInput() { document.getElementById('file-input').click(); }
+function triggerFileInput() { 
+  if (isUploading) return;
+  document.getElementById('file-input').click(); 
+}
 function handleFileSelect(e) {
-  var file = e.target.files[0]; if (!file) return;
+  var file = e.target.files[0]; 
+  if (!file) return;
+  
+  if (file.size > MAX_FILE_SIZE) {
+    alert('Файл слишком большой. Максимум 200 МБ.');
+    e.target.value = '';
+    return;
+  }
+  
+  // Для больших файлов (> 1 МБ) — используем чанки, не читаем в base64
+  if (file.size > 1024 * 1024) {
+    selectedFile = {
+      file: file,
+      name: file.name,
+      type: file.type,
+      data: null,
+      isLarge: true
+    };
+    var thumbImg = document.getElementById('attachment-thumb-img');
+    document.getElementById('attachment-name-label').innerText = file.name;
+    var typeLabel = document.getElementById('attachment-type-label');
+    typeLabel.innerText = formatBytes(file.size) + ' • ' + 
+      (file.type.indexOf('video/') === 0 ? 'Видео' : 
+       file.type.indexOf('audio/') === 0 ? 'Аудио' : 
+       file.type.indexOf('image/') === 0 ? 'Изображение' : 'Файл');
+    
+    if (file.type.indexOf('image/') === 0) {
+      var r = new FileReader();
+      r.onload = function (ev) { thumbImg.src = ev.target.result; thumbImg.style.display = 'block'; };
+      r.readAsDataURL(file);
+    } else {
+      thumbImg.src = ''; thumbImg.style.display = 'none';
+    }
+    document.getElementById('attachment-preview-container').classList.add('active');
+    return;
+  }
+  
+  // Маленький файл — base64
   var reader = new FileReader();
   reader.onload = function (evt) {
-    selectedFile = { data: evt.target.result, name: file.name, type: file.type };
+    selectedFile = { data: evt.target.result, name: file.name, type: file.type, file: file, isLarge: false };
     var thumbImg = document.getElementById('attachment-thumb-img');
     document.getElementById('attachment-name-label').innerText = file.name;
     var typeLabel = document.getElementById('attachment-type-label');
@@ -1807,6 +2077,7 @@ function handleFileSelect(e) {
   reader.readAsDataURL(file);
 }
 function cancelAttachment() {
+  if (isUploading) return;
   selectedFile = null;
   document.getElementById('file-input').value = '';
   document.getElementById('attachment-preview-container').classList.remove('active');
@@ -1934,11 +2205,129 @@ async function toggleVoiceRecord() {
   }
 }
 
+/* ---------- ЧАНКОВАННАЯ ЗАГРУЗКА ФАЙЛОВ ---------- */
+async function uploadFileInChunks(file, onProgress) {
+  var initRes = await fetch('/api/upload/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fileName: file.name,
+      fileSize: file.size,
+      fileType: file.type,
+      senderId: currentUser.id,
+      receiverId: activePeer && activePeer.type !== 'group' ? activePeer.id : '',
+      groupId: activePeer && activePeer.type === 'group' ? activePeer.id : '',
+      clientId: 'up_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8)
+    })
+  });
+  
+  if (!initRes.ok) {
+    var err = await initRes.json().catch(function () { return {}; });
+    throw new Error(err.error || 'Ошибка инициализации загрузки');
+  }
+  
+  var initData = await initRes.json();
+  var fileId = initData.fileId;
+  var totalChunks = initData.totalChunks;
+  
+  for (var i = 0; i < totalChunks; i++) {
+    var start = i * CHUNK_SIZE;
+    var end = Math.min(start + CHUNK_SIZE, file.size);
+    var chunk = file.slice(start, end);
+    
+    var chunkRes = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: chunk
+    });
+    
+    if (!chunkRes.ok) {
+      throw new Error('Ошибка загрузки чанка ' + (i + 1) + '/' + totalChunks);
+    }
+    
+    if (onProgress) {
+      onProgress(i + 1, totalChunks);
+    }
+  }
+  
+  var finishRes = await fetch('/api/upload/finish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ 
+      fileId: fileId, 
+      text: document.getElementById('msg-input').value.trim() 
+    })
+  });
+  
+  if (!finishRes.ok) {
+    var ferr = await finishRes.json().catch(function () { return {}; });
+    throw new Error(ferr.error || 'Ошибка завершения загрузки');
+  }
+  
+  return await finishRes.json();
+}
+
+async function sendLargeFile(file, text) {
+  if (!activePeer) return;
+  if (file.size > MAX_FILE_SIZE) {
+    alert('Файл слишком большой (макс. 200 МБ)');
+    return;
+  }
+  
+  isUploading = true;
+  var inputBar = document.getElementById('input-bar');
+  var originalHTML = inputBar.innerHTML;
+  
+  inputBar.innerHTML =
+    '<div class="upload-progress-container">' +
+      '<div class="upload-progress-track">' +
+        '<div class="upload-progress-bar" id="upload-progress-bar"></div>' +
+      '</div>' +
+      '<span class="upload-progress-text" id="upload-progress-text">0%</span>' +
+    '</div>';
+  
+  var onProgress = function (done, total) {
+    var percent = Math.round((done / total) * 100);
+    var bar = document.getElementById('upload-progress-bar');
+    var txt = document.getElementById('upload-progress-text');
+    if (bar) bar.style.width = percent + '%';
+    if (txt) txt.innerText = percent + '% • ' + formatBytes(Math.min(done * CHUNK_SIZE, file.size)) + ' / ' + formatBytes(file.size);
+  };
+  
+  try {
+    var result = await uploadFileInChunks(file, onProgress);
+    
+    inputBar.innerHTML = originalHTML;
+    document.getElementById('msg-input').value = '';
+    document.getElementById('file-input').value = '';
+    selectedFile = null;
+    document.getElementById('attachment-preview-container').classList.remove('active');
+    
+    if (result.message) {
+      var rm = Object.assign({}, result.message); rm.isPending = false;
+      mergeMessage(rm);
+      saveCache();
+      renderMessagesContainer(getChatMessages(activePeer));
+      loadDialogsQuiet();
+    }
+  } catch (e) {
+    inputBar.innerHTML = originalHTML;
+    alert('Ошибка загрузки: ' + e.message);
+  } finally {
+    isUploading = false;
+  }
+}
+
 /* ---------- ОТПРАВКА ---------- */
 async function sendMessagePayload(payload) {
   var text = payload.text || '';
   var file = payload.file || null;
   if (!activePeer) return;
+  
+  if (file && file.isLarge && file.file) {
+    return sendLargeFile(file.file, text);
+  }
+  
   var isGroup = activePeer.type === 'group';
   var clientId = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
   var optimisticMsg = {
@@ -2004,6 +2393,7 @@ async function sendMessagePayload(payload) {
 }
 async function sendMsg() {
   if (!activePeer) return;
+  if (isUploading) return;
   if (!lockButton('send-btn', 1200)) return;
   var input = document.getElementById('msg-input');
   var text = input.value.trim();
