@@ -536,6 +536,69 @@ app.get('*', (req, res) => {
     .input-bar input[type="text"] { flex: 1; padding: 12px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; }
     .icon-btn { cursor: pointer; font-size: 22px; user-select: none; border: none; background: transparent; color: var(--text-main); }
 
+    /* ==== Кнопка записи (интерфейс из первого кода) ==== */
+    #mic-btn {
+      cursor: pointer;
+      font-size: 20px;
+      user-select: none;
+      border: none;
+      background: transparent;
+      color: var(--text-main);
+      padding: 6px 10px;
+      border-radius: 50%;
+      transition: all 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 40px;
+    }
+    #mic-btn:hover { background: var(--bg-input); }
+    #mic-btn.recording {
+      background-color: #27ae60;
+      color: #fff;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+
+    /* Панель таймера — НАД полем ввода, не сдвигает его */
+    .record-panel {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      background: var(--bg-sidebar);
+      border-top: 1px solid var(--border);
+      padding: 8px 10px;
+    }
+    .record-panel.active { display: flex; }
+    #record-timer {
+      font-size: 15px;
+      font-weight: bold;
+      color: #e53935;
+      font-family: monospace;
+      min-width: 48px;
+      text-align: center;
+    }
+    #stop-record-btn {
+      background-color: #f39c12;
+      color: #fff;
+      border: none;
+      border-radius: 50%;
+      width: 34px;
+      height: 34px;
+      cursor: pointer;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      transition: background 0.2s;
+    }
+    #stop-record-btn:hover { background-color: #e67e22; }
+
     .empty-state { margin: auto; text-align: center; color: var(--text-muted); font-size: 14px; }
 
     .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: none; align-items: center; justify-content: center; }
@@ -556,11 +619,6 @@ app.get('*', (req, res) => {
 
     .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: none; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); }
     .msg-actions-sheet.active { display: flex; }
-
-    .recording-indicator { display: none; align-items: center; gap: 6px; font-size: 12px; color: #e53935; margin-left: 6px; }
-    .recording-indicator.active { display: inline-flex; }
-    .recording-dot { width: 8px; height: 8px; border-radius: 50%; background: #e53935; animation: recpulse 1s infinite; }
-    @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 
     @media (min-width: 601px) {
       .menu-dots-btn { display: flex !important; }
@@ -643,14 +701,16 @@ app.get('*', (req, res) => {
           <span class="attachment-cancel" onclick="cancelAttachment()" title="Отменить">✕</span>
         </div>
 
+        <!-- Панель таймера — НАД полем ввода, не сдвигает его -->
+        <div class="record-panel" id="record-panel">
+          <span id="record-timer">00:00</span>
+          <button id="stop-record-btn" onclick="stopVoiceRecordAndSend()" title="Остановить и отправить">⏹</button>
+        </div>
+
         <div class="input-bar" id="input-bar" style="display:none;">
           <button class="icon-btn" onclick="triggerFileInput()">📎</button>
           <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
-          <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
-          <div class="recording-indicator" id="recording-indicator">
-            <span class="recording-dot"></span>
-            <span id="recording-timer">0:00</span>
-          </div>
+          <button id="mic-btn" onclick="startVoiceRecord()" title="Записать голосовое">🎙️</button>
           <input type="text" id="msg-input" placeholder="Напишите сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" style="width:auto; padding:10px 18px; border-radius:20px;" onclick="sendMsg()">➤</button>
         </div>
@@ -717,12 +777,14 @@ app.get('*', (req, res) => {
     let isRecording = false;
     let activeStream = null;
     let recordStartedAt = 0;
-    let recordingTimerInterval = null;
 
     let recordAudioCtx = null;
     let recordSourceNode = null;
     let recordProcessor = null;
     let recordSilentGain = null;
+
+    let recordTimerInterval = null;
+    let recordSeconds = 0;
 
     let lastDialogsHash = '';
     let lastMessagesHash = '';
@@ -1575,9 +1637,7 @@ app.get('*', (req, res) => {
       document.getElementById('attachment-preview-container').classList.remove('active');
     }
 
-    // ==================== ЗАПИСЬ ГОЛОСА (WAV, чистый звук) ====================
-    // MediaRecorder на Android даёт треск из-за чанков. Поэтому пишем
-    // сырые PCM-сэмплы через Web Audio API и кодируем в WAV.
+    // ==================== ЗАПИСЬ ГОЛОСА (WAV) ====================
 
     function floatTo16BitPCM(output, offset, input) {
       for (let i = 0; i < input.length; i++, offset += 2) {
@@ -1624,161 +1684,176 @@ app.get('*', (req, res) => {
       recordAudioCtx = null;
     }
 
-    function startRecordingTimer() {
-      recordStartedAt = Date.now();
-      const indicator = document.getElementById('recording-indicator');
-      const timerEl = document.getElementById('recording-timer');
-      indicator.classList.add('active');
-      if (recordingTimerInterval) clearInterval(recordingTimerInterval);
-      recordingTimerInterval = setInterval(() => {
-        const s = Math.floor((Date.now() - recordStartedAt) / 1000);
-        const mm = Math.floor(s / 60);
-        const ss = (s % 60).toString().padStart(2, '0');
-        timerEl.innerText = mm + ':' + ss;
-      }, 200);
+    function formatTime(sec) {
+      const m = String(Math.floor(sec / 60)).padStart(2, '0');
+      const s = String(sec % 60).padStart(2, '0');
+      return m + ':' + s;
     }
 
-    function stopRecordingTimer() {
-      const indicator = document.getElementById('recording-indicator');
-      indicator.classList.remove('active');
-      if (recordingTimerInterval) {
-        clearInterval(recordingTimerInterval);
-        recordingTimerInterval = null;
-      }
-    }
-
-    async function toggleVoiceRecord() {
+    function showRecordingUI(show) {
       const micBtn = document.getElementById('mic-btn');
-
-      // ---- СТОП ----
-      if (isRecording) {
-        isRecording = false;
+      const panel = document.getElementById('record-panel');
+      if (show) {
+        micBtn.classList.add('recording');
+        micBtn.innerText = '⏺';
+        micBtn.title = 'Идёт запись...';
+        panel.classList.add('active');
+      } else {
+        micBtn.classList.remove('recording');
         micBtn.innerText = '🎙️';
-        stopRecordingTimer();
-
-        const chunks = audioChunks.slice();
-        const durationMs = Date.now() - recordStartedAt;
-        const capturedRate = recordAudioCtx ? recordAudioCtx.sampleRate : 48000;
-
-        cleanupRecordingNodes();
-        try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e) {}
-        activeStream = null;
-
-        if (chunks.length === 0) {
-          alert('Запись получилась пустой. Попробуйте ещё раз.');
-          return;
-        }
-
-        // Склеиваем PCM
-        let totalLen = 0;
-        for (const c of chunks) totalLen += c.length;
-        const merged = new Float32Array(totalLen);
-        let off = 0;
-        for (const c of chunks) { merged.set(c, off); off += c.length; }
-
-        // Понижаем частоту до 16 кГц — голос звучит нормально, размер меньше
-        const targetRate = 16000;
-        let finalSamples = merged;
-        let finalRate = capturedRate;
-        if (capturedRate > targetRate) {
-          const ratio = capturedRate / targetRate;
-          const newLen = Math.floor(merged.length / ratio);
-          const down = new Float32Array(newLen);
-          for (let i = 0; i < newLen; i++) {
-            down[i] = merged[Math.floor(i * ratio)] || 0;
-          }
-          finalSamples = down;
-          finalRate = targetRate;
-        }
-
-        const wavBlob = encodeWAV(finalSamples, finalRate);
-        const reader = new FileReader();
-        reader.onload = function(evt) {
-          selectedFile = {
-            data: evt.target.result,
-            name: 'voice_' + Date.now() + '.wav',
-            type: 'audio/wav'
-          };
-          const previewContainer = document.getElementById('attachment-preview-container');
-          document.getElementById('attachment-thumb-img').style.display = 'none';
-          document.getElementById('attachment-name-label').innerText = 'Голосовое сообщение (' +
-            Math.max(1, Math.round(durationMs / 1000)) + 'с)';
-          document.getElementById('attachment-type-label').innerText = 'Аудио (нажмите ➤ чтобы отправить)';
-          previewContainer.classList.add('active');
-        };
-        reader.readAsDataURL(wavBlob);
-        return;
+        micBtn.title = 'Записать голосовое';
+        panel.classList.remove('active');
       }
+    }
 
-      // ---- СТАРТ ----
+    function startRecordTimer() {
+      recordSeconds = 0;
+      document.getElementById('record-timer').textContent = '00:00';
+      if (recordTimerInterval) clearInterval(recordTimerInterval);
+      recordTimerInterval = setInterval(() => {
+        recordSeconds++;
+        document.getElementById('record-timer').textContent = formatTime(recordSeconds);
+      }, 1000);
+    }
+
+    function stopRecordTimer() {
+      if (recordTimerInterval) {
+        clearInterval(recordTimerInterval);
+        recordTimerInterval = null;
+      }
+    }
+
+    async function startVoiceRecord() {
+      if (isRecording) return;
+      if (!activePeer) { alert('Сначала выберите чат.'); return; }
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         alert('Ваш браузер не поддерживает запись с микрофона.');
         return;
       }
-
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            channelCount: 1
-          },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
           video: false
         });
         activeStream = stream;
-
         const AC = window.AudioContext || window.webkitAudioContext;
         const ctx = new AC();
         recordAudioCtx = ctx;
-        if (ctx.state === 'suspended') {
-          try { await ctx.resume(); } catch(e) {}
-        }
-
+        if (ctx.state === 'suspended') { try { await ctx.resume(); } catch(e) {} }
         const source = ctx.createMediaStreamSource(stream);
         recordSourceNode = source;
-
-        // ScriptProcessor — работает на всех устройствах, включая Android.
-        // Буфер 4096 = ~85мс при 48кГц, без пропусков.
         const processor = ctx.createScriptProcessor(4096, 1, 1);
         recordProcessor = processor;
-
         audioChunks = [];
-
         processor.onaudioprocess = (e) => {
           if (!isRecording) return;
           const input = e.inputBuffer.getChannelData(0);
-          // Копируем — иначе буфер перезапишется
           audioChunks.push(new Float32Array(input));
         };
-
-        // На Android ScriptProcessor не работает, пока не подключён к destination.
-        // Silent gain даёт цепочку, но в динамик ничего не идёт.
         const silentGain = ctx.createGain();
         silentGain.gain.value = 0;
         recordSilentGain = silentGain;
-
         source.connect(processor);
         processor.connect(silentGain);
         silentGain.connect(ctx.destination);
 
         isRecording = true;
-        micBtn.innerText = '🔴';
-        startRecordingTimer();
-
+        recordStartedAt = Date.now();
+        showRecordingUI(true);
+        startRecordTimer();
       } catch (err) {
         console.error('getUserMedia error', err);
         let msg = 'Нет доступа к микрофону.';
-        if (err && err.name === 'NotAllowedError') msg = 'Вы отклонили доступ к микрофону. Разрешите в настройках браузера.';
-        else if (err && err.name === 'NotFoundError') msg = 'Микрофон не найден на устройстве.';
+        if (err && err.name === 'NotAllowedError') msg = 'Вы отклонили доступ к микрофону.';
+        else if (err && err.name === 'NotFoundError') msg = 'Микрофон не найден.';
         else if (err && err.name === 'NotReadableError') msg = 'Микрофон занят другим приложением.';
         alert(msg);
         cleanupRecordingNodes();
         try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e) {}
         activeStream = null;
         isRecording = false;
-        micBtn.innerText = '🎙️';
-        stopRecordingTimer();
+        showRecordingUI(false);
+        stopRecordTimer();
+      }
+    }
+
+    function stopVoiceRecordAndSend() {
+      if (!isRecording) return;
+      isRecording = false;
+      showRecordingUI(false);
+      stopRecordTimer();
+
+      const chunks = audioChunks.slice();
+      const durationMs = Date.now() - recordStartedAt;
+      const capturedRate = recordAudioCtx ? recordAudioCtx.sampleRate : 48000;
+
+      cleanupRecordingNodes();
+      try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e) {}
+      activeStream = null;
+
+      if (chunks.length === 0) { alert('Запись получилась пустой.'); return; }
+
+      let totalLen = 0;
+      for (const c of chunks) totalLen += c.length;
+      const merged = new Float32Array(totalLen);
+      let off = 0;
+      for (const c of chunks) { merged.set(c, off); off += c.length; }
+
+      const targetRate = 16000;
+      let finalSamples = merged;
+      let finalRate = capturedRate;
+      if (capturedRate > targetRate) {
+        const ratio = capturedRate / targetRate;
+        const newLen = Math.floor(merged.length / ratio);
+        const down = new Float32Array(newLen);
+        for (let i = 0; i < newLen; i++) down[i] = merged[Math.floor(i * ratio)] || 0;
+        finalSamples = down;
+        finalRate = targetRate;
+      }
+
+      const wavBlob = encodeWAV(finalSamples, finalRate);
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+        const fileToSend = {
+          data: evt.target.result,
+          name: 'voice_' + Date.now() + '.wav',
+          type: 'audio/wav'
+        };
+        sendAudioFile(fileToSend);
+      };
+      reader.readAsDataURL(wavBlob);
+    }
+
+    async function sendAudioFile(fileToSend) {
+      if (!activePeer) return;
+      const body = {
+        senderId: currentUser.id,
+        receiverId: activePeer.id,
+        text: '',
+        fileData: fileToSend.data,
+        fileName: fileToSend.name,
+        fileType: fileToSend.type
+      };
+      try {
+        const res = await fetch('/api/messages/send', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body)
+        });
+        if (res.status === 403) {
+          alert('Сообщение не доставлено: чат заблокирован.');
+        } else if (res.ok) {
+          const data = await res.json();
+          if (data.message) {
+            localMessagesCache.push(data.message);
+            localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
+          }
+        }
+        lastMessagesHash = '';
+        loadMessages();
+        loadDialogs();
+      } catch(e) {
+        alert('Не удалось отправить голосовое сообщение.');
       }
     }
 
