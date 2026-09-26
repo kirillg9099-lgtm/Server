@@ -195,12 +195,20 @@ app.post('/api/groups/create', function (req, res) {
   if (!userId) return res.status(400).json({ error: 'Нет пользователя' });
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите название группы' });
 
+  if (!Array.isArray(members) || members.length === 0) {
+    return res.status(400).json({ error: 'Выберите хотя бы одного участника' });
+  }
+
   const accounts = readAccounts();
   const creator = accounts.find(function (u) { return u.id === userId; });
   const contactsSet = new Set(creator && creator.contacts ? creator.contacts : []);
-  const validMembers = (Array.isArray(members) ? members : []).filter(function (mId) { return mId !== userId && contactsSet.has(mId); });
-  const memberSet = new Set([userId].concat(validMembers));
+  const validMembers = members.filter(function (mId) { return mId !== userId && contactsSet.has(mId); });
 
+  if (validMembers.length === 0) {
+    return res.status(400).json({ error: 'Выбранные пользователи недоступны' });
+  }
+
+  const memberSet = new Set([userId].concat(validMembers));
   const groups = readGroups();
   const group = {
     id: genId('grp_'), name: name.trim(), avatar: avatar || '',
@@ -249,6 +257,9 @@ app.post('/api/groups/update', function (req, res) {
 
 app.post('/api/groups/add', function (req, res) {
   const groupId = req.body.groupId, userId = req.body.userId, members = req.body.members;
+  if (!Array.isArray(members) || members.length === 0) {
+    return res.status(400).json({ error: 'Выберите хотя бы одного участника' });
+  }
   const groups = readGroups();
   const g = groups.find(function (x) { return x.id === groupId; });
   if (!g) return res.status(404).json({ error: 'Группа не найдена' });
@@ -258,9 +269,16 @@ app.post('/api/groups/add', function (req, res) {
   const owner = accounts.find(function (u) { return u.id === userId; });
   const contactsSet = new Set(owner && owner.contacts ? owner.contacts : []);
 
-  (Array.isArray(members) ? members : []).forEach(function (mId) {
-    if (contactsSet.has(mId) && g.members.indexOf(mId) === -1) g.members.push(mId);
+  var added = 0;
+  members.forEach(function (mId) {
+    if (contactsSet.has(mId) && g.members.indexOf(mId) === -1) {
+      g.members.push(mId);
+      added++;
+    }
   });
+  if (added === 0) {
+    return res.status(400).json({ error: 'Никто не был добавлен (уже в группе или нет в контактах)' });
+  }
   writeGroups(groups);
   res.json({ success: true, group: groupWithDetails(g) });
 });
@@ -598,7 +616,9 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
   .profile-link-btn { background: none; border: none; color: var(--accent); font-size: 14px; font-weight: 500; cursor: pointer; padding: 5px; text-align: center; }
   .profile-link-btn:hover { text-decoration: underline; }
-  .check-row { display: flex; align-items: center; gap: 10px; padding: 8px; cursor: pointer; border-bottom: 1px solid var(--border); }
+  .check-row { display: flex; align-items: center; gap: 10px; padding: 8px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background 0.15s; border-radius: 8px; }
+  .check-row:hover { background: var(--bg-hover); }
+  .check-row input[type="checkbox"] { accent-color: var(--accent); flex-shrink: 0; }
   .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; cursor: pointer; border-radius: 8px; position: relative; transition: background 0.15s; }
   .member-row:hover { background: var(--bg-hover); }
   .member-menu-btn { background: transparent; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer; padding: 4px 8px; border-radius: 50%; flex-shrink: 0; line-height: 1; }
@@ -883,11 +903,6 @@ function safeOpenModal(id) {
 function safeCloseModal(id) {
   var el = document.getElementById(id);
   if (el) el.classList.remove('active');
-}
-function closeAllModals(except) {
-  document.querySelectorAll('.modal-overlay').forEach(function (ov) {
-    if (!except || ov.id !== except) ov.classList.remove('active');
-  });
 }
 
 /* ---------- УТИЛИТЫ ---------- */
@@ -2008,21 +2023,26 @@ async function sendMsg() {
 
 /* ---------- ГРУППЫ ---------- */
 async function getContactUsers() {
+  var arr = [];
+  for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
+    var u = localKnownUsers[k];
+    if (u.id && u.id !== currentUser.id) {
+      arr.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
+    }
+  }
   try {
     var res = await fetch('/api/dialogs/' + currentUser.id);
     var list = await res.json();
-    return list.filter(function (d) { return d.type !== 'group'; });
+    var serverUsers = list.filter(function (d) { return d.type !== 'group' && d.id !== currentUser.id; });
+    serverUsers.forEach(function (u) { cacheUser(u); });
+    return serverUsers;
   } catch (e) {
-    var arr = [];
-    for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
-      var u = localKnownUsers[k];
-      arr.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
-    }
     return arr;
   }
 }
 function renderCheckList(containerId, users, excludeSet) {
-  var c = document.getElementById(containerId); c.innerHTML = '';
+  var c = document.getElementById(containerId);
+  c.innerHTML = '';
   var list = users.filter(function (u) { return !excludeSet.has(u.id); });
   if (list.length === 0) {
     c.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px;">Нет доступных контактов. Сначала начните с кем-нибудь чат.</div>';
@@ -2031,8 +2051,14 @@ function renderCheckList(containerId, users, excludeSet) {
   list.forEach(function (u) {
     var row = document.createElement('label');
     row.className = 'check-row';
-    row.innerHTML = '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;"><span>' + escapeHtml(u.name) + '</span>';
+    row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:8px; cursor:pointer; border-bottom:1px solid var(--border); border-radius:8px;';
+    var avatarId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    row.innerHTML =
+      '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;flex-shrink:0;">' +
+      '<div class="avatar-circle" id="' + avatarId + '" style="width:32px;height:32px;font-size:13px;"></div>' +
+      '<span style="flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">' + escapeHtml(u.name) + '</span>';
     c.appendChild(row);
+    renderAvatarIntoElement(document.getElementById(avatarId), u, false);
   });
 }
 function getChecked(containerId) {
@@ -2043,20 +2069,34 @@ function openCreateGroup() {
   groupDraftAvatar = '';
   document.getElementById('create-group-name').value = '';
   fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥');
-  document.getElementById('create-group-contacts').innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px;">Загрузка контактов…</div>';
+
+  var cached = [];
+  for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
+    var u = localKnownUsers[k];
+    if (u.id && u.id !== currentUser.id) {
+      cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
+    }
+  }
+  renderCheckList('create-group-contacts', cached, new Set());
+
   safeOpenModal('create-group-modal');
+
   getContactUsers().then(function (contacts) {
-    renderCheckList('create-group-contacts', contacts, new Set());
-  }).catch(function () {
-    renderCheckList('create-group-contacts', [], new Set());
-  });
+    if (contacts.length !== cached.length) {
+      renderCheckList('create-group-contacts', contacts, new Set());
+    }
+  }).catch(function () {});
 }
 function closeCreateGroup() { safeCloseModal('create-group-modal'); }
 function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
 function handleGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
+  if (file.size > 10 * 1024 * 1024) {
+    alert('Файл слишком большой. Максимум 10 МБ.');
+    return;
+  }
   compressImage(file, 200, 0.85, function (compressed) {
-    if (!compressed) return;
+    if (!compressed) { alert('Не удалось обработать изображение.'); return; }
     groupDraftAvatar = compressed;
     fillAvatarBox(document.getElementById('create-group-avatar'), groupDraftAvatar, '👥');
   });
@@ -2064,8 +2104,12 @@ function handleGroupAvatarSelect(e) {
 async function submitCreateGroup() {
   var name = document.getElementById('create-group-name').value.trim();
   if (!name) { alert('Введите название группы'); return; }
-  if (!lockButton('create-group-submit-btn', 5000)) return;
   var members = getChecked('create-group-contacts');
+  if (members.length === 0) {
+    alert('Выберите хотя бы одного участника для группы');
+    return;
+  }
+  if (!lockButton('create-group-submit-btn', 5000)) return;
   try {
     var res = await fetch('/api/groups/create', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2102,6 +2146,7 @@ async function openGroupProfile() {
   if (isModalOpen('group-profile-modal')) return;
   await refreshGroupInfo();
   var g = activePeer;
+  editGroupDraftAvatar = '';
   fillAvatarBox(document.getElementById('group-profile-avatar'), g.avatar, '👥');
   document.getElementById('group-profile-name').innerText = g.name;
   document.getElementById('group-profile-count').innerText = (g.members ? g.members.length : 0) + ' участников';
@@ -2109,11 +2154,15 @@ async function openGroupProfile() {
   var ownerControls = document.getElementById('group-owner-controls');
   ownerControls.style.display = isOwner ? 'block' : 'none';
   document.getElementById('delete-group-btn').style.display = isOwner ? 'block' : 'none';
-  if (isOwner) { document.getElementById('edit-group-name').value = g.name; editGroupDraftAvatar = ''; }
+  if (isOwner) { document.getElementById('edit-group-name').value = g.name; }
   renderMembersList('group-members-list', g.memberDetails || [], g.ownerId);
   safeOpenModal('group-profile-modal');
 }
-function closeGroupProfile() { safeCloseModal('group-profile-modal'); closeMemberDropdown(); }
+function closeGroupProfile() {
+  editGroupDraftAvatar = '';
+  safeCloseModal('group-profile-modal');
+  closeMemberDropdown();
+}
 function renderMembersList(containerId, memberDetails, ownerId) {
   var c = document.getElementById(containerId); c.innerHTML = '';
   var amIOwner = ownerId === currentUser.id;
@@ -2226,16 +2275,21 @@ async function deleteGroup() {
 function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
 function handleEditGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
+  if (file.size > 10 * 1024 * 1024) {
+    alert('Файл слишком большой. Максимум 10 МБ.');
+    return;
+  }
   compressImage(file, 200, 0.85, function (compressed) {
-    if (!compressed) return;
+    if (!compressed) { alert('Не удалось обработать изображение.'); return; }
     editGroupDraftAvatar = compressed;
-    fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥');
+    fillAvatarBox(document.getElementById('group-profile-avatar'), compressed, '👥');
   });
 }
 async function saveGroupChanges() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!lockButton('save-group-btn', 3000)) return;
   var name = document.getElementById('edit-group-name').value.trim();
+  if (!name) { alert('Введите название группы'); return; }
   var body = { groupId: activePeer.id, userId: currentUser.id, name: name };
   if (editGroupDraftAvatar) body.avatar = editGroupDraftAvatar;
   try {
@@ -2255,25 +2309,46 @@ async function saveGroupChanges() {
 async function openAddMembers() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (isModalOpen('add-members-modal')) return;
-  document.getElementById('add-members-contacts').innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px;">Загрузка…</div>';
-  safeOpenModal('add-members-modal');
-  var contacts = await getContactUsers();
+
   var exclude = new Set(activePeer.members || []);
-  renderCheckList('add-members-contacts', contacts, exclude);
+
+  var cached = [];
+  for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
+    var u = localKnownUsers[k];
+    if (u.id && u.id !== currentUser.id && !exclude.has(u.id)) {
+      cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
+    }
+  }
+  renderCheckList('add-members-contacts', cached, exclude);
+
+  safeOpenModal('add-members-modal');
+
+  getContactUsers().then(function (contacts) {
+    renderCheckList('add-members-contacts', contacts, exclude);
+  }).catch(function () {});
 }
 function closeAddMembers() { safeCloseModal('add-members-modal'); }
 async function submitAddMembers() {
-  if (!lockButton('add-members-submit-btn', 3000)) return;
   var members = getChecked('add-members-contacts');
-  if (members.length === 0) { closeAddMembers(); return; }
+  if (members.length === 0) {
+    alert('Выберите хотя бы одного участника');
+    return;
+  }
+  if (!lockButton('add-members-submit-btn', 3000)) return;
   try {
     var res = await fetch('/api/groups/add', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id, members: members })
     });
     var data = await res.json();
-    if (data.success) { closeAddMembers(); await refreshGroupInfo(); openGroupProfile(); }
-    else { alert(data.error || 'Не удалось добавить'); }
+    if (data.success) {
+      closeAddMembers();
+      await refreshGroupInfo();
+      renderMembersList('group-members-list', activePeer.memberDetails || [], activePeer.ownerId);
+      document.getElementById('group-profile-count').innerText = (activePeer.members ? activePeer.members.length : 0) + ' участников';
+      lastDialogsHash = '';
+      loadDialogsQuiet();
+    } else { alert(data.error || 'Не удалось добавить'); }
   } catch (e) { alert('Ошибка добавления участников'); }
 }
 async function leaveGroup() {
