@@ -7,12 +7,9 @@ const PORT = process.env.PORT || 3000;
 
 /* ============================================================
    ВЕРСИЯ КОДА
-   При несовместимых изменениях — увеличивайте MIN_CLIENT_VERSION.
-   Клиент с меньшей версией localStorage будет мигрирован.
-   Клиент с меньшей версией в коде — получит сообщение об обновлении.
    ============================================================ */
-const SERVER_VERSION = '2.0.0';
-const MIN_CLIENT_VERSION = '2.0.0';   // минимальная совместимая версия клиента
+const SERVER_VERSION = '2.1.0';
+const MIN_CLIENT_VERSION = '1.0.0';
 const API_VERSION = 'v2';
 
 app.use(express.json({ limit: '200mb' }));
@@ -42,15 +39,10 @@ const CHUNK_SIZE_LIMIT = 1024 * 1024;
 const MAX_FILE_SIZE = 200 * 1024 * 1024;
 const uploads = new Map();
 
-/* ==================== СЛУЖЕБНАЯ МЕТА СЕРВЕРА ==================== */
-function readServerMeta() {
-  return safeReadJSON(META_FILE, { version: SERVER_VERSION, firstStart: Date.now() });
-}
-function writeServerMeta(m) {
-  safeWriteJSON(META_FILE, m);
-}
+/* ==================== МЕТА ==================== */
+function readServerMeta() { return safeReadJSON(META_FILE, { version: SERVER_VERSION, firstStart: Date.now() }); }
+function writeServerMeta(m) { safeWriteJSON(META_FILE, m); }
 
-/* ==================== ФАЙЛОВЫЕ ОПЕРАЦИИ ==================== */
 function safeReadJSON(filePath, fallback) {
   if (fallback === undefined) fallback = [];
   try {
@@ -75,24 +67,14 @@ function writeMessages(d) { safeWriteJSON(MESSAGES_FILE, d); }
 function readGroups() { return safeReadJSON(GROUPS_FILE, []); }
 function writeGroups(d) { safeWriteJSON(GROUPS_FILE, d); }
 
-/* ==================== МИГРАЦИИ ДАННЫХ ==================== */
-// При старте сервера — миграция, если нужно.
 (function runServerMigrations() {
   const meta = readServerMeta();
   const fromVersion = meta.version || '1.0.0';
-  
   if (fromVersion === SERVER_VERSION) {
     console.log('[MIGRATIONS] Уже на версии ' + SERVER_VERSION);
     return;
   }
-  
   console.log('[MIGRATIONS] Обновление с ' + fromVersion + ' на ' + SERVER_VERSION);
-  
-  // ВСЕ МИГРАЦИИ ЗДЕСЬ.
-  // Например, если в 2.1.0 добавили поле "pin" в аккаунты:
-  // if (compareVersions(fromVersion, '2.1.0') < 0) { ... }
-  
-  // Пока миграций с изменением структуры нет — просто фиксируем версию.
   meta.version = SERVER_VERSION;
   meta.lastMigration = Date.now();
   meta.firstStart = meta.firstStart || Date.now();
@@ -112,7 +94,6 @@ function compareVersions(a, b) {
   return 0;
 }
 
-/* ==================== УТИЛИТЫ ==================== */
 function encryptText(text) {
   if (!text) return '';
   try { return Buffer.from(String(text), 'utf8').toString('base64'); }
@@ -129,7 +110,7 @@ function decryptText(text) {
 function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
 
-/* ==================== HEALTH С ВЕРСИЕЙ ==================== */
+/* ==================== HEALTH ==================== */
 app.get('/api/health', function (req, res) {
   res.json({
     ok: true,
@@ -161,8 +142,7 @@ app.post('/api/register', function (req, res) {
       id: finalId, name: name.trim(), avatar: avatar || '',
       contacts: Array.isArray(contacts) ? contacts : [],
       blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now(),
-      createdAt: Date.now(),
-      schemaVersion: SERVER_VERSION
+      createdAt: Date.now(), schemaVersion: SERVER_VERSION
     };
     accounts.push(user);
   }
@@ -639,7 +619,7 @@ app.get('/files/:name', function (req, res) {
   const range = req.headers.range;
   const ext = path.extname(name).toLowerCase();
   const mime = {
-    '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg',
+    '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime',
     '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
     '.gif': 'image/gif', '.webp': 'image/webp',
@@ -664,8 +644,6 @@ app.get('/files/:name', function (req, res) {
 });
 
 /* ==================== HTML ==================== */
-// (Стили и HTML — оставляю как в предыдущей версии, они не изменились.
-//  Единственное добавление: элемент для показа "устаревшая версия", см. JS.)
 const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
@@ -710,7 +688,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .loading-text { color: var(--text-muted); font-size: 15px; text-align: center; padding: 0 20px; }
   .loading-title { font-size: 20px; font-weight: bold; color: var(--text-main); text-align: center; }
   
-  .version-info { position: fixed; bottom: 8px; right: 10px; font-size: 10px; color: var(--text-muted); z-index: 9998; opacity: 0.6; }
+  .version-info { position: fixed; bottom: 8px; right: 10px; font-size: 10px; color: var(--text-muted); z-index: 9998; opacity: 0.6; pointer-events: none; }
   
   #app-container { display: flex; width: 100%; height: 100%; }
   .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
@@ -817,13 +795,11 @@ const CLIENT_HTML = `<!DOCTYPE html>
 <body>
   <div id="status-bar"></div>
   <div class="version-info" id="version-info"></div>
-  
   <div id="loading-screen">
     <div class="loading-title" id="loading-title">Соединение...</div>
     <div class="spinner"></div>
     <div class="loading-text" id="loading-text">Подключаемся к серверу</div>
   </div>
-  
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход в мессенджер</h2>
@@ -834,7 +810,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
       <button class="btn" id="login-btn" onclick="registerUser()">Войти</button>
     </div>
   </div>
-  
   <div id="app-screen" class="screen">
     <div id="app-container">
       <div class="sidebar">
@@ -1016,12 +991,8 @@ const CLIENT_HTML = `<!DOCTYPE html>
 const CLIENT_JS = `
 /* ============================================================
    ВЕРСИЯ КЛИЕНТА
-   При обновлении кода — увеличьте CLIENT_VERSION здесь и
-   в SERVER_VERSION выше. Если у пользователя в localStorage
-   сохранена меньшая версия — будет вызвана миграция.
    ============================================================ */
-var CLIENT_VERSION = '2.0.0';
-var MIN_COMPATIBLE_VERSION = '1.0.0';   // ниже этой версии — считаем устаревшим
+var CLIENT_VERSION = '2.1.0';
 var SCHEMA_VERSION_KEY = 'messenger_schema_version';
 
 var currentUser = null;
@@ -1061,8 +1032,11 @@ var CHUNK_SIZE = 500 * 1024;
 var MAX_FILE_SIZE = 200 * 1024 * 1024;
 var serverVersion = 'unknown';
 var serverMinClientVersion = '0.0.0';
+var pingFailCount = 0;
+var healthFailCount = 0;
+var isRetrying = false;
 
-/* ==================== ВЕРСИИ И МИГРАЦИЯ ==================== */
+/* ==================== ВЕРСИИ ==================== */
 function compareVersions(a, b) {
   var aP = String(a || '0').split('.').map(function (n) { return parseInt(n, 10) || 0; });
   var bP = String(b || '0').split('.').map(function (n) { return parseInt(n, 10) || 0; });
@@ -1076,40 +1050,26 @@ function compareVersions(a, b) {
   return 0;
 }
 
-/* Миграция localStorage при обновлении версии.
-   Здесь можно безопасно менять структуру данных —
-   старые данные будут сконвертированы в новые. */
 function runClientMigrations() {
   var storedVersion = localStorage.getItem(SCHEMA_VERSION_KEY) || '1.0.0';
   var userVersion = CLIENT_VERSION;
-  
   console.log('[MIGRATION] schema=' + storedVersion + ' client=' + userVersion);
-  
   if (storedVersion === userVersion) {
     console.log('[MIGRATION] Уже на версии ' + userVersion);
     return;
   }
-  
-  // === ЗАГРУЖАЕМ СЫРЫЕ ДАННЫЕ ===
   var rawUser = null, rawKnown = {}, rawMsgs = [], rawMuted = [];
   try { rawUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) {}
   try { rawKnown = JSON.parse(localStorage.getItem('messenger_known_users') || '{}'); } catch (e) {}
   try { rawMsgs = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]'); } catch (e) {}
   try { rawMuted = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]'); } catch (e) {}
   
-  // === ЗДЕСЬ БУДУЩИЕ МИГРАЦИИ ===
-  // Пример: если в 2.1.0 добавили поле "pin" — здесь его инициализируем.
-  // if (compareVersions(storedVersion, '2.1.0') < 0) { ... }
-  
-  // Гарантируем наличие полей у профиля
   if (rawUser && typeof rawUser === 'object') {
     if (!Array.isArray(rawUser.contacts)) rawUser.contacts = [];
     if (!Array.isArray(rawUser.blockedContacts)) rawUser.blockedContacts = [];
     if (!Array.isArray(rawUser.hiddenDialogs)) rawUser.hiddenDialogs = [];
     if (!rawUser.name) rawUser.name = 'Пользователь';
   }
-  
-  // Гарантируем что каждый known user имеет структуру
   Object.keys(rawKnown).forEach(function (uid) {
     var u = rawKnown[uid];
     if (u && typeof u === 'object') {
@@ -1118,8 +1078,6 @@ function runClientMigrations() {
       if (u.avatar === undefined) u.avatar = '';
     }
   });
-  
-  // Гарантируем что каждое сообщение имеет нужные поля
   rawMsgs.forEach(function (m) {
     if (!m || typeof m !== 'object') return;
     if (!m.id) m.id = 'msg_migrated_' + Math.random().toString(36).substr(2, 9);
@@ -1138,16 +1096,14 @@ function runClientMigrations() {
     if (!m.senderId) m.senderId = '';
     if (m.receiverId === undefined) m.receiverId = '';
     if (m.groupId === undefined) m.groupId = '';
+    if (typeof m.isPending !== 'boolean') m.isPending = false;
   });
-  
-  // === СОХРАНЯЕМ ОБРАТНО ===
   try {
     if (rawUser) localStorage.setItem('messenger_user', JSON.stringify(rawUser));
     localStorage.setItem('messenger_known_users', JSON.stringify(rawKnown));
     localStorage.setItem('messenger_messages_cache', JSON.stringify(rawMsgs));
     localStorage.setItem('messenger_muted_peers', JSON.stringify(rawMuted));
-  } catch (e) { console.warn('Ошибка записи миграции:', e); }
-  
+  } catch (e) {}
   localStorage.setItem(SCHEMA_VERSION_KEY, userVersion);
   console.log('[MIGRATION] Готово → ' + userVersion);
 }
@@ -1251,7 +1207,6 @@ function updateLoadingScreen() {
     text.innerText = 'Проверяем соединение';
   }
 }
-
 async function checkServerHealth() {
   if (!navigator.onLine) {
     setConnectionState('no-internet');
@@ -1259,7 +1214,7 @@ async function checkServerHealth() {
   }
   try {
     var ctrl = new AbortController();
-    var tm = setTimeout(function () { ctrl.abort(); }, 5000);
+    var tm = setTimeout(function () { ctrl.abort(); }, 8000);
     var res = await fetch('/api/health?_=' + Date.now(), { signal: ctrl.signal });
     clearTimeout(tm);
     if (res.ok) {
@@ -1267,31 +1222,29 @@ async function checkServerHealth() {
       serverVersion = data.serverVersion || 'unknown';
       serverMinClientVersion = data.minClientVersion || '0.0.0';
       updateVersionInfo();
-      
-      // Проверка совместимости
       if (compareVersions(CLIENT_VERSION, serverMinClientVersion) < 0) {
         showUpdateRequired();
         return false;
       }
-      
+      healthFailCount = 0;
       setConnectionState('online');
       return true;
     }
-    setConnectionState('server-offline');
+    healthFailCount++;
+    if (healthFailCount >= 2) setConnectionState('server-offline');
     return false;
   } catch (e) {
+    healthFailCount++;
     if (!navigator.onLine) setConnectionState('no-internet');
-    else setConnectionState('server-offline');
+    else if (healthFailCount >= 2) setConnectionState('server-offline');
     return false;
   }
 }
-
 function updateVersionInfo() {
   var el = document.getElementById('version-info');
   if (!el) return;
   el.innerText = 'client v' + CLIENT_VERSION + ' · server v' + serverVersion;
 }
-
 function showUpdateRequired() {
   var ls = document.getElementById('loading-screen');
   var title = document.getElementById('loading-title');
@@ -1299,17 +1252,18 @@ function showUpdateRequired() {
   if (!ls) return;
   ls.classList.add('active');
   title.innerText = 'Требуется обновление';
-  text.innerText = 'Пожалуйста, обновите страницу (Ctrl+Shift+R или Cmd+Shift+R)';
-  // Прячем спиннер
+  text.innerText = 'Обновите страницу (Ctrl+Shift+R или Cmd+Shift+R)';
   var sp = ls.querySelector('.spinner');
   if (sp) sp.style.display = 'none';
 }
-
 window.addEventListener('online', async function () {
+  healthFailCount = 0;
+  pingFailCount = 0;
   var ok = await checkServerHealth();
   if (ok && currentUser) {
     loadDialogs();
     if (activePeer) loadMessages();
+    retryPendingMessages();
   }
 });
 window.addEventListener('offline', function () {
@@ -1506,10 +1460,10 @@ async function registerUser() {
   var errBox = document.getElementById('auth-error');
   if (!name) { errBox.innerText = 'Введите ваше имя.'; errBox.style.display = 'block'; return; }
   
-  if (connectionState !== 'online') {
-    errBox.innerText = connectionState === 'no-internet' ? 'Нет подключения к интернету' : 'Соединение...';
+  // Регистрация обязательна через сервер — не пытаемся без него
+  if (!navigator.onLine) {
+    errBox.innerText = 'Нет подключения к интернету';
     errBox.style.display = 'block';
-    checkServerHealth();
     return;
   }
   
@@ -1527,9 +1481,9 @@ async function registerUser() {
     localStorage.setItem(SCHEMA_VERSION_KEY, CLIENT_VERSION);
     startApp();
   } catch (e) {
-    errBox.innerText = 'Сервер недоступен';
+    errBox.innerText = 'Сервер недоступен. Проверьте соединение.';
     errBox.style.display = 'block';
-    setConnectionState(navigator.onLine ? 'server-offline' : 'no-internet');
+    setConnectionState('server-offline');
   }
 }
 
@@ -1542,8 +1496,9 @@ function startApp() {
   
   if (dialogsPollingTimer) clearInterval(dialogsPollingTimer);
   dialogsPollingTimer = setInterval(function () {
-    if (currentUser && !isRecording && !isUploading && connectionState === 'online') {
+    if (currentUser && !isRecording && !isUploading) {
       sendPing();
+      retryPendingMessages();
       loadDialogsQuiet();
       if (activePeer) {
         loadMessagesQuiet();
@@ -1560,6 +1515,7 @@ function startApp() {
     if (ok && !wasOnline) {
       loadDialogs();
       if (activePeer) loadMessages();
+      retryPendingMessages();
     }
   }, 4000);
 }
@@ -1578,6 +1534,11 @@ async function sendPing() {
       })
     });
     var data = await res.json();
+    
+    // УСПЕХ — восстанавливаем
+    pingFailCount = 0;
+    if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
+    
     if (data.success && data.user) {
       var serverUser = data.user;
       var changed = false;
@@ -1597,8 +1558,9 @@ async function sendPing() {
       }
     }
   } catch (e) {
+    pingFailCount++;
     if (!navigator.onLine) setConnectionState('no-internet');
-    else setConnectionState('server-offline');
+    else if (pingFailCount >= 3) setConnectionState('server-offline');
   }
 }
 
@@ -1619,6 +1581,64 @@ async function refreshActivePeerStatus() {
       if (avatarChanged) { lastDialogsHash = ''; loadDialogsQuiet(); }
     }
   } catch (e) {}
+}
+
+/* ==================== RETRY ОТЛОЖЕННЫХ СООБЩЕНИЙ ==================== */
+async function retryPendingMessages() {
+  if (!currentUser) return;
+  if (isRetrying) return;
+  var pending = localMessagesCache.filter(function (m) {
+    return m.isPending && m.senderId === currentUser.id && m.clientId;
+  });
+  if (pending.length === 0) return;
+  
+  isRetrying = true;
+  var anySuccess = false;
+  for (var i = 0; i < pending.length; i++) {
+    var pm = pending[i];
+    try {
+      var res = await fetch('/api/messages/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          senderId: pm.senderId,
+          receiverId: pm.receiverId || '',
+          groupId: pm.groupId || '',
+          text: pm.text || '',
+          fileData: pm.fileData || '',
+          fileName: pm.fileName || '',
+          fileType: pm.fileType || '',
+          clientId: pm.clientId,
+          fileUrl: pm.fileUrl || '',
+          fileSize: pm.fileSize || 0
+        })
+      });
+      if (res.ok) {
+        var data = await res.json();
+        if (data && data.message) {
+          var rm = Object.assign({}, data.message);
+          rm.isPending = false;
+          if (pm.fileUrl) rm.fileUrl = pm.fileUrl;
+          if (pm.fileSize) rm.fileSize = pm.fileSize;
+          for (var j = 0; j < localMessagesCache.length; j++) {
+            if (localMessagesCache[j].clientId === pm.clientId) {
+              localMessagesCache[j] = rm;
+              break;
+            }
+          }
+          anySuccess = true;
+        }
+      }
+    } catch (e) {
+      break;
+    }
+  }
+  if (anySuccess) {
+    saveCache();
+    if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
+    loadDialogsQuiet();
+    if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
+  }
+  isRetrying = false;
 }
 
 /* ==================== МОЙ ПРОФИЛЬ ==================== */
@@ -1651,10 +1671,6 @@ function removeMyAvatar() {
   document.getElementById('remove-avatar-link-btn').style.display = 'none';
 }
 async function saveMyProfileChanges() {
-  if (connectionState !== 'online') {
-    alert(connectionState === 'no-internet' ? 'Нет подключения к интернету' : 'Соединение...');
-    return;
-  }
   if (!lockButton('save-my-profile-btn', 3000)) return;
   var newName = document.getElementById('edit-my-name-input').value.trim();
   if (newName) currentUser.name = newName;
@@ -1673,7 +1689,9 @@ async function saveMyProfileChanges() {
       await loadDialogs();
       closeMyProfile();
     }
-  } catch (e) { alert('Не удалось обновить'); }
+  } catch (e) {
+    alert('Не удалось сохранить. Проверьте соединение.');
+  }
 }
 
 /* ==================== ПРОФИЛЬ СОБЕСЕДНИКА ==================== */
@@ -1817,7 +1835,6 @@ async function onSearchInput() {
   var clearBtn = document.getElementById('clear-search-btn');
   if (!q) { clearBtn.style.display = 'none'; lastDialogsHash = ''; loadDialogs(); return; }
   clearBtn.style.display = 'block';
-  
   var ql = q.toLowerCase();
   var localFound = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
@@ -1828,8 +1845,6 @@ async function onSearchInput() {
     }
   }
   renderChatList(localFound);
-  
-  if (connectionState !== 'online') return;
   try {
     var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
     var users = await res.json();
@@ -1940,7 +1955,7 @@ async function loadMessagesQuiet() {
     });
     saveCache();
     var peerMsgs = getChatMessages(activePeer);
-    var currentHash = JSON.stringify(peerMsgs.map(function (m) { return m.id + '_' + m.isRead + '_' + (m.readBy ? m.readBy.length : 0) + '_' + m.isDeleted; }));
+    var currentHash = JSON.stringify(peerMsgs.map(function (m) { return m.id + '_' + m.isRead + '_' + (m.readBy ? m.readBy.length : 0) + '_' + m.isDeleted + '_' + (m.fileUrl || ''); }));
     if (currentHash !== lastMessagesHash) {
       if (hasNewMsg && lastMessagesHash !== '' && mutedPeers.indexOf(activePeer.id) === -1) playNotificationSound();
       lastMessagesHash = currentHash;
@@ -1974,7 +1989,7 @@ function renderMessagesContainer(messages) {
   var isGroup = activePeer && activePeer.type === 'group';
   messages.forEach(function (m) {
     var div = document.createElement('div');
-    div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
+    div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '') + (m.isPending ? ' pending' : '');
     div.setAttribute('data-msg-id', m.id);
     div.setAttribute('data-sender-id', m.senderId);
     div.oncontextmenu = function (e) {
@@ -1994,21 +2009,23 @@ function renderMessagesContainer(messages) {
     if (m.text) html += '<div>' + escapeHtml(m.text) + '</div>';
     var fileType = m.fileType || '';
     
+    // ВИДЕО И ФАЙЛЫ С СЕРВЕРА (fileUrl) — предзагрузка metadata, чтобы сразу игралось
     if (m.fileUrl) {
       if (fileType.indexOf('image/') === 0) {
-        html += '<img src="' + m.fileUrl + '" class="media-preview" data-full="1">';
+        html += '<img src="' + m.fileUrl + '" class="media-preview" data-full="1" loading="lazy">';
       } else if (fileType.indexOf('video/') === 0) {
-        html += '<video src="' + m.fileUrl + '" controls class="video-preview" preload="metadata"></video>';
+        html += '<video src="' + m.fileUrl + '" controls class="video-preview" preload="auto" playsinline webkit-playsinline></video>';
       } else if (fileType.indexOf('audio/') === 0) {
-        html += '<audio src="' + m.fileUrl + '" controls class="audio-preview" preload="metadata"></audio>';
+        html += '<audio src="' + m.fileUrl + '" controls class="audio-preview" preload="auto"></audio>';
       } else {
         html += '<a class="file-link" href="' + m.fileUrl + '" download="' + escapeHtml(m.fileName || 'file') + '" target="_blank">📁 ' + escapeHtml(m.fileName || 'Файл') + (m.fileSize ? ' (' + formatBytes(m.fileSize) + ')' : '') + '</a>';
       }
     } else if (m.fileData) {
+      // Маленькие файлы в base64
       if (fileType.indexOf('image/') === 0) {
         html += '<img src="' + m.fileData + '" class="media-preview" data-full="1">';
       } else if (fileType.indexOf('video/') === 0) {
-        html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
+        html += '<video src="' + m.fileData + '" controls class="video-preview" playsinline webkit-playsinline></video>';
       } else if (fileType.indexOf('audio/') === 0) {
         html += '<audio src="' + m.fileData + '" controls class="audio-preview"></audio>';
       } else {
@@ -2025,8 +2042,27 @@ function renderMessagesContainer(messages) {
     }
     html += '<div class="msg-footer"><span>' + escapeHtml(m.timestamp || '') + '</span>' + ticksHtml + '</div>';
     div.innerHTML = html;
+    
+    // Клик по картинке
     var imgEl = div.querySelector('img[data-full]');
     if (imgEl) imgEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(m.fileUrl || m.fileData); });
+    
+    // Обработка видео и аудио — обработка ошибок
+    var videoEl = div.querySelector('video');
+    if (videoEl) {
+      videoEl.addEventListener('error', function (e) {
+        // Если видео не загружается — показать заглушку
+        if (!videoEl.parentNode) return;
+        var placeholder = document.createElement('div');
+        placeholder.className = 'file-placeholder';
+        placeholder.innerHTML = '⚠️ Видео недоступно. Попробуйте обновить страницу.';
+        videoEl.parentNode.replaceChild(placeholder, videoEl);
+      });
+      // Если это видео от собеседника и еще не загружено — покажем что грузится
+      videoEl.addEventListener('loadedmetadata', function () {
+        // Метаданные загружены — видео готово
+      });
+    }
     container.appendChild(div);
   });
   if (isScrolledToBottom) container.scrollTop = container.scrollHeight;
@@ -2264,20 +2300,11 @@ async function toggleVoiceRecord() {
   }
 }
 
-/* ==================== ОТПРАВКА ==================== */
+/* ==================== ОТПРАВКА (без блокировки) ==================== */
 async function sendMsg() {
   if (!activePeer) return;
   if (isUploading) return;
-  if (connectionState !== 'online') {
-    var bar = document.getElementById('status-bar');
-    if (bar) {
-      bar.innerText = connectionState === 'no-internet' ? '⚠ Нет подключения к интернету' : '⌛ Соединение...';
-      bar.className = 'visible ' + (connectionState === 'no-internet' ? 'internet-off' : 'server-off');
-      if (statusBarTimeout) clearTimeout(statusBarTimeout);
-      statusBarTimeout = setTimeout(function () { updateStatusBar(); }, 3000);
-    }
-    return;
-  }
+  // НИКАКИХ проверок connectionState — всегда пробуем
   if (!lockButton('send-btn', 1200)) return;
   var input = document.getElementById('msg-input');
   var text = input.value.trim();
@@ -2335,9 +2362,15 @@ async function sendMsg() {
         text: text
       });
     } catch (e) {
-      alert('Ошибка загрузки: ' + e.message);
+      // НЕ УДАЛЯЕМ сообщение — оставим с isPending для retry
+      // Но fileUrl нет, поэтому отправить не сможем — удаляем
+      var errMsg = e && e.message ? e.message : 'unknown';
       localMessagesCache = localMessagesCache.filter(function (m) { return m.clientId !== clientId; });
       saveCache();
+      renderMessagesContainer(getChatMessages(activePeer));
+      if (navigator.onLine) {
+        alert('Не удалось загрузить файл: ' + errMsg + '. Попробуйте ещё раз.');
+      }
     }
     inputBar.innerHTML = originalHTML;
     isUploading = false;
@@ -2372,7 +2405,7 @@ async function sendTextOrSmallFile(payload) {
       alert('Чат заблокирован');
       return;
     }
-    if (!res.ok) throw new Error('Server error');
+    if (!res.ok) throw new Error('Server error ' + res.status);
     var data = await res.json();
     if (data && data.message) {
       var rm = Object.assign({}, data.message); rm.isPending = false;
@@ -2380,9 +2413,12 @@ async function sendTextOrSmallFile(payload) {
       saveCache();
       renderMessagesContainer(getChatMessages(activePeer));
       loadDialogsQuiet();
+      if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
     }
   } catch (e) {
-    console.warn('Ошибка отправки');
+    // НЕ удаляем — оставляем isPending:true, retryPendingMessages подхватит
+    if (!navigator.onLine) setConnectionState('no-internet');
+    else setConnectionState('server-offline');
   }
 }
 
@@ -2404,7 +2440,7 @@ async function sendLargeFileMessage(payload) {
         fileSize: payload.fileSize
       })
     });
-    if (!res.ok) throw new Error('Server error');
+    if (!res.ok) throw new Error('Server error ' + res.status);
     var data = await res.json();
     if (data && data.message) {
       var rm = Object.assign({}, data.message);
@@ -2415,9 +2451,11 @@ async function sendLargeFileMessage(payload) {
       saveCache();
       renderMessagesContainer(getChatMessages(activePeer));
       loadDialogsQuiet();
+      if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
     }
   } catch (e) {
-    alert('Ошибка отправки сообщения');
+    if (!navigator.onLine) setConnectionState('no-internet');
+    else setConnectionState('server-offline');
   }
 }
 
@@ -2485,7 +2523,6 @@ function getChecked(containerId) {
   return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; });
 }
 async function openCreateGroup() {
-  if (connectionState !== 'online') { alert('Нет соединения'); return; }
   if (isModalOpen('create-group-modal')) return;
   groupDraftAvatar = '';
   document.getElementById('create-group-name').value = '';
@@ -2513,7 +2550,6 @@ function handleGroupAvatarSelect(e) {
   });
 }
 async function submitCreateGroup() {
-  if (connectionState !== 'online') { alert('Нет соединения'); return; }
   var name = document.getElementById('create-group-name').value.trim();
   if (!name) { alert('Введите название'); return; }
   var members = getChecked('create-group-contacts');
@@ -2532,7 +2568,7 @@ async function submitCreateGroup() {
       var g = data.group;
       openChat({ id: g.id, type: 'group', name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId, memberCount: g.members.length });
     } else { alert(data.error || 'Ошибка'); }
-  } catch (e) { alert('Ошибка'); }
+  } catch (e) { alert('Не удалось создать группу. Проверьте соединение.'); }
 }
 async function refreshGroupInfo() {
   if (!activePeer || activePeer.type !== 'group') return;
@@ -2758,26 +2794,14 @@ window.addEventListener('DOMContentLoaded', async function () {
     ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); });
   });
   
-  // Миграция localStorage ПЕРЕД загрузкой
   runClientMigrations();
   
-  // Загрузка данных
-  try {
-    currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null');
-  } catch (e) { currentUser = null; }
-  try {
-    localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}');
-  } catch (e) { localKnownUsers = {}; }
-  try {
-    localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]');
-  } catch (e) { localMessagesCache = []; }
-  try {
-    mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]');
-  } catch (e) { mutedPeers = []; }
+  try { currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) { currentUser = null; }
+  try { localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}'); } catch (e) { localKnownUsers = {}; }
+  try { localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]'); } catch (e) { localMessagesCache = []; }
+  try { mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]'); } catch (e) { mutedPeers = []; }
   
   updateVersionInfo();
-  
-  // Проверка соединения
   await checkServerHealth();
   
   if (!currentUser) {
