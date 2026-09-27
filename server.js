@@ -9,698 +9,347 @@ app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
 app.use('/api/upload/chunk', express.raw({ type: 'application/octet-stream', limit: '5mb' }));
 
-process.on('uncaughtException', function (err) { console.error('[ОШИБКА СЕРВЕРА]:', err); });
-process.on('unhandledRejection', function (reason) { console.error('[ОШИБКА ПРОМИСА]:', reason); });
+process.on('uncaughtException', function (err) { console.error('[СЕРВЕР]:', err); });
+process.on('unhandledRejection', function (r) { console.error('[ПРОМИС]:', r); });
 
 const SERV_DIR = __dirname;
 const ARXIV_DIR = path.join(SERV_DIR, 'arxiv');
-const ACCOUNTS_DIR = path.join(ARXIV_DIR, 'accounts');
-const MESSAGES_DIR = path.join(ARXIV_DIR, 'messages');
-const GROUPS_DIR = path.join(ARXIV_DIR, 'groups');
 const FILES_DIR = path.join(ARXIV_DIR, 'files');
+if (!fs.existsSync(ARXIV_DIR)) fs.mkdirSync(ARXIV_DIR, { recursive: true });
+if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR, { recursive: true });
 
-[ARXIV_DIR, ACCOUNTS_DIR, MESSAGES_DIR, GROUPS_DIR, FILES_DIR].forEach(function (dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
-
-const ACCOUNTS_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
-const MESSAGES_FILE = path.join(MESSAGES_DIR, 'messages.json');
-const GROUPS_FILE = path.join(GROUPS_DIR, 'groups.json');
+const TOMB_FILE = path.join(ARXIV_DIR, 'tombstones.json');
+const PROFILES_FILE = path.join(ARXIV_DIR, 'profiles.json');
 
 const CHUNK_SIZE_LIMIT = 1024 * 1024;
 const MAX_FILE_SIZE = 200 * 1024 * 1024;
 
+/* ==================== IN-MEMORY ==================== */
+const recentEvents = new Map();
+const RECENT_LIMIT = 10000;
+const tombstones = new Map();
+let tombstonesDirty = false;
+const onlineUsers = new Map();
+const ONLINE_TIMEOUT = 8000;
+const profilesCache = {};
+let profilesDirty = false;
+const fileIndex = new Map();
 const uploads = new Map();
 
-function safeReadJSON(filePath, fallback) {
-  if (fallback === undefined) fallback = [];
+/* ==================== DISK ==================== */
+function safeReadJSON(fp, fb) {
   try {
-    if (!fs.existsSync(filePath)) return fallback;
-    const raw = fs.readFileSync(filePath, 'utf8');
-    if (!raw || !raw.trim()) return fallback;
+    if (!fs.existsSync(fp)) return fb;
+    const raw = fs.readFileSync(fp, 'utf8');
+    if (!raw || !raw.trim()) return fb;
     return JSON.parse(raw);
-  } catch (e) { return fallback; }
+  } catch (e) { return fb; }
 }
-function safeWriteJSON(filePath, data) {
-  const tmpPath = filePath + '.tmp';
+function safeWriteJSON(fp, data) {
+  const tmp = fp + '.tmp';
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(data), 'utf8');
-    fs.renameSync(tmpPath, filePath);
-  } catch (e) { console.error('[ОШИБКА ЗАПИСИ ' + filePath + ']:', e); }
-}
-
-function readAccounts() { return safeReadJSON(ACCOUNTS_FILE, []); }
-function writeAccounts(d) { safeWriteJSON(ACCOUNTS_FILE, d); }
-function readMessages() { return safeReadJSON(MESSAGES_FILE, []); }
-function writeMessages(d) { safeWriteJSON(MESSAGES_FILE, d); }
-function readGroups() { return safeReadJSON(GROUPS_FILE, []); }
-function writeGroups(d) { safeWriteJSON(GROUPS_FILE, d); }
-
-function encryptText(text) {
-  if (!text) return '';
-  try { return Buffer.from(String(text), 'utf8').toString('base64'); }
-  catch (e) { return text; }
-}
-function decryptText(text) {
-  if (!text) return '';
-  try {
-    const decoded = Buffer.from(text, 'base64').toString('utf8');
-    if (decoded && decoded.indexOf('\uFFFD') === -1) return decoded;
+    fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+    fs.renameSync(tmp, fp);
   } catch (e) {}
-  return text;
 }
-function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
-function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
 
-/* ==================== АККАУНТЫ ==================== */
+(function () {
+  const arr = safeReadJSON(TOMB_FILE, []);
+  arr.forEach(t => { if (t && t.type && t.id) tombstones.set(t.type + ':' + t.id, t); });
+  console.log('[TOMBSTONES] loaded: ' + tombstones.size);
+})();
+(function () {
+  const obj = safeReadJSON(PROFILES_FILE, {});
+  Object.keys(obj).forEach(id => { profilesCache[id] = obj[id]; });
+  console.log('[PROFILES] loaded: ' + Object.keys(profilesCache).length);
+})();
 
+setInterval(function () {
+  if (tombstonesDirty) { tombstonesDirty = false; safeWriteJSON(TOMB_FILE, Array.from(tombstones.values())); }
+  if (profilesDirty) { profilesDirty = false; safeWriteJSON(PROFILES_FILE, profilesCache); }
+}, 3000);
+
+/* ==================== HELPERS ==================== */
+function markOnline(u) {
+  onlineUsers.set(u.id, { id: u.id, name: u.name || '', avatar: u.avatar || '', lastSeen: Date.now() });
+}
+setInterval(function () {
+  const now = Date.now();
+  onlineUsers.forEach((u, id) => { if (now - u.lastSeen > ONLINE_TIMEOUT) onlineUsers.delete(id); });
+}, 3000);
+
+function pushEvent(ev) {
+  const key = ev._key || (ev.type + ':' + (ev.id || Date.now()) + ':' + Math.random().toString(36).substr(2, 6));
+  ev._key = key;
+  ev._ts = Date.now();
+  recentEvents.set(key, ev);
+  if (recentEvents.size > RECENT_LIMIT) {
+    const firstKey = recentEvents.keys().next().value;
+    recentEvents.delete(firstKey);
+  }
+}
+
+/* ==================== API ==================== */
+
+// Проверка соединения клиента с сервером
+app.get('/api/health', function (req, res) {
+  res.json({ ok: true, serverTime: Date.now() });
+});
+
+// РЕГИСТРАЦИЯ — только через сервер. Если сервер жив, но не подтвердил — отказ
 app.post('/api/register', function (req, res) {
-  let id = req.body.id, name = req.body.name, avatar = req.body.avatar, contacts = req.body.contacts;
-  const accounts = readAccounts();
+  const { name } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите имя' });
-
-  let finalId = id;
-  if (!finalId || accounts.some(function (u) { return u.id === finalId && u.name !== name.trim(); })) {
-    finalId = 'id_' + Math.random().toString(36).substr(2, 9);
-  }
-  let user = accounts.find(function (u) { return u.id === finalId; });
-  if (user) {
-    user.name = name.trim();
-    if (avatar !== undefined) user.avatar = avatar;
-    user.updatedAt = Date.now();
-    if (Array.isArray(contacts)) user.contacts = Array.from(new Set([].concat(user.contacts || [], contacts)));
-  } else {
-    user = {
-      id: finalId, name: name.trim(), avatar: avatar || '',
-      contacts: Array.isArray(contacts) ? contacts : [],
-      blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now()
-    };
-    accounts.push(user);
-  }
-  writeAccounts(accounts);
-  res.json({ success: true, user: user });
+  
+  const id = 'id_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+  const profile = {
+    id: id,
+    name: name.trim(),
+    avatar: '',
+    updatedAt: Date.now()
+  };
+  
+  profilesCache[id] = profile;
+  profilesDirty = true;
+  markOnline(profile);
+  
+  res.json({ success: true, user: profile });
 });
 
 app.post('/api/ping', function (req, res) {
-  const id = req.body.id, name = req.body.name, avatar = req.body.avatar, contacts = req.body.contacts, knownUsers = req.body.knownUsers;
-  if (!id) return res.status(400).json({ error: 'No id provided' });
-  const accounts = readAccounts();
+  const { id, name, avatar } = req.body;
+  if (!id) return res.status(400).json({ error: 'No id' });
+  markOnline({ id, name, avatar });
+  if (name) {
+    if (!profilesCache[id] || profilesCache[id].name !== name || profilesCache[id].avatar !== avatar) {
+      profilesCache[id] = { id, name, avatar: avatar || '', updatedAt: Date.now() };
+      profilesDirty = true;
+    }
+  }
+  res.json({
+    success: true,
+    online: Array.from(onlineUsers.keys()),
+    tombstonesCount: tombstones.size,
+    eventsCount: recentEvents.size,
+    serverTime: Date.now()
+  });
+});
 
-  if (Array.isArray(knownUsers)) {
-    knownUsers.forEach(function (kUser) {
-      if (!kUser.id) return;
-      if (!accounts.some(function (a) { return a.id === kUser.id; })) {
-        accounts.push({
-          id: kUser.id, name: kUser.name || 'Пользователь', avatar: kUser.avatar || '',
-          contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0
-        });
+app.get('/api/profiles', function (req, res) {
+  const result = Object.keys(profilesCache).map(id => {
+    const p = profilesCache[id];
+    return { id, name: p.name, avatar: p.avatar || '', isOnline: onlineUsers.has(id) };
+  });
+  res.json(result);
+});
+
+app.post('/api/push', function (req, res) {
+  const { senderId, events, tombstones: newTombs, profile } = req.body;
+  if (!senderId) return res.status(400).json({ error: 'No senderId' });
+  markOnline({ id: senderId, name: req.body.name || '', avatar: req.body.avatar || '' });
+  
+  if (profile && profile.id) {
+    profilesCache[profile.id] = Object.assign({}, profile, { updatedAt: Date.now() });
+    profilesDirty = true;
+  }
+  
+  if (Array.isArray(newTombs)) {
+    newTombs.forEach(t => {
+      if (!t || !t.type || !t.id) return;
+      const key = t.type + ':' + t.id;
+      if (!tombstones.has(key)) {
+        tombstones.set(key, { type: t.type, id: t.id, at: t.at || Date.now(), fromUser: senderId });
+        tombstonesDirty = true;
+        if (t.type === 'message' || t.type === 'file') {
+          try {
+            const files = fs.readdirSync(FILES_DIR);
+            files.forEach(f => {
+              if (f.indexOf(t.id) === 0) {
+                try { fs.unlinkSync(path.join(FILES_DIR, f)); } catch (e) {}
+              }
+            });
+          } catch (e) {}
+        }
       }
     });
   }
-
-  let user = accounts.find(function (u) { return u.id === id; });
-  if (!user) {
-    user = {
-      id: id, name: name || 'Пользователь', avatar: avatar || '',
-      contacts: Array.isArray(contacts) ? contacts : [],
-      blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now()
-    };
-    accounts.push(user);
-  } else {
-    user.updatedAt = Date.now();
-    if (name) user.name = name;
-    if (avatar !== undefined) user.avatar = avatar;
-    if (Array.isArray(contacts)) user.contacts = Array.from(new Set([].concat(user.contacts || [], contacts)));
-  }
-  writeAccounts(accounts);
-  res.json({ success: true, user: user });
-});
-
-app.post('/api/profile/update', function (req, res) {
-  const id = req.body.id, name = req.body.name, avatar = req.body.avatar;
-  const accounts = readAccounts();
-  const user = accounts.find(function (u) { return u.id === id; });
-  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-  if (name && name.trim()) user.name = name.trim();
-  if (avatar !== undefined) user.avatar = avatar;
-  user.updatedAt = Date.now();
-  writeAccounts(accounts);
-  res.json({ success: true, user: user });
-});
-
-app.get('/api/users/:userId', function (req, res) {
-  const accounts = readAccounts();
-  const user = accounts.find(function (u) { return u.id === req.params.userId; });
-  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-  const isOnline = user.updatedAt && (Date.now() - user.updatedAt < 8000);
-  res.json({ id: user.id, name: user.name, avatar: user.avatar || '', isOnline: isOnline, updatedAt: user.updatedAt });
-});
-
-app.post('/api/users/block', function (req, res) {
-  const userId = req.body.userId, peerId = req.body.peerId, block = req.body.block;
-  const accounts = readAccounts();
-  const user = accounts.find(function (u) { return u.id === userId; });
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  if (!user.blockedContacts) user.blockedContacts = [];
-  if (block) { if (user.blockedContacts.indexOf(peerId) === -1) user.blockedContacts.push(peerId); }
-  else { user.blockedContacts = user.blockedContacts.filter(function (x) { return x !== peerId; }); }
-  writeAccounts(accounts);
-  res.json({ success: true, blockedContacts: user.blockedContacts });
-});
-
-app.post('/api/chat/hide', function (req, res) {
-  const userId = req.body.userId, peerId = req.body.peerId;
-  const accounts = readAccounts();
-  const user = accounts.find(function (u) { return u.id === userId; });
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  if (!user.hiddenDialogs) user.hiddenDialogs = [];
-  if (user.hiddenDialogs.indexOf(peerId) === -1) user.hiddenDialogs.push(peerId);
-  writeAccounts(accounts);
-  res.json({ success: true, hiddenDialogs: user.hiddenDialogs });
-});
-
-app.get('/api/users/search', function (req, res) {
-  const q = (req.query.q || '').toLowerCase().trim();
-  if (!q) return res.json([]);
-  const accounts = readAccounts();
-  const now = Date.now();
-  const results = accounts
-    .filter(function (u) { return (u.id && u.id.toLowerCase().indexOf(q) !== -1) || (u.name && u.name.toLowerCase().indexOf(q) !== -1); })
-    .map(function (u) {
-      return {
-        id: u.id, type: 'user', name: u.name, avatar: u.avatar || '',
-        isOnline: u.updatedAt && (now - u.updatedAt < 8000)
-      };
-    });
-  res.json(results);
-});
-
-/* ==================== ГРУППЫ ==================== */
-
-app.post('/api/groups/create', function (req, res) {
-  const userId = req.body.userId, name = req.body.name, members = req.body.members, avatar = req.body.avatar;
-  if (!userId) return res.status(400).json({ error: 'Нет пользователя' });
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Введите название группы' });
-
-  if (!Array.isArray(members) || members.length === 0) {
-    return res.status(400).json({ error: 'Выберите хотя бы одного участника' });
-  }
-
-  const accounts = readAccounts();
-  const creator = accounts.find(function (u) { return u.id === userId; });
-  const contactsSet = new Set(creator && creator.contacts ? creator.contacts : []);
-  const validMembers = members.filter(function (mId) { return mId !== userId && contactsSet.has(mId); });
-
-  if (validMembers.length === 0) {
-    return res.status(400).json({ error: 'Выбранные пользователи недоступны' });
-  }
-
-  const memberSet = new Set([userId].concat(validMembers));
-  const groups = readGroups();
-  const group = {
-    id: genId('grp_'), name: name.trim(), avatar: avatar || '',
-    ownerId: userId, members: Array.from(memberSet), createdAt: Date.now()
-  };
-  groups.push(group);
-  writeGroups(groups);
-  res.json({ success: true, group: group });
-});
-
-function groupWithDetails(group) {
-  const accounts = readAccounts();
-  const now = Date.now();
-  const memberDetails = group.members.map(function (mId) {
-    const u = accounts.find(function (a) { return a.id === mId; });
-    return {
-      id: mId,
-      name: u ? u.name : 'Пользователь',
-      avatar: u ? (u.avatar || '') : '',
-      isOnline: u && u.updatedAt && (now - u.updatedAt < 8000)
-    };
-  });
-  const copy = Object.assign({}, group);
-  copy.memberDetails = memberDetails;
-  return copy;
-}
-
-app.get('/api/groups/:groupId', function (req, res) {
-  const groups = readGroups();
-  const g = groups.find(function (x) { return x.id === req.params.groupId; });
-  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-  res.json(groupWithDetails(g));
-});
-
-app.post('/api/groups/update', function (req, res) {
-  const groupId = req.body.groupId, userId = req.body.userId, name = req.body.name, avatar = req.body.avatar;
-  const groups = readGroups();
-  const g = groups.find(function (x) { return x.id === groupId; });
-  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-  if (g.ownerId !== userId) return res.status(403).json({ error: 'Только создатель может менять группу' });
-  if (name && name.trim()) g.name = name.trim();
-  if (avatar !== undefined) g.avatar = avatar;
-  writeGroups(groups);
-  res.json({ success: true, group: groupWithDetails(g) });
-});
-
-app.post('/api/groups/add', function (req, res) {
-  const groupId = req.body.groupId, userId = req.body.userId, members = req.body.members;
-  if (!Array.isArray(members) || members.length === 0) {
-    return res.status(400).json({ error: 'Выберите хотя бы одного участника' });
-  }
-  const groups = readGroups();
-  const g = groups.find(function (x) { return x.id === groupId; });
-  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-  if (g.ownerId !== userId) return res.status(403).json({ error: 'Только создатель может добавлять' });
-
-  const accounts = readAccounts();
-  const owner = accounts.find(function (u) { return u.id === userId; });
-  const contactsSet = new Set(owner && owner.contacts ? owner.contacts : []);
-
-  var added = 0;
-  members.forEach(function (mId) {
-    if (contactsSet.has(mId) && g.members.indexOf(mId) === -1) {
-      g.members.push(mId);
-      added++;
-    }
-  });
-  if (added === 0) {
-    return res.status(400).json({ error: 'Никто не был добавлен (уже в группе или нет в контактах)' });
-  }
-  writeGroups(groups);
-  res.json({ success: true, group: groupWithDetails(g) });
-});
-
-app.post('/api/groups/kick', function (req, res) {
-  const groupId = req.body.groupId, userId = req.body.userId, memberId = req.body.memberId;
-  const groups = readGroups();
-  const g = groups.find(function (x) { return x.id === groupId; });
-  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-  if (g.ownerId !== userId) return res.status(403).json({ error: 'Только создатель может выгонять' });
-  if (memberId === userId) return res.status(400).json({ error: 'Нельзя выгнать себя' });
-  if (g.members.indexOf(memberId) === -1) return res.status(404).json({ error: 'Участник не найден' });
-  g.members = g.members.filter(function (m) { return m !== memberId; });
-  writeGroups(groups);
-  res.json({ success: true, group: groupWithDetails(g) });
-});
-
-app.post('/api/groups/delete', function (req, res) {
-  const groupId = req.body.groupId, userId = req.body.userId;
-  let groups = readGroups();
-  const g = groups.find(function (x) { return x.id === groupId; });
-  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-  if (g.ownerId !== userId) return res.status(403).json({ error: 'Только создатель может удалить группу' });
-  groups = groups.filter(function (x) { return x.id !== groupId; });
-  writeGroups(groups);
-  res.json({ success: true });
-});
-
-app.post('/api/groups/leave', function (req, res) {
-  const groupId = req.body.groupId, userId = req.body.userId;
-  let groups = readGroups();
-  const g = groups.find(function (x) { return x.id === groupId; });
-  if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-  g.members = g.members.filter(function (m) { return m !== userId; });
-  if (g.ownerId === userId) g.ownerId = g.members[0] || null;
-  if (g.members.length === 0) groups = groups.filter(function (x) { return x.id !== groupId; });
-  writeGroups(groups);
-  res.json({ success: true });
-});
-
-/* ==================== СООБЩЕНИЯ ==================== */
-
-app.post('/api/messages/send', function (req, res) {
-  const senderId = req.body.senderId, receiverId = req.body.receiverId, groupId = req.body.groupId;
-  const text = req.body.text, fileData = req.body.fileData, fileName = req.body.fileName, fileType = req.body.fileType, clientId = req.body.clientId;
-  const accounts = readAccounts();
-  const messages = readMessages();
-
-  if (clientId) {
-    const dup = messages.find(function (m) { return m.clientId && m.clientId === clientId; });
-    if (dup) {
-      const copyDup = Object.assign({}, dup);
-      copyDup.text = decryptText(dup.text);
-      return res.json({ success: true, duplicate: true, message: copyDup });
-    }
-  }
-
-  const sender = accounts.find(function (u) { return u.id === senderId; });
-
-  if (groupId) {
-    const groups = readGroups();
-    const g = groups.find(function (x) { return x.id === groupId; });
-    if (!g) return res.status(404).json({ error: 'Группа не найдена' });
-    if (g.members.indexOf(senderId) === -1) return res.status(403).json({ error: 'Вы не участник группы' });
-  } else {
-    const receiver = accounts.find(function (u) { return u.id === receiverId; });
-    if (sender && sender.blockedContacts && sender.blockedContacts.indexOf(receiverId) !== -1) {
-      return res.status(403).json({ error: 'Вы заблокировали этого пользователя' });
-    }
-    if (receiver && receiver.blockedContacts && receiver.blockedContacts.indexOf(senderId) !== -1) {
-      return res.status(403).json({ error: 'Вы заблокированы получателем' });
-    }
-    if (sender && sender.hiddenDialogs) sender.hiddenDialogs = sender.hiddenDialogs.filter(function (id) { return id !== receiverId; });
-    if (receiver && receiver.hiddenDialogs) receiver.hiddenDialogs = receiver.hiddenDialogs.filter(function (id) { return id !== senderId; });
-    if (sender) {
-      if (!sender.contacts) sender.contacts = [];
-      if (sender.contacts.indexOf(receiverId) === -1) sender.contacts.push(receiverId);
-    }
-    if (receiver) {
-      if (!receiver.contacts) receiver.contacts = [];
-      if (receiver.contacts.indexOf(senderId) === -1) receiver.contacts.push(senderId);
-    }
-    writeAccounts(accounts);
-  }
-
-  const newMsg = {
-    id: genId('msg_'), clientId: clientId || '',
-    senderId: senderId,
-    receiverId: groupId ? '' : receiverId,
-    groupId: groupId || '',
-    text: encryptText(text || ''),
-    fileData: fileData || '', fileName: fileName || '', fileType: fileType || '',
-    timestamp: timeStr(), ts: Date.now(),
-    isRead: false, readBy: [], isDeleted: false,
-    clearedFor: []
-  };
-
-  messages.push(newMsg);
-  writeMessages(messages);
-  const copyMsg = Object.assign({}, newMsg);
-  copyMsg.text = text || '';
-  res.json({ success: true, message: copyMsg });
-});
-
-app.post('/api/messages/read', function (req, res) {
-  const msgIds = req.body.msgIds, userId = req.body.userId;
-  if (!Array.isArray(msgIds) || msgIds.length === 0) return res.json({ success: true });
-  const messages = readMessages();
-  let changed = false;
-  messages.forEach(function (m) {
-    if (msgIds.indexOf(m.id) === -1) return;
-    if (m.groupId) {
-      if (!m.readBy) m.readBy = [];
-      if (userId && m.senderId !== userId && m.readBy.indexOf(userId) === -1) {
-        m.readBy.push(userId); changed = true;
+  
+  if (Array.isArray(events)) {
+    events.forEach(ev => {
+      if (!ev || !ev.type) return;
+      if (ev.id) {
+        if (ev.type === 'message' && tombstones.has('message:' + ev.id)) return;
+        if (ev.type === 'group' && tombstones.has('group:' + ev.id)) return;
+        if (ev.type === 'group_update' && tombstones.has('group:' + ev.id)) return;
       }
-    } else if (!m.isRead && m.senderId !== userId) {
-      m.isRead = true; changed = true;
-    }
-  });
-  if (changed) writeMessages(messages);
-  res.json({ success: true });
-});
-
-app.delete('/api/messages/:msgId', function (req, res) {
-  const msgId = req.params.msgId;
-  const messages = readMessages();
-  let changed = false;
-  messages.forEach(function (m) { if (m.id === msgId) { m.isDeleted = true; changed = true; } });
-  if (changed) writeMessages(messages);
-  res.json({ success: true });
-});
-
-app.post('/api/chat/clear', function (req, res) {
-  const userId = req.body.userId, peerId = req.body.peerId, groupId = req.body.groupId;
-  const messages = readMessages();
-  let changed = false;
-  messages.forEach(function (m) {
-    const isGroupMatch = groupId && m.groupId === groupId;
-    const isDmMatch = !groupId && (
-      (m.senderId === userId && m.receiverId === peerId) ||
-      (m.senderId === peerId && m.receiverId === userId)
-    );
-    if ((isGroupMatch || isDmMatch) && !m.isDeleted) {
-      if (!m.clearedFor) m.clearedFor = [];
-      if (m.clearedFor.indexOf(userId) === -1) { m.clearedFor.push(userId); changed = true; }
-    }
-  });
-  if (changed) writeMessages(messages);
-  res.json({ success: true });
-});
-
-app.get('/api/messages/group/:groupId', function (req, res) {
-  const groupId = req.params.groupId;
-  const userId = req.query.userId;
-  const messages = readMessages();
-  const list = messages
-    .filter(function (m) {
-      return !m.isDeleted && m.groupId === groupId &&
-        !(m.clearedFor && userId && m.clearedFor.indexOf(userId) !== -1);
-    })
-    .sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); })
-    .map(function (m) { const c = Object.assign({}, m); c.text = decryptText(m.text); return c; });
-  res.json(list);
-});
-
-app.get('/api/messages/:userId/:peerId', function (req, res) {
-  const userId = req.params.userId, peerId = req.params.peerId;
-  const messages = readMessages();
-  const chatMsgs = messages.filter(function (m) {
-    return !m.isDeleted && !m.groupId &&
-      ((m.senderId === userId && m.receiverId === peerId) || (m.senderId === peerId && m.receiverId === userId)) &&
-      !(m.clearedFor && m.clearedFor.indexOf(userId) !== -1);
-  }).sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); })
-    .map(function (m) { const c = Object.assign({}, m); c.text = decryptText(m.text); return c; });
-  res.json(chatMsgs);
-});
-
-app.get('/api/dialogs/:userId', function (req, res) {
-  const userId = req.params.userId;
-  const accounts = readAccounts();
-  const currentUser = accounts.find(function (u) { return u.id === userId; });
-  const messages = readMessages();
-  const groups = readGroups();
-  const now = Date.now();
-
-  const hiddenSet = new Set(currentUser && currentUser.hiddenDialogs ? currentUser.hiddenDialogs : []);
-  const peerIds = new Set(currentUser ? currentUser.contacts || [] : []);
-  const lastTs = {};
-
-  messages.forEach(function (m) {
-    if (m.isDeleted) return;
-    if (m.clearedFor && m.clearedFor.indexOf(userId) !== -1) return;
-    if (m.groupId) {
-      lastTs['grp:' + m.groupId] = Math.max(lastTs['grp:' + m.groupId] || 0, m.ts || 0);
-    } else {
-      if (m.senderId === userId) { peerIds.add(m.receiverId); lastTs[m.receiverId] = Math.max(lastTs[m.receiverId] || 0, m.ts || 0); }
-      if (m.receiverId === userId) { peerIds.add(m.senderId); lastTs[m.senderId] = Math.max(lastTs[m.senderId] || 0, m.ts || 0); }
-    }
-  });
-
-  const userDialogs = accounts
-    .filter(function (u) { return peerIds.has(u.id) && u.id !== userId && !hiddenSet.has(u.id); })
-    .map(function (u) {
-      return {
-        id: u.id, type: 'user', name: u.name, avatar: u.avatar || '',
-        isOnline: u.updatedAt && (now - u.updatedAt < 8000),
-        lastTs: lastTs[u.id] || 0
-      };
+      ev.fromUser = senderId;
+      pushEvent(ev);
     });
-
-  const groupDialogs = groups
-    .filter(function (g) { return g.members.indexOf(userId) !== -1; })
-    .map(function (g) {
-      return {
-        id: g.id, type: 'group', name: g.name, avatar: g.avatar || '',
-        ownerId: g.ownerId, members: g.members, memberCount: g.members.length,
-        lastTs: lastTs['grp:' + g.id] || 0
-      };
-    });
-
-  const all = userDialogs.concat(groupDialogs).sort(function (a, b) { return (b.lastTs || 0) - (a.lastTs || 0); });
-  res.json(all);
+  }
+  
+  res.json({ success: true });
 });
 
-/* ==================== ЧАНКОВАННАЯ ЗАГРУЗКА ФАЙЛОВ ==================== */
+app.post('/api/pull', function (req, res) {
+  const { userId, contacts, groups, knownTombstones } = req.body;
+  if (!userId) return res.status(400).json({ error: 'No userId' });
+  markOnline({ id: userId, name: req.body.name || '', avatar: req.body.avatar || '' });
+  
+  const knownSet = new Set(knownTombstones || []);
+  const contactsSet = new Set(contacts || []);
+  const myGroups = new Map();
+  (groups || []).forEach(g => myGroups.set(g.id, new Set(g.members || [])));
+  
+  const newTombstones = [];
+  tombstones.forEach((t, key) => {
+    if (knownSet.has(key)) return;
+    if (t.fromUser === userId) return;
+    newTombstones.push(t);
+  });
+  
+  const result = [];
+  recentEvents.forEach(ev => {
+    if (ev.fromUser === userId) return;
+    if (ev.id) {
+      if (ev.type === 'message' && tombstones.has('message:' + ev.id)) return;
+      if (ev.type === 'group' && tombstones.has('group:' + ev.id)) return;
+    }
+    let interested = false;
+    if (ev.type === 'message' || ev.type === 'message_read') {
+      if (ev.groupId) interested = myGroups.has(ev.groupId);
+      else interested = (ev.senderId === userId || ev.receiverId === userId);
+    } else if (ev.type === 'group' || ev.type === 'group_update') {
+      interested = myGroups.has(ev.id) || (ev.members && ev.members.indexOf(userId) !== -1) || (ev.ownerId === userId);
+    } else if (ev.type === 'group_kick') {
+      interested = (ev.memberId === userId) || myGroups.has(ev.groupId);
+    } else if (ev.type === 'profile') {
+      interested = contactsSet.has(ev.id) || ev.id === userId;
+    } else if (ev.type === 'sync_request' && ev.toUserId === userId) {
+      interested = true;
+    } else if (ev.type === 'sync_response' && ev.toUserId === userId) {
+      interested = true;
+    } else if (ev.type === 'file_request' && ev.toUserId === userId) {
+      interested = true;
+    }
+    if (interested) result.push(ev);
+  });
+  
+  res.json({
+    success: true,
+    events: result,
+    tombstones: newTombstones,
+    online: Array.from(onlineUsers.keys())
+  });
+});
 
+app.post('/api/request-sync', function (req, res) {
+  const { fromUserId, toUserId, scope } = req.body;
+  if (!fromUserId || !toUserId) return res.status(400).json({ error: 'Bad' });
+  pushEvent({
+    type: 'sync_request',
+    id: fromUserId + ':' + toUserId + ':' + Date.now(),
+    fromUser: fromUserId, fromUserId, toUserId,
+    scope: scope || 'all'
+  });
+  res.json({ success: true });
+});
+
+app.post('/api/respond-sync', function (req, res) {
+  const { fromUserId, toUserId, chunkIndex, totalChunks, data } = req.body;
+  if (!fromUserId || !toUserId) return res.status(400).json({ error: 'Bad' });
+  pushEvent({
+    type: 'sync_response',
+    id: fromUserId + ':' + toUserId + ':' + (chunkIndex || 0) + ':' + Date.now(),
+    fromUser: fromUserId, fromUserId, toUserId,
+    chunkIndex: chunkIndex || 0, totalChunks: totalChunks || 1, data
+  });
+  res.json({ success: true });
+});
+
+/* ==================== FILES ==================== */
 app.post('/api/upload/init', function (req, res) {
-  const fileName = req.body.fileName, fileSize = req.body.fileSize, fileType = req.body.fileType;
-  const senderId = req.body.senderId, receiverId = req.body.receiverId, groupId = req.body.groupId, clientId = req.body.clientId;
-  
-  if (!fileName || !fileSize || !senderId) {
-    return res.status(400).json({ error: 'Недостаточно данных' });
-  }
-  if (fileSize > MAX_FILE_SIZE) {
-    return res.status(413).json({ error: 'Файл слишком большой (макс. 200 МБ)' });
-  }
-  
-  const fileId = 'file_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE_LIMIT);
-  
-  uploads.set(fileId, {
-    fileId: fileId,
-    fileName: fileName,
-    fileSize: fileSize,
-    fileType: fileType,
-    senderId: senderId,
-    receiverId: receiverId || '',
-    groupId: groupId || '',
-    clientId: clientId || '',
-    totalChunks: totalChunks,
-    receivedChunks: 0,
-    startedAt: Date.now(),
-    chunks: []
-  });
-  
-  res.json({ success: true, fileId: fileId, totalChunks: totalChunks, chunkSize: CHUNK_SIZE_LIMIT });
+  const { senderId, fileName, fileSize, fileType } = req.body;
+  if (!senderId) return res.status(400).json({ error: 'No sender' });
+  if (fileSize > MAX_FILE_SIZE) return res.status(413).json({ error: 'Too big' });
+  const fileId = 'f_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+  const totalChunks = Math.ceil((fileSize || 0) / CHUNK_SIZE_LIMIT);
+  uploads.set(fileId, { fileId, fileName, fileSize, fileType, senderId, totalChunks, chunks: [], received: 0 });
+  res.json({ success: true, fileId, totalChunks, chunkSize: CHUNK_SIZE_LIMIT });
 });
 
 app.post('/api/upload/chunk', function (req, res) {
   const fileId = req.query.fileId;
-  const chunkIndex = parseInt(req.query.chunkIndex, 10);
-  
-  if (!fileId || isNaN(chunkIndex)) {
-    return res.status(400).json({ error: 'fileId и chunkIndex обязательны' });
-  }
-  
-  const upload = uploads.get(fileId);
-  if (!upload) return res.status(404).json({ error: 'Загрузка не найдена или истекла' });
-  if (chunkIndex < 0 || chunkIndex >= upload.totalChunks) {
-    return res.status(400).json({ error: 'Неверный индекс чанка' });
-  }
-  
-  upload.chunks[chunkIndex] = Buffer.from(req.body);
-  upload.receivedChunks = upload.chunks.filter(function (c) { return c; }).length;
-  
-  res.json({ success: true, received: upload.receivedChunks, total: upload.totalChunks });
+  const idx = parseInt(req.query.chunkIndex, 10);
+  const up = uploads.get(fileId);
+  if (!up) return res.status(404).json({ error: 'Not found' });
+  if (isNaN(idx) || idx < 0 || idx >= up.totalChunks) return res.status(400).json({ error: 'Bad chunk' });
+  up.chunks[idx] = Buffer.from(req.body);
+  up.received = up.chunks.filter(c => c).length;
+  res.json({ success: true, received: up.received, total: up.totalChunks });
 });
 
 app.post('/api/upload/finish', function (req, res) {
-  const fileId = req.body.fileId;
-  const text = req.body.text || '';
-  const upload = uploads.get(fileId);
-  if (!upload) return res.status(404).json({ error: 'Загрузка не найдена' });
-  
-  for (let i = 0; i < upload.totalChunks; i++) {
-    if (!upload.chunks[i]) {
-      return res.status(400).json({ error: 'Не все чанки получены (отсутствует ' + i + ')' });
-    }
+  const { fileId } = req.body;
+  const up = uploads.get(fileId);
+  if (!up) return res.status(404).json({ error: 'Not found' });
+  for (let i = 0; i < up.totalChunks; i++) {
+    if (!up.chunks[i]) return res.status(400).json({ error: 'Missing chunk ' + i });
   }
-  
-  const fullBuffer = Buffer.concat(upload.chunks);
-  const safeFileName = upload.fileId + '_' + upload.fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const filePath = path.join(FILES_DIR, safeFileName);
-  
-  try {
-    fs.writeFileSync(filePath, fullBuffer);
-  } catch (e) {
-    uploads.delete(fileId);
-    return res.status(500).json({ error: 'Не удалось сохранить файл' });
-  }
-  
-  const accounts = readAccounts();
-  const messages = readMessages();
-  const sender = accounts.find(function (u) { return u.id === upload.senderId; });
-  
-  if (upload.groupId) {
-    const groups = readGroups();
-    const g = groups.find(function (x) { return x.id === upload.groupId; });
-    if (!g || g.members.indexOf(upload.senderId) === -1) {
-      uploads.delete(fileId);
-      try { fs.unlinkSync(filePath); } catch (e) {}
-      return res.status(403).json({ error: 'Вы не участник группы' });
-    }
-  } else {
-    if (sender) {
-      if (!sender.contacts) sender.contacts = [];
-      if (sender.contacts.indexOf(upload.receiverId) === -1) sender.contacts.push(upload.receiverId);
-    }
-    const receiver = accounts.find(function (u) { return u.id === upload.receiverId; });
-    if (receiver) {
-      if (!receiver.contacts) receiver.contacts = [];
-      if (receiver.contacts.indexOf(upload.senderId) === -1) receiver.contacts.push(upload.senderId);
-    }
-    writeAccounts(accounts);
-  }
-  
-  const newMsg = {
-    id: genId('msg_'), clientId: upload.clientId || '',
-    senderId: upload.senderId,
-    receiverId: upload.groupId ? '' : upload.receiverId,
-    groupId: upload.groupId || '',
-    text: encryptText(text),
-    fileData: '',
-    fileUrl: '/files/' + safeFileName,
-    fileName: upload.fileName,
-    fileType: upload.fileType,
-    fileSize: upload.fileSize,
-    timestamp: timeStr(),
-    ts: Date.now(),
-    isRead: false, readBy: [], isDeleted: false,
-    clearedFor: []
-  };
-  
-  messages.push(newMsg);
-  writeMessages(messages);
+  const buf = Buffer.concat(up.chunks);
+  const safeName = fileId + '_' + (up.fileName || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const fp = path.join(FILES_DIR, safeName);
+  fs.writeFileSync(fp, buf);
+  fileIndex.set(fileId, { path: fp, ownerId: up.senderId });
   uploads.delete(fileId);
-  
-  const copyMsg = Object.assign({}, newMsg);
-  copyMsg.text = text;
-  res.json({ success: true, message: copyMsg });
+  res.json({ success: true, fileId, url: '/files/' + safeName, fileName: up.fileName, fileType: up.fileType, fileSize: up.fileSize });
 });
 
-app.get('/files/:fileName', function (req, res) {
-  const fileName = req.params.fileName;
-  if (fileName.indexOf('..') !== -1 || fileName.indexOf('/') !== -1 || fileName.indexOf('\\') !== -1) {
-    return res.status(400).send('Invalid file name');
-  }
-  const filePath = path.join(FILES_DIR, fileName);
-  if (!fs.existsSync(filePath)) return res.status(404).send('File not found');
-  
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
+app.get('/files/:name', function (req, res) {
+  const name = req.params.name;
+  if (name.indexOf('..') !== -1 || name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) return res.status(400).send('bad');
+  const fp = path.join(FILES_DIR, name);
+  if (!fs.existsSync(fp)) return res.status(404).send('not found');
+  const stat = fs.statSync(fp);
   const range = req.headers.range;
-  
-  const ext = path.extname(fileName).toLowerCase();
-  const mimeMap = {
+  const ext = path.extname(name).toLowerCase();
+  const mime = {
     '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg',
     '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
     '.gif': 'image/gif', '.webp': 'image/webp',
     '.pdf': 'application/pdf', '.txt': 'text/plain'
-  };
-  const contentType = mimeMap[ext] || 'application/octet-stream';
-  
+  }[ext] || 'application/octet-stream';
   if (range) {
     const parts = range.replace(/bytes=/, '').split('-');
     const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    
-    if (start >= fileSize) {
-      res.status(416).set('Content-Range', 'bytes */' + fileSize).end();
-      return;
-    }
-    
-    const chunkSize = (end - start) + 1;
-    const file = fs.createReadStream(filePath, { start: start, end: end });
-    
+    const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+    if (start >= stat.size) return res.status(416).set('Content-Range', 'bytes */' + stat.size).end();
     res.writeHead(206, {
-      'Content-Range': 'bytes ' + start + '-' + end + '/' + fileSize,
+      'Content-Range': 'bytes ' + start + '-' + end + '/' + stat.size,
       'Accept-Ranges': 'bytes',
-      'Content-Length': chunkSize,
-      'Content-Type': contentType
+      'Content-Length': end - start + 1,
+      'Content-Type': mime
     });
-    file.pipe(res);
+    fs.createReadStream(fp, { start, end }).pipe(res);
   } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': contentType,
-      'Accept-Ranges': 'bytes'
-    });
-    fs.createReadStream(filePath).pipe(res);
+    res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': mime, 'Accept-Ranges': 'bytes' });
+    fs.createReadStream(fp).pipe(res);
   }
 });
 
-setInterval(function () {
-  const now = Date.now();
-  uploads.forEach(function (upload, fileId) {
-    if (now - upload.startedAt > 60 * 60 * 1000) {
-      uploads.delete(fileId);
-    }
+app.post('/api/request-file', function (req, res) {
+  const { fileId, fromUserId, ownerId } = req.body;
+  if (!fileId || !fromUserId || !ownerId) return res.status(400).json({ error: 'Bad' });
+  pushEvent({
+    type: 'file_request',
+    id: fileId + ':' + fromUserId,
+    fromUser: fromUserId, fileId, fromUserId, ownerId, toUserId: ownerId
   });
-}, 10 * 60 * 1000);
+  res.json({ success: true });
+});
 
-/* ==================== HTML КЛИЕНТ ==================== */
+/* ==================== HTML ==================== */
+
 const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
@@ -731,6 +380,22 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
   .btn-danger { background: #e53935; color: #fff; }
   .error-msg { color: #e53935; font-size: 12px; margin-top: 8px; display: none; }
+  
+  /* STATUS BAR - состояние соединения */
+  #status-bar { position: fixed; top: 0; left: 0; right: 0; padding: 8px; text-align: center; font-size: 13px; font-weight: 600; z-index: 9999; transition: transform 0.3s, opacity 0.3s; transform: translateY(-100%); }
+  #status-bar.visible { transform: translateY(0); }
+  #status-bar.internet-off { background: #e53935; color: #fff; }
+  #status-bar.server-off { background: #f9a825; color: #000; }
+  #status-bar.reconnected { background: #4cd964; color: #fff; }
+  
+  /* LOADING SCREEN */
+  #loading-screen { display: none; position: fixed; inset: 0; background: var(--bg-app); z-index: 10000; flex-direction: column; align-items: center; justify-content: center; gap: 20px; }
+  #loading-screen.active { display: flex; }
+  .spinner { width: 50px; height: 50px; border: 4px solid var(--bg-input); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading-text { color: var(--text-muted); font-size: 15px; text-align: center; padding: 0 20px; }
+  .loading-title { font-size: 20px; font-weight: bold; color: var(--text-main); text-align: center; }
+  
   #app-container { display: flex; width: 100%; height: 100%; }
   .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
   .sidebar-header { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
@@ -742,8 +407,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .online-indicator { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; background: #4cd964; border: 2px solid var(--bg-sidebar); border-radius: 50%; display: none; z-index: 999; pointer-events: none; box-sizing: content-box; }
   .online-indicator.visible { display: block; }
   .header-actions { display: flex; gap: 6px; }
-  .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; transition: opacity 0.15s; }
-  .theme-toggle-btn:disabled { opacity: 0.5; cursor: wait; }
+  .theme-toggle-btn { background: var(--bg-input); border: none; color: var(--text-main); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
   .new-group-btn-icon { display: inline-flex; align-items: baseline; line-height: 1; }
   .new-group-btn-icon .plus { font-size: 11px; margin-right: 1px; }
   .new-group-btn-icon .people { font-size: 16px; }
@@ -751,31 +415,28 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .search-box input { width: 100%; padding: 10px 12px; border-radius: 18px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; font-size: 14px; }
   .clear-search { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; color: var(--text-muted); display: none; }
   .chat-list { flex: 1; overflow-y: auto; }
-  .chat-item { display: flex; align-items: center; gap: 12px; padding: 12px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background 0.15s; }
+  .chat-item { display: flex; align-items: center; gap: 12px; padding: 12px; cursor: pointer; border-bottom: 1px solid var(--border); }
   .chat-item:hover, .chat-item.active { background: var(--bg-active); }
   .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); position: relative; min-width: 0; }
   .chat-header { background: var(--bg-sidebar); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
   .chat-header-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; overflow: hidden; }
   .chat-menu-container { position: relative; }
-  .menu-dots-btn { background: transparent; border: none; color: var(--text-main); font-size: 20px; cursor: pointer; padding: 8px; border-radius: 50%; display: none; align-items: center; justify-content: center; }
-  .menu-dots-btn:hover { background: var(--bg-input); }
-  .chat-dropdown-menu { position: absolute; right: 0; top: 45px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 220px; display: flex; flex-direction: column; z-index: 1000; overflow: hidden; visibility: hidden; opacity: 0; transform: translateY(-6px); transition: opacity 0.12s, transform 0.12s, visibility 0.12s; pointer-events: none; }
-  .chat-dropdown-menu.active { visibility: visible; opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .menu-dots-btn { background: transparent; border: none; color: var(--text-main); font-size: 20px; cursor: pointer; padding: 8px; border-radius: 50%; display: none; }
+  .chat-dropdown-menu { position: absolute; right: 0; top: 45px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 220px; display: none; flex-direction: column; z-index: 1000; overflow: hidden; }
+  .chat-dropdown-menu.active { display: flex; }
   .menu-item { padding: 12px 16px; font-size: 14px; cursor: pointer; border-bottom: 1px solid var(--border); text-align: left; background: none; border-top: none; border-left: none; border-right: none; color: var(--text-main); width: 100%; }
   .menu-item:hover { background: var(--bg-active); }
   .menu-item.danger { color: #e53935; }
-  .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; }
-  .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; position: relative; user-select: none; transition: background 0.15s; }
+  .messages-container { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; user-select: none; }
   .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
   .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
-  .msg.pending { opacity: 0.75; }
   .msg-sender { font-size: 12px; font-weight: bold; color: var(--accent); margin-bottom: 2px; }
   .media-preview { width: 260px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
   .video-preview { width: 260px; max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; background: #000; }
-  .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; cursor: pointer; }
-  .audio-slot { width: 240px; max-width: 100%; height: 40px; margin-top: 5px; }
-  .audio-preview { width: 240px !important; min-width: 240px !important; max-width: 240px !important; height: 40px; margin-top: 5px; display: block; flex-shrink: 0; box-sizing: border-box; }
-  @media (max-width: 360px) { .audio-preview { width: 200px !important; min-width: 200px !important; max-width: 200px !important; } .audio-slot { width: 200px; } }
+  .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
+  .file-placeholder { padding: 8px 12px; background: var(--bg-input); border-radius: 6px; margin-top: 5px; font-size: 12px; color: var(--text-muted); }
+  .audio-preview { width: 240px !important; max-width: 240px !important; height: 40px; margin-top: 5px; display: block; }
   .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 9px; color: var(--text-muted); margin-top: 3px; }
   .ticks { font-size: 11px; letter-spacing: -3px; font-weight: bold; }
   .ticks.read { color: var(--accent); }
@@ -788,51 +449,44 @@ const CLIENT_HTML = `<!DOCTYPE html>
   #audio-attachment-preview { display: none; }
   #audio-attachment-preview.active { display: flex; }
   #audio-attachment-preview audio { height: 36px; }
-  .record-panel { display: none; background: var(--bg-sidebar); border-top: 1px solid var(--border); padding: 6px 12px; align-items: center; justify-content: center; gap: 10px; flex-shrink: 0; height: 40px; box-sizing: border-box; }
+  .record-panel { display: none; background: var(--bg-sidebar); border-top: 1px solid var(--border); padding: 6px 12px; align-items: center; justify-content: center; gap: 10px; flex-shrink: 0; height: 40px; }
   .record-panel.active { display: flex; }
   .recording-indicator { display: none; align-items: center; gap: 6px; font-size: 13px; color: #e53935; }
   .recording-indicator.active { display: inline-flex; }
   .recording-dot { width: 10px; height: 10px; border-radius: 50%; background: #e53935; animation: recpulse 1s infinite; }
   @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
   #recording-timer { font-family: monospace; font-weight: bold; color: #e53935; font-size: 14px; }
-  .record-hint { font-size: 12px; color: var(--text-muted); }
   .input-bar { background: var(--bg-sidebar); padding: 10px; display: flex; gap: 10px; align-items: center; flex-shrink: 0; border-top: 1px solid var(--border); }
   .input-bar input[type="text"] { flex: 1; padding: 12px; border-radius: 20px; border: none; background: var(--bg-input); color: var(--text-main); outline: none; min-width: 0; }
-  .icon-btn { cursor: pointer; font-size: 22px; user-select: none; border: none; background: transparent; color: var(--text-main); padding: 4px; flex-shrink: 0; }
+  .icon-btn { cursor: pointer; font-size: 22px; border: none; background: transparent; color: var(--text-main); padding: 4px; flex-shrink: 0; }
   .icon-btn.recording { color: #e53935; }
   .empty-state { margin: auto; text-align: center; color: var(--text-muted); font-size: 14px; }
-  .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: opacity 0.15s, visibility 0.15s; pointer-events: none; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 2000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: 0.15s; pointer-events: none; }
   .modal-overlay.active { visibility: visible; opacity: 1; pointer-events: auto; }
-  .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); position: relative; max-height: 90dvh; overflow-y: auto; }
+  .profile-card { background: var(--bg-sidebar); width: 90%; max-width: 380px; border-radius: 16px; padding: 25px; display: flex; flex-direction: column; align-items: center; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.5); max-height: 90dvh; overflow-y: auto; }
   .profile-avatar-big { width: 90px; height: 90px; border-radius: 50%; background: var(--accent); margin-bottom: 15px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 32px; font-weight: bold; position: relative; }
-  .profile-avatar-big img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; display: block; position: relative; z-index: 1; }
+  .profile-avatar-big img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
   .profile-avatar-big > span { position: relative; z-index: 1; }
   .profile-name { font-size: 20px; font-weight: bold; margin-bottom: 5px; }
   .profile-id { font-size: 13px; color: var(--accent); margin-bottom: 20px; }
   .profile-actions { width: 100%; display: flex; flex-direction: column; gap: 10px; }
-  .profile-link-btn { background: none; border: none; color: var(--accent); font-size: 14px; font-weight: 500; cursor: pointer; padding: 5px; text-align: center; }
-  .profile-link-btn:hover { text-decoration: underline; }
-  .check-row { display: flex; align-items: center; gap: 10px; padding: 8px; cursor: pointer; border-bottom: 1px solid var(--border); transition: background 0.15s; border-radius: 8px; }
-  .check-row:hover { background: var(--bg-hover); }
-  .check-row input[type="checkbox"] { accent-color: var(--accent); flex-shrink: 0; }
-  .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; cursor: pointer; border-radius: 8px; position: relative; transition: background 0.15s; }
+  .profile-link-btn { background: none; border: none; color: var(--accent); font-size: 14px; cursor: pointer; padding: 5px; text-align: center; }
+  .check-row { display: flex; align-items: center; gap: 10px; padding: 8px; cursor: pointer; border-radius: 8px; }
+  .member-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; cursor: pointer; border-radius: 8px; position: relative; }
   .member-row:hover { background: var(--bg-hover); }
-  .member-menu-btn { background: transparent; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer; padding: 4px 8px; border-radius: 50%; flex-shrink: 0; line-height: 1; }
-  .member-menu-btn:hover { background: var(--bg-input); color: var(--text-main); }
-  .member-dropdown { position: absolute; right: 8px; top: 90%; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 180px; z-index: 1500; overflow: hidden; display: none; }
+  .member-menu-btn { background: transparent; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer; padding: 4px 8px; border-radius: 50%; }
+  .member-dropdown { position: absolute; right: 8px; top: 90%; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 180px; z-index: 1500; display: none; }
   .member-dropdown.active { display: block; }
-  .member-dropdown .menu-item { padding: 10px 14px; font-size: 13px; text-align: left; width: 100%; background: none; border: none; color: var(--text-main); cursor: pointer; display: block; }
-  .member-dropdown .menu-item:hover { background: var(--bg-active); }
-  .member-dropdown .menu-item.danger { color: #e53935; }
+  .member-dropdown .menu-item { padding: 10px 14px; font-size: 13px; }
   .upload-progress-container { flex: 1; display: flex; align-items: center; gap: 10px; }
   .upload-progress-track { flex: 1; background: var(--bg-input); border-radius: 10px; overflow: hidden; height: 8px; }
   .upload-progress-bar { height: 100%; background: var(--accent); width: 0%; transition: width 0.15s; }
-  .upload-progress-text { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
-  #image-viewer-modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: opacity 0.15s, visibility 0.15s; pointer-events: none; }
+  .upload-progress-text { font-size: 12px; color: var(--text-muted); }
+  #image-viewer-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: 0.15s; pointer-events: none; }
   #image-viewer-modal.active { visibility: visible; opacity: 1; pointer-events: auto; }
-  #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; object-fit: contain; }
+  #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
   .viewer-close { position: absolute; top: 20px; right: 20px; color: #fff; font-size: 30px; cursor: pointer; background: none; border: none; }
-  .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 -4px 20px rgba(0,0,0,0.4); visibility: hidden; opacity: 0; transform: translateY(20px); transition: opacity 0.15s, transform 0.15s, visibility 0.15s; pointer-events: none; }
+  .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: flex; flex-direction: column; gap: 10px; visibility: hidden; opacity: 0; transform: translateY(20px); transition: 0.15s; pointer-events: none; }
   .msg-actions-sheet.active { visibility: visible; opacity: 1; transform: translateY(0); pointer-events: auto; }
   @media (min-width: 601px) { .menu-dots-btn { display: flex !important; } }
   @media (max-width: 600px) {
@@ -842,12 +496,20 @@ const CLIENT_HTML = `<!DOCTYPE html>
     .app-mobile-chat .main-chat { display: flex; }
     .app-mobile-chat .menu-dots-btn { display: flex !important; }
   }
-  @media (orientation: landscape) and (max-width: 900px) {
-    .audio-preview { width: 240px !important; min-width: 240px !important; max-width: 240px !important; }
-  }
 </style>
 </head>
 <body>
+  
+  <!-- STATUS BAR -->
+  <div id="status-bar"></div>
+  
+  <!-- LOADING SCREEN -->
+  <div id="loading-screen">
+    <div class="loading-title" id="loading-title">Соединение...</div>
+    <div class="spinner"></div>
+    <div class="loading-text" id="loading-text">Подключаемся к серверу</div>
+  </div>
+  
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход в мессенджер</h2>
@@ -858,6 +520,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
       <button class="btn" id="login-btn" onclick="registerUser()">Войти</button>
     </div>
   </div>
+  
   <div id="app-screen" class="screen">
     <div id="app-container">
       <div class="sidebar">
@@ -874,11 +537,11 @@ const CLIENT_HTML = `<!DOCTYPE html>
               <button class="theme-toggle-btn" id="new-group-btn" onclick="openCreateGroup()" title="Создать группу">
                 <span class="new-group-btn-icon"><span class="plus">+</span><span class="people">👥</span></span>
               </button>
-              <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Сменить тему">🌙</button>
+              <button class="theme-toggle-btn" id="theme-toggle-btn" onclick="toggleTheme()">🌙</button>
             </div>
           </div>
           <div class="search-box">
-            <input type="text" id="search-input" placeholder="Поиск по имени или ID..." oninput="onSearchInput()">
+            <input type="text" id="search-input" placeholder="Поиск..." oninput="onSearchInput()">
             <span class="clear-search" id="clear-search-btn" onclick="clearSearch()">✕</span>
           </div>
         </div>
@@ -897,27 +560,27 @@ const CLIENT_HTML = `<!DOCTYPE html>
             </div>
           </div>
           <div class="chat-menu-container">
-            <button class="menu-dots-btn" id="chat-menu-dots-btn" onclick="toggleChatDropdown()" title="Опции чата">⋮</button>
+            <button class="menu-dots-btn" id="chat-menu-dots-btn" onclick="toggleChatDropdown()">⋮</button>
             <div class="chat-dropdown-menu" id="chat-dropdown-menu"></div>
           </div>
         </div>
         <div class="messages-container" id="messages-container">
-          <div class="empty-state">Выберите диалог слева или найдите пользователя в поиске</div>
+          <div class="empty-state">Выберите диалог слева</div>
         </div>
         <div class="attachment-preview-container" id="attachment-preview-container">
-          <img id="attachment-thumb-img" class="attachment-thumb" src="" alt="" style="display:none;">
+          <img id="attachment-thumb-img" class="attachment-thumb" src="" style="display:none;">
           <div class="attachment-info">
             <div class="attachment-name" id="attachment-name-label">файл</div>
-            <div style="font-size:11px; color:var(--text-muted);" id="attachment-type-label">Готово к отправке</div>
+            <div style="font-size:11px; color:var(--text-muted);" id="attachment-type-label">Готово</div>
           </div>
-          <span class="attachment-cancel" onclick="cancelAttachment()" title="Отменить">✕</span>
+          <span class="attachment-cancel" onclick="cancelAttachment()">✕</span>
         </div>
         <div class="attachment-preview-container" id="audio-attachment-preview">
           <div class="attachment-info" style="flex:1;">
-            <div class="attachment-name">🎤 Голосовое сообщение — готово к отправке</div>
+            <div class="attachment-name">🎤 Голосовое сообщение</div>
             <audio id="audio-preview-player" controls style="width:100%; margin-top:6px;"></audio>
           </div>
-          <span class="attachment-cancel" onclick="cancelVoiceAttachment()" title="Отменить">✕</span>
+          <span class="attachment-cancel" onclick="cancelVoiceAttachment()">✕</span>
         </div>
         <div class="record-panel" id="record-panel">
           <div class="recording-indicator active" id="recording-indicator">
@@ -925,18 +588,19 @@ const CLIENT_HTML = `<!DOCTYPE html>
             <span>Запись</span>
             <span id="recording-timer">0:00</span>
           </div>
-          <span class="record-hint">нажмите 🔴 для остановки</span>
+          <span style="font-size:12px; color:var(--text-muted);">нажмите 🔴 для остановки</span>
         </div>
         <div class="input-bar" id="input-bar" style="display:none;">
           <button class="icon-btn" onclick="triggerFileInput()">📎</button>
           <input type="file" id="file-input" style="display:none;" onchange="handleFileSelect(event)">
           <button class="icon-btn" id="mic-btn" onclick="toggleVoiceRecord()">🎙️</button>
-          <input type="text" id="msg-input" placeholder="Напишите сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
+          <input type="text" id="msg-input" placeholder="Сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
           <button class="btn" id="send-btn" style="width:auto; padding:10px 18px; border-radius:20px;" onclick="sendMsg()">➤</button>
         </div>
       </div>
     </div>
   </div>
+  
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="my-profile-avatar-view">
@@ -950,7 +614,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
       <div class="profile-actions" style="align-items: center;">
         <button class="profile-link-btn" onclick="triggerAvatarInput()">Загрузить фото</button>
         <input type="file" id="avatar-file-input" style="display:none;" accept="image/*" onchange="handleAvatarSelect(event)">
-        <button class="profile-link-btn" id="remove-avatar-link-btn" style="color: #e53935; display:none;" onclick="removeMyAvatar()">Удалить фото профиля</button>
+        <button class="profile-link-btn" id="remove-avatar-link-btn" style="color:#e53935; display:none;" onclick="removeMyAvatar()">Удалить фото</button>
         <button class="btn" id="save-my-profile-btn" onclick="saveMyProfileChanges()">Сохранить</button>
         <button class="btn btn-secondary" onclick="closeMyProfile()">Закрыть</button>
       </div>
@@ -964,7 +628,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
       <div class="profile-name" id="peer-profile-name-view">Имя</div>
       <div class="profile-id" id="peer-profile-id-view">ID</div>
       <div class="profile-actions">
-        <button class="btn btn-secondary" id="mute-peer-btn" onclick="toggleMutePeer()">Выключить звуковой сигнал</button>
+        <button class="btn btn-secondary" id="mute-peer-btn" onclick="toggleMutePeer()">Выключить звук</button>
         <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Заблокировать</button>
         <button class="btn btn-secondary" onclick="closePeerProfile()">Закрыть</button>
       </div>
@@ -974,17 +638,15 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <div class="profile-card">
       <h3 style="margin-bottom:15px; color:var(--accent);">Новая группа</h3>
       <div class="profile-avatar-big" id="create-group-avatar"><span>👥</span></div>
-      <button class="profile-link-btn" onclick="triggerGroupAvatarInput()">Загрузить фото группы</button>
+      <button class="profile-link-btn" onclick="triggerGroupAvatarInput()">Загрузить фото</button>
       <input type="file" id="group-avatar-input" style="display:none;" accept="image/*" onchange="handleGroupAvatarSelect(event)">
       <div class="input-group" style="width:100%; margin-top:10px;">
-        <input type="text" id="create-group-name" placeholder="Название группы...">
+        <input type="text" id="create-group-name" placeholder="Название...">
       </div>
-      <div style="width:100%; text-align:left; font-size:13px; color:var(--text-muted); margin-bottom:8px;">Добавить участников (только те, с кем у вас есть чат):</div>
-      <div id="create-group-contacts" style="width:100%; max-height:200px; overflow-y:auto; margin-bottom:10px;">
-        <div style="color:var(--text-muted); font-size:13px; padding:8px;">Загрузка контактов…</div>
-      </div>
+      <div style="width:100%; text-align:left; font-size:13px; color:var(--text-muted); margin-bottom:8px;">Участники:</div>
+      <div id="create-group-contacts" style="width:100%; max-height:200px; overflow-y:auto; margin-bottom:10px;"></div>
       <div class="profile-actions">
-        <button class="btn" id="create-group-submit-btn" onclick="submitCreateGroup()">Создать группу</button>
+        <button class="btn" id="create-group-submit-btn" onclick="submitCreateGroup()">Создать</button>
         <button class="btn btn-secondary" onclick="closeCreateGroup()">Отмена</button>
       </div>
     </div>
@@ -996,18 +658,18 @@ const CLIENT_HTML = `<!DOCTYPE html>
       <div class="profile-id" id="group-profile-count">0 участников</div>
       <div id="group-owner-controls" style="width:100%; display:none; border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:8px;">
         <div class="input-group" style="width:100%;">
-          <input type="text" id="edit-group-name" placeholder="Название группы...">
+          <input type="text" id="edit-group-name" placeholder="Название...">
         </div>
-        <button class="profile-link-btn" onclick="triggerEditGroupAvatarInput()">Изменить фото группы</button>
+        <button class="profile-link-btn" onclick="triggerEditGroupAvatarInput()">Изменить фото</button>
         <input type="file" id="edit-group-avatar-input" style="display:none;" accept="image/*" onchange="handleEditGroupAvatarSelect(event)">
-        <button class="btn" id="save-group-btn" onclick="saveGroupChanges()">Сохранить изменения</button>
+        <button class="btn" id="save-group-btn" onclick="saveGroupChanges()">Сохранить</button>
         <button class="btn btn-secondary" onclick="openAddMembers()">Добавить участников</button>
       </div>
       <div style="width:100%; text-align:left; font-size:13px; color:var(--text-muted); margin:6px 0 5px;">Участники:</div>
       <div id="group-members-list" style="width:100%; max-height:180px; overflow-y:auto; margin-bottom:10px;"></div>
       <div class="profile-actions">
         <button class="btn btn-danger" id="delete-group-btn" style="display:none;" onclick="deleteGroup()">Удалить группу</button>
-        <button class="btn btn-danger" id="leave-group-btn" onclick="leaveGroup()">Покинуть группу</button>
+        <button class="btn btn-danger" id="leave-group-btn" onclick="leaveGroup()">Покинуть</button>
         <button class="btn btn-secondary" onclick="closeGroupProfile()">Закрыть</button>
       </div>
     </div>
@@ -1015,7 +677,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   <div class="modal-overlay" id="add-members-modal">
     <div class="profile-card">
       <h3 style="margin-bottom:15px; color:var(--accent);">Добавить участников</h3>
-      <div style="width:100%; text-align:left; font-size:13px; color:var(--text-muted); margin-bottom:8px;">Доступны только те, с кем у вас есть чат:</div>
       <div id="add-members-contacts" style="width:100%; max-height:250px; overflow-y:auto; margin-bottom:10px;"></div>
       <div class="profile-actions">
         <button class="btn" id="add-members-submit-btn" onclick="submitAddMembers()">Добавить</button>
@@ -1024,13 +685,13 @@ const CLIENT_HTML = `<!DOCTYPE html>
     </div>
   </div>
   <div id="image-viewer-modal" onclick="closeImageViewer()">
-    <button class="viewer-close" onclick="closeImageViewer()">✕</button>
-    <img id="full-screen-img" src="" alt="">
+    <button class="viewer-close">✕</button>
+    <img id="full-screen-img" src="">
   </div>
   <div class="msg-actions-sheet" id="msg-actions-sheet">
-    <button class="btn" id="action-btn-copy" onclick="actionCopyText()" style="display:none;">Копировать текст</button>
-    <button class="btn" id="action-btn-download" onclick="actionDownloadFile()" style="display:none;">Скачать файл</button>
-    <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить сообщение</button>
+    <button class="btn" id="action-btn-copy" onclick="actionCopyText()" style="display:none;">Копировать</button>
+    <button class="btn" id="action-btn-download" onclick="actionDownloadFile()" style="display:none;">Скачать</button>
+    <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить</button>
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
   <div id="audio-pool" style="display:none; position:absolute; width:0; height:0; overflow:hidden;"></div>
@@ -1038,10 +699,37 @@ const CLIENT_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-/* ==================== JS КЛИЕНТА ==================== */
+/* ==================== CLIENT JS ==================== */
+
 const CLIENT_JS = `
+/* ============================================================
+   Соединение с сервером обязательно. Хранилище — IndexedDB.
+   ============================================================ */
+
+var appDB = null;
+var messagesCache = {};
+var usersCache = {};
+var groupsCache = {};
+var tombstonesCache = {};
+var metaCache = {};
 var currentUser = null;
 var activePeer = null;
+var mutedPeers = [];
+var fileUrlCache = new Map();
+
+var syncState = {
+  pendingEvents: [],
+  pendingTombstones: [],
+  isPushing: false,
+  isPulling: false
+};
+
+// Состояние соединения
+var connectionState = 'checking'; // 'checking' | 'online' | 'server-offline' | 'no-internet'
+
+var savedTheme = localStorage.getItem('app_theme') || 'dark';
+document.documentElement.setAttribute('data-theme', savedTheme);
+
 var selectedFile = null;
 var pendingVoice = null;
 var audioChunks = [];
@@ -1050,51 +738,252 @@ var activeStream = null;
 var recordStartedAt = 0;
 var recordingTimerInterval = null;
 var recordAudioCtx = null, recordSourceNode = null, recordProcessor = null, recordSilentGain = null;
-var lastDialogsHash = '';
-var lastMessagesHash = '';
 var selectedMsgId = null;
 var selectedMsgObj = null;
 var longTouchTimer = null;
 var groupDraftAvatar = '';
 var editGroupDraftAvatar = '';
-var localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}');
-var mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]');
-var localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]');
-var savedTheme = localStorage.getItem('app_theme') || 'dark';
-document.documentElement.setAttribute('data-theme', savedTheme);
-var audioPool = new Map();
-var blobUrlCache = new Map();
-var visibleMsgDebounce = null;
-var busyButtons = {};
-var dialogsPollingTimer = null;
 var draftAvatar = null;
 var activeMemberDropdown = null;
 var profileTargetId = null;
 var isUploading = false;
-
+var busyButtons = {};
 var CHUNK_SIZE = 500 * 1024;
 var MAX_FILE_SIZE = 200 * 1024 * 1024;
+var statusBarTimeout = null;
 
-/* ---------- ЗАЩИТА КНОПОК ---------- */
+/* ==================== INDEXEDDB ==================== */
+
+function openAppDB() {
+  return new Promise(function (resolve, reject) {
+    if (appDB) return resolve(appDB);
+    if (!window.indexedDB) return reject(new Error('No IndexedDB'));
+    var req = indexedDB.open('messenger_v4', 1);
+    req.onupgradeneeded = function (e) {
+      var db = e.target.result;
+      if (!db.objectStoreNames.contains('messages')) {
+        var ms = db.createObjectStore('messages', { keyPath: 'id' });
+        ms.createIndex('by_ts', 'ts');
+        ms.createIndex('by_group', 'groupId');
+      }
+      if (!db.objectStoreNames.contains('groups')) db.createObjectStore('groups', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('users')) db.createObjectStore('users', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('tombstones')) db.createObjectStore('tombstones', { keyPath: 'key' });
+    };
+    req.onsuccess = function (e) { appDB = e.target.result; resolve(appDB); };
+    req.onerror = function (e) { reject(e.target.error); };
+  });
+}
+
+async function dbPut(store, value) {
+  var db = await openAppDB();
+  return new Promise(function (res, rej) {
+    var tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).put(value);
+    tx.oncomplete = function () { res(true); };
+    tx.onerror = function (e) { rej(e.target.error); };
+  });
+}
+async function dbGet(store, key) {
+  var db = await openAppDB();
+  return new Promise(function (res, rej) {
+    var tx = db.transaction(store, 'readonly');
+    var r = tx.objectStore(store).get(key);
+    r.onsuccess = function () { res(r.result || null); };
+    r.onerror = function (e) { rej(e.target.error); };
+  });
+}
+async function dbDelete(store, key) {
+  var db = await openAppDB();
+  return new Promise(function (res, rej) {
+    var tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).delete(key);
+    tx.oncomplete = function () { res(true); };
+    tx.onerror = function (e) { rej(e.target.error); };
+  });
+}
+async function dbGetAll(store) {
+  var db = await openAppDB();
+  return new Promise(function (res, rej) {
+    var tx = db.transaction(store, 'readonly');
+    var r = tx.objectStore(store).getAll();
+    r.onsuccess = function () { res(r.result || []); };
+    r.onerror = function (e) { rej(e.target.error); };
+  });
+}
+
+async function loadAllFromDB() {
+  var msgs = await dbGetAll('messages');
+  msgs.forEach(m => { messagesCache[m.id] = m; });
+  var users = await dbGetAll('users');
+  users.forEach(u => { usersCache[u.id] = u; });
+  var groups = await dbGetAll('groups');
+  groups.forEach(g => { groupsCache[g.id] = g; });
+  var tombs = await dbGetAll('tombstones');
+  tombs.forEach(t => { tombstonesCache[t.key] = t; });
+  var meta = await dbGetAll('meta');
+  meta.forEach(m => { metaCache[m.key] = m.value; });
+  currentUser = metaCache['profile'] || null;
+  mutedPeers = metaCache['mutedPeers'] || [];
+}
+
+async function setMeta(key, value) {
+  metaCache[key] = value;
+  await dbPut('meta', { key, value });
+}
+function getMeta(key) { return metaCache[key]; }
+
+/* ==================== CONNECTION ==================== */
+
+function setConnectionState(state) {
+  if (connectionState === state) return;
+  connectionState = state;
+  updateStatusBar();
+  updateLoadingScreen();
+}
+
+function updateStatusBar() {
+  var bar = document.getElementById('status-bar');
+  if (!bar) return;
+  if (statusBarTimeout) { clearTimeout(statusBarTimeout); statusBarTimeout = null; }
+  bar.className = '';
+  if (connectionState === 'online') {
+    // Если только что восстановилось — показать зелёную плашку на 2 сек
+    if (bar.dataset.wasOffline === '1') {
+      bar.innerText = '✓ Подключено';
+      bar.className = 'visible reconnected';
+      statusBarTimeout = setTimeout(function () {
+        bar.classList.remove('visible');
+        bar.dataset.wasOffline = '0';
+      }, 2000);
+    }
+  } else if (connectionState === 'no-internet') {
+    bar.innerText = '⚠ Нет подключения к интернету';
+    bar.className = 'visible internet-off';
+    bar.dataset.wasOffline = '1';
+  } else if (connectionState === 'server-offline') {
+    bar.innerText = '⌛ Соединение...';
+    bar.className = 'visible server-off';
+    bar.dataset.wasOffline = '1';
+  }
+}
+
+function updateLoadingScreen() {
+  var ls = document.getElementById('loading-screen');
+  var title = document.getElementById('loading-title');
+  var text = document.getElementById('loading-text');
+  if (!ls) return;
+  // Показываем экран загрузки только если ещё не залогинились и связи нет
+  if (currentUser) { ls.classList.remove('active'); return; }
+  if (connectionState === 'online') {
+    ls.classList.remove('active');
+  } else if (connectionState === 'no-internet') {
+    ls.classList.add('active');
+    title.innerText = 'Нет подключения к интернету';
+    text.innerText = 'Проверьте соединение с интернетом';
+  } else if (connectionState === 'server-offline') {
+    ls.classList.add('active');
+    title.innerText = 'Соединение...';
+    text.innerText = 'Подключаемся к серверу';
+  } else {
+    ls.classList.add('active');
+    title.innerText = 'Подключение';
+    text.innerText = 'Проверяем соединение';
+  }
+}
+
+async function checkServerHealth() {
+  // 1. Есть ли вообще интернет?
+  if (!navigator.onLine) {
+    setConnectionState('no-internet');
+    return false;
+  }
+  // 2. Отвечает ли сервер?
+  try {
+    var ctrl = new AbortController();
+    var tm = setTimeout(function () { ctrl.abort(); }, 5000);
+    var res = await fetch('/api/health?_=' + Date.now(), { signal: ctrl.signal });
+    clearTimeout(tm);
+    if (res.ok) {
+      setConnectionState('online');
+      return true;
+    }
+    setConnectionState('server-offline');
+    return false;
+  } catch (e) {
+    // Отличить internet-off от server-off
+    if (!navigator.onLine) setConnectionState('no-internet');
+    else setConnectionState('server-offline');
+    return false;
+  }
+}
+
+window.addEventListener('online', async function () {
+  var ok = await checkServerHealth();
+  if (ok) {
+    pushToServer();
+    pullFromServer();
+  }
+});
+window.addEventListener('offline', function () {
+  setConnectionState('no-internet');
+});
+
+/* ==================== UTILS ==================== */
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+  });
+}
+function formatBytes(b) {
+  if (!b || b < 1024) return (b || 0) + ' Б';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' КБ';
+  if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + ' МБ';
+  return (b / (1024 * 1024 * 1024)).toFixed(1) + ' ГБ';
+}
+function updateThemeIcon(t) {
+  var b = document.getElementById('theme-toggle-btn');
+  if (b) b.innerText = t === 'dark' ? '🌙' : '☀️';
+}
+function toggleTheme() {
+  var c = document.documentElement.getAttribute('data-theme');
+  var n = c === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', n);
+  localStorage.setItem('app_theme', n);
+  updateThemeIcon(n);
+}
+function playNotificationSound() {
+  try {
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    var osc = ctx.createOscillator();
+    var g = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(587, ctx.currentTime);
+    osc.frequency.setValueAtTime(880, ctx.currentTime + 0.08);
+    g.gain.setValueAtTime(0.15, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start(); osc.stop(ctx.currentTime + 0.3);
+  } catch (e) {}
+}
 function lockButton(id, ms) {
-  if (ms === undefined) ms = 1500;
+  ms = ms || 1500;
   var el = document.getElementById(id);
   if (!el) return false;
   if (busyButtons[id]) return false;
   busyButtons[id] = true;
   el.disabled = true;
   el.style.opacity = '0.5';
-  el.style.pointerEvents = 'none';
   setTimeout(function () {
     busyButtons[id] = false;
     el.disabled = false;
     el.style.opacity = '';
-    el.style.pointerEvents = '';
   }, ms);
   return true;
 }
-
-/* ---------- МОДАЛКИ ---------- */
 function isModalOpen(id) {
   var el = document.getElementById(id);
   return !!(el && el.classList.contains('active'));
@@ -1109,645 +998,599 @@ function safeCloseModal(id) {
   if (el) el.classList.remove('active');
 }
 
-/* ---------- УТИЛИТЫ ---------- */
-function escapeHtml(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
-  });
-}
-function formatBytes(bytes) {
-  if (!bytes || bytes < 1024) return (bytes || 0) + ' Б';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' КБ';
-  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' МБ';
-  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' ГБ';
-}
-function saveCache() { try { localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache)); } catch (e) {} }
-function saveKnownUsers() { try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {} }
-function mergeMessage(msg) {
-  if (!msg || !msg.id) return;
-  for (var i = 0; i < localMessagesCache.length; i++) {
-    var m = localMessagesCache[i];
-    if (m.id === msg.id || (msg.clientId && m.clientId && m.clientId === msg.clientId)) {
-      localMessagesCache[i] = msg; return;
-    }
-  }
-  localMessagesCache.push(msg);
-}
-function quickHash(str) {
-  if (!str) return '0';
-  var len = str.length;
-  var head = str.substring(0, 64);
-  var tail = str.substring(Math.max(0, len - 64));
-  var h = 0;
-  var sample = head + '|' + tail + '|' + len;
-  for (var i = 0; i < sample.length; i++) h = ((h << 5) - h + sample.charCodeAt(i)) | 0;
-  return len + '_' + (h >>> 0).toString(36);
-}
-function getAudioSignature(msg) { return [msg.fileType || '', msg.fileName || '', quickHash(msg.fileData || '')].join('|'); }
-function dataUrlToBlobUrl(dataUrl) {
-  var commaIdx = dataUrl.indexOf(',');
-  if (commaIdx === -1) return null;
-  var meta = dataUrl.substring(5, commaIdx);
-  var isBase64 = meta.indexOf(';base64') !== -1;
-  var mime = meta.split(';')[0] || 'audio/webm';
-  var blob;
-  if (isBase64) {
-    var b64 = dataUrl.substring(commaIdx + 1);
-    var bin = atob(b64);
-    var bytes = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    blob = new Blob([bytes], { type: mime });
-  } else {
-    var decoded = decodeURIComponent(dataUrl.substring(commaIdx + 1));
-    blob = new Blob([decoded], { type: mime });
-  }
-  return URL.createObjectURL(blob);
-}
-function getOrCreateBlobUrl(signature, fileData) {
-  if (blobUrlCache.has(signature)) return blobUrlCache.get(signature);
-  try {
-    if (fileData && fileData.indexOf('data:') === 0) {
-      var url = dataUrlToBlobUrl(fileData);
-      if (url) { blobUrlCache.set(signature, url); return url; }
-    }
-  } catch (e) {}
-  return fileData;
-}
-function getOrCreateAudioElement(msg) {
-  var existing = audioPool.get(msg.id);
-  var signature = getAudioSignature(msg);
-  if (existing && existing.signature === signature) return existing.element;
-  if (existing) {
-    try { existing.element.pause(); } catch (e) {}
-    if (existing.element.parentNode) existing.element.parentNode.removeChild(existing.element);
-    audioPool.delete(msg.id);
-  }
-  var audio = document.createElement('audio');
-  audio.controls = true;
-  audio.className = 'audio-preview';
-  audio.preload = 'metadata';
-  audio.setAttribute('controlsList', 'nodownload');
-  audio.src = getOrCreateBlobUrl(signature, msg.fileData);
-  audio.addEventListener('click', function (e) { e.stopPropagation(); });
-  audio.addEventListener('contextmenu', function (e) { e.stopPropagation(); });
-  audio.addEventListener('touchstart', function (e) { e.stopPropagation(); }, { passive: true });
-  document.getElementById('audio-pool').appendChild(audio);
-  audioPool.set(msg.id, { element: audio, signature: signature });
-  return audio;
-}
-function cleanupAudioPool(validMsgIds) {
-  var validSet = new Set(validMsgIds);
-  audioPool.forEach(function (entry, msgId) {
-    if (!validSet.has(msgId)) {
-      try { entry.element.pause(); } catch (e) {}
-      if (entry.element.parentNode) entry.element.parentNode.removeChild(entry.element);
-      audioPool.delete(msgId);
-    }
-  });
-  var usedSignatures = new Set();
-  audioPool.forEach(function (v) { usedSignatures.add(v.signature); });
-  blobUrlCache.forEach(function (url, sig) {
-    if (!usedSignatures.has(sig)) {
-      try { URL.revokeObjectURL(url); } catch (e) {}
-      blobUrlCache.delete(sig);
-    }
-  });
-}
-function pauseAllAudio() { audioPool.forEach(function (entry) { try { entry.element.pause(); } catch (e) {} }); }
-function playNotificationSound() {
-  try {
-    var audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    var osc = audioCtx.createOscillator();
-    var gain = audioCtx.createGain();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(587.33, audioCtx.currentTime);
-    osc.frequency.setValueAtTime(880, audioCtx.currentTime + 0.08);
-    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
-    osc.connect(gain); gain.connect(audioCtx.destination);
-    osc.start(); osc.stop(audioCtx.currentTime + 0.3);
-  } catch (e) {}
-}
-function updateThemeIcon(theme) {
-  var btn = document.getElementById('theme-toggle-btn');
-  if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️';
-}
-function toggleTheme() {
-  var current = document.documentElement.getAttribute('data-theme');
-  var next = current === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('app_theme', next);
-  updateThemeIcon(next);
-}
+/* ==================== AVATARS ==================== */
 
-/* ---------- СЖАТИЕ ИЗОБРАЖЕНИЙ ---------- */
-function compressImage(file, maxSize, quality, callback) {
-  if (!file || file.type.indexOf('image/') !== 0) {
-    callback(null);
-    return;
-  }
-  var reader = new FileReader();
-  reader.onload = function (e) {
-    var img = new Image();
-    img.onload = function () {
-      var canvas = document.createElement('canvas');
-      var w = img.width, h = img.height;
-      var ratio = Math.min(maxSize / w, maxSize / h, 1);
-      w = Math.round(w * ratio);
-      h = Math.round(h * ratio);
-      canvas.width = w;
-      canvas.height = h;
-      var ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
-      var isPng = file.type === 'image/png';
-      var outType = isPng ? 'image/png' : 'image/jpeg';
-      var outQuality = isPng ? undefined : (quality || 0.85);
-      try {
-        callback(canvas.toDataURL(outType, outQuality));
-      } catch (err) {
-        callback(e.target.result);
-      }
-    };
-    img.onerror = function () { callback(e.target.result); };
-    img.src = e.target.result;
-  };
-  reader.readAsDataURL(file);
-}
-
-/* ---------- МЕНЮ ЧАТА ---------- */
-function toggleChatDropdown() {
-  var menu = document.getElementById('chat-dropdown-menu');
-  if (!menu) return;
-  if (menu.classList.contains('active')) {
-    menu.classList.remove('active');
-  } else {
-    menu.classList.add('active');
-  }
-}
-function closeChatDropdown() {
-  var menu = document.getElementById('chat-dropdown-menu');
-  if (menu) menu.classList.remove('active');
-}
-document.addEventListener('click', function (e) {
-  var menu = document.getElementById('chat-dropdown-menu');
-  var dotsBtn = document.getElementById('chat-menu-dots-btn');
-  if (menu && menu.classList.contains('active')) {
-    if (!menu.contains(e.target) && e.target !== dotsBtn && !dotsBtn.contains(e.target)) {
-      menu.classList.remove('active');
-    }
-  }
-});
-
-/* ---------- АВАТАРЫ ---------- */
 function renderAvatarIntoElement(el, userObj, isOnline) {
   if (!el) return;
+  var rk = (userObj && userObj.id ? userObj.id : '') + '|' +
+           (userObj && userObj.avatar ? String(userObj.avatar).substring(0, 30) : '') + '|' +
+           (userObj && userObj.name ? userObj.name : '');
+  if (el.dataset.renderKey === rk) {
+    var ind = el.querySelector('.online-indicator');
+    if (ind) {
+      if (isOnline) ind.classList.add('visible');
+      else ind.classList.remove('visible');
+    }
+    return;
+  }
+  el.dataset.renderKey = rk;
   var indicator = el.querySelector('.online-indicator');
   Array.from(el.childNodes).forEach(function (node) {
     if (node !== indicator) el.removeChild(node);
   });
-
-  var avatarSrc = userObj && userObj.avatar;
-  if (avatarSrc) {
+  var src = userObj && userObj.avatar;
+  if (src) {
     var img = document.createElement('img');
-    img.src = avatarSrc;
+    img.src = src;
     img.onerror = function () {
       this.remove();
-      var span = document.createElement('span');
-      span.innerText = ((userObj && userObj.name) ? userObj.name.charAt(0).toUpperCase() : '?');
-      if (indicator) el.insertBefore(span, indicator); else el.appendChild(span);
+      var s = document.createElement('span');
+      s.innerText = ((userObj && userObj.name) ? userObj.name.charAt(0).toUpperCase() : '?');
+      if (indicator) el.insertBefore(s, indicator); else el.appendChild(s);
     };
     if (indicator) el.insertBefore(img, indicator); else el.appendChild(img);
   } else {
-    var span2 = document.createElement('span');
-    span2.innerText = (userObj && userObj.name ? userObj.name.charAt(0).toUpperCase() : '?');
-    if (indicator) el.insertBefore(span2, indicator); else el.appendChild(span2);
+    var s2 = document.createElement('span');
+    s2.innerText = (userObj && userObj.name ? userObj.name.charAt(0).toUpperCase() : '?');
+    if (indicator) el.insertBefore(s2, indicator); else el.appendChild(s2);
   }
-
   if (indicator) {
     if (isOnline) indicator.classList.add('visible');
     else indicator.classList.remove('visible');
   }
 }
-function fillAvatarBox(el, avatar, fallback) {
-  renderAvatarIntoElement(el, { avatar: avatar, name: fallback || '?' }, false);
+
+/* ==================== FILES ==================== */
+
+async function saveFileToIDB(key, blob, meta) {
+  await dbPut('files', {
+    key: key, blob: blob,
+    fileName: (meta && meta.fileName) || '',
+    fileType: (meta && meta.fileType) || '',
+    fileSize: (meta && meta.fileSize) || blob.size
+  });
+}
+async function getFileFromIDB(key) { return await dbGet('files', key); }
+async function deleteFileFromIDB(key) { try { await dbDelete('files', key); } catch (e) {} }
+
+async function downloadAndCacheFile(msg) {
+  if (!msg.fileUrl) return false;
+  var ex = await getFileFromIDB(msg.id);
+  if (ex) return true;
+  try {
+    var res = await fetch(msg.fileUrl);
+    if (!res.ok) return false;
+    var blob = await res.blob();
+    await saveFileToIDB(msg.id, blob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: blob.size });
+    return true;
+  } catch (e) { return false; }
 }
 
-function cacheUser(user) {
-  if (!user || !user.id || user.type === 'group') return;
-  localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar };
-  saveKnownUsers();
-}
-function getUserName(id) {
-  if (!currentUser) return 'Пользователь';
-  if (id === currentUser.id) return currentUser.name;
-  if (localKnownUsers[id]) return localKnownUsers[id].name;
-  if (activePeer && activePeer.memberDetails) {
-    var m = activePeer.memberDetails.find(function (x) { return x.id === id; });
-    if (m) return m.name;
+async function getFileUrlForMessage(msg) {
+  if (fileUrlCache.has(msg.id)) return fileUrlCache.get(msg.id);
+  var entry = await getFileFromIDB(msg.id);
+  if (entry && entry.blob) {
+    var url = URL.createObjectURL(entry.blob);
+    fileUrlCache.set(msg.id, url);
+    return url;
   }
-  return 'Пользователь';
+  return msg.fileUrl || null;
 }
-function getChatMessages(chat) {
-  if (!chat || !currentUser) return [];
-  var list;
-  if (chat.type === 'group') {
-    list = localMessagesCache.filter(function (m) { return !m.isDeleted && m.groupId === chat.id; });
-  } else {
-    list = localMessagesCache.filter(function (m) {
-      return !m.isDeleted && !m.groupId &&
-        ((m.senderId === currentUser.id && m.receiverId === chat.id) ||
-         (m.senderId === chat.id && m.receiverId === currentUser.id));
+
+/* ==================== TOMBSTONES ==================== */
+
+async function markDeleted(type, id, extra) {
+  var key = type + ':' + id;
+  if (tombstonesCache[key]) return;
+  var tomb = { type: type, id: id, at: Date.now(), fromUser: currentUser.id };
+  if (extra) Object.assign(tomb, extra);
+  tombstonesCache[key] = tomb;
+  await dbPut('tombstones', { key: key, ...tomb });
+  await applyDeleteLocally(type, id, extra);
+  syncState.pendingTombstones.push(tomb);
+  pushToServer();
+}
+
+async function applyDeleteLocally(type, id, extra) {
+  if (type === 'message') {
+    var m = messagesCache[id];
+    if (m) { m.isDeleted = true; await dbPut('messages', m); }
+    await deleteFileFromIDB(id);
+    if (fileUrlCache.has(id)) {
+      try { URL.revokeObjectURL(fileUrlCache.get(id)); } catch (e) {}
+      fileUrlCache.delete(id);
+    }
+  } else if (type === 'group') {
+    delete groupsCache[id];
+    await dbDelete('groups', id);
+  } else if (type === 'file') {
+    await deleteFileFromIDB(id);
+    if (fileUrlCache.has(id)) {
+      try { URL.revokeObjectURL(fileUrlCache.get(id)); } catch (e) {}
+      fileUrlCache.delete(id);
+    }
+  } else if (type === 'group_kick') {
+    if (extra && extra.memberId === currentUser.id) {
+      delete groupsCache[extra.groupId];
+      await dbDelete('groups', extra.groupId);
+    } else if (extra && extra.groupId && groupsCache[extra.groupId]) {
+      var g = groupsCache[extra.groupId];
+      g.members = extra.members || g.members;
+      await dbPut('groups', g);
+    }
+  } else if (type === 'chat_hide') {
+    if (extra && extra.userId === currentUser.id) {
+      if (!currentUser.hiddenDialogs) currentUser.hiddenDialogs = [];
+      if (currentUser.hiddenDialogs.indexOf(extra.peerId) === -1) {
+        currentUser.hiddenDialogs.push(extra.peerId);
+        await setMeta('profile', currentUser);
+      }
+    }
+  }
+}
+
+/* ==================== SYNC ==================== */
+
+function getMyGroupsSummary() {
+  var arr = [];
+  for (var id in groupsCache) {
+    var g = groupsCache[id];
+    if (g.isDeleted) continue;
+    if (g.members.indexOf(currentUser.id) === -1) continue;
+    arr.push({ id: g.id, members: g.members });
+  }
+  return arr;
+}
+
+function scheduleEvent(ev) {
+  if (!ev.id) ev.id = ev.payload && ev.payload.id;
+  syncState.pendingEvents.push(ev);
+  pushToServer();
+}
+
+async function pushToServer() {
+  if (!currentUser) return;
+  if (connectionState !== 'online') return;
+  if (syncState.isPushing) return;
+  if (syncState.pendingEvents.length === 0 && syncState.pendingTombstones.length === 0) return;
+  syncState.isPushing = true;
+  try {
+    var evBatch = syncState.pendingEvents.slice(0, 300);
+    var tbBatch = syncState.pendingTombstones.slice(0, 300);
+    var res = await fetch('/api/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        senderId: currentUser.id,
+        name: currentUser.name,
+        avatar: currentUser.avatar || '',
+        profile: { id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar || '' },
+        events: evBatch,
+        tombstones: tbBatch
+      })
     });
+    if (res.ok) {
+      syncState.pendingEvents = syncState.pendingEvents.slice(evBatch.length);
+      syncState.pendingTombstones = syncState.pendingTombstones.slice(tbBatch.length);
+    }
+  } catch (e) {
+    setConnectionState(navigator.onLine ? 'server-offline' : 'no-internet');
   }
-  return list.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
+  syncState.isPushing = false;
 }
+
+async function pullFromServer() {
+  if (!currentUser) return;
+  if (connectionState !== 'online') return;
+  if (syncState.isPulling) return;
+  syncState.isPulling = true;
+  try {
+    var knownTombKeys = Object.keys(tombstonesCache);
+    var res = await fetch('/api/pull', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: currentUser.id,
+        name: currentUser.name,
+        avatar: currentUser.avatar || '',
+        contacts: currentUser.contacts || [],
+        groups: getMyGroupsSummary(),
+        knownTombstones: knownTombKeys
+      })
+    });
+    var data = await res.json();
+    if (!data.success) { syncState.isPulling = false; return; }
+    var hasUpdates = false;
+    if (Array.isArray(data.tombstones)) {
+      for (var ti = 0; ti < data.tombstones.length; ti++) {
+        var t = data.tombstones[ti];
+        var key = t.type + ':' + t.id;
+        if (!tombstonesCache[key]) {
+          tombstonesCache[key] = t;
+          await dbPut('tombstones', { key: key, ...t });
+          await applyDeleteLocally(t.type, t.id, t);
+          hasUpdates = true;
+        }
+      }
+    }
+    for (var i = 0; i < data.events.length; i++) {
+      var applied = await applyRemoteEvent(data.events[i]);
+      if (applied) hasUpdates = true;
+    }
+    if (Array.isArray(data.online)) {
+      var set = new Set(data.online);
+      for (var uid in usersCache) usersCache[uid].isOnline = set.has(uid);
+      hasUpdates = true;
+    }
+    if (hasUpdates) refreshUI();
+  } catch (e) {
+    setConnectionState(navigator.onLine ? 'server-offline' : 'no-internet');
+  }
+  syncState.isPulling = false;
+}
+
+async function applyRemoteEvent(ev) {
+  if (!ev || !ev.type) return false;
+  if (ev.id) {
+    if (ev.type === 'message' && tombstonesCache['message:' + ev.id]) return false;
+    if (ev.type === 'group' && tombstonesCache['group:' + ev.id]) return false;
+    if (ev.type === 'group_update' && tombstonesCache['group:' + ev.id]) return false;
+    if (ev.type === 'file' && tombstonesCache['file:' + ev.id]) return false;
+  }
+  if (ev.type === 'message') {
+    if (messagesCache[ev.id]) return false;
+    messagesCache[ev.id] = ev;
+    await dbPut('messages', ev);
+    if (ev.fileUrl) downloadAndCacheFile(ev).catch(function () {});
+    if (activePeer && ev.senderId !== currentUser.id && mutedPeers.indexOf(activePeer.id) === -1) {
+      var isForThis = (ev.groupId && activePeer.id === ev.groupId) ||
+                      (!ev.groupId && (ev.senderId === activePeer.id || ev.receiverId === activePeer.id));
+      if (isForThis) playNotificationSound();
+    }
+    return true;
+  } else if (ev.type === 'group') {
+    if (groupsCache[ev.id]) return false;
+    groupsCache[ev.id] = ev;
+    await dbPut('groups', ev);
+    return true;
+  } else if (ev.type === 'group_update') {
+    var g = groupsCache[ev.id];
+    if (!g) {
+      if (ev.members && ev.members.indexOf(currentUser.id) === -1) return false;
+      groupsCache[ev.id] = ev;
+      await dbPut('groups', ev);
+      return true;
+    }
+    g.name = ev.name || g.name;
+    if (ev.avatar !== undefined) g.avatar = ev.avatar;
+    if (ev.members) g.members = ev.members;
+    if (ev.ownerId) g.ownerId = ev.ownerId;
+    await dbPut('groups', g);
+    return true;
+  } else if (ev.type === 'message_read') {
+    var m = messagesCache[ev.id];
+    if (m) {
+      if (m.groupId) {
+        if (!m.readBy) m.readBy = [];
+        if (m.readBy.indexOf(ev.readerId) === -1) {
+          m.readBy.push(ev.readerId);
+          await dbPut('messages', m);
+          return true;
+        }
+      } else if (!m.isRead) {
+        m.isRead = true;
+        await dbPut('messages', m);
+        return true;
+      }
+    }
+  } else if (ev.type === 'group_kick') {
+    if (ev.memberId === currentUser.id) {
+      await markDeleted('group', ev.groupId);
+      return true;
+    }
+    var gk = groupsCache[ev.groupId];
+    if (gk && ev.members) {
+      gk.members = ev.members;
+      await dbPut('groups', gk);
+      return true;
+    }
+  } else if (ev.type === 'profile') {
+    if (!ev.id || ev.id === currentUser.id) return false;
+    var u = usersCache[ev.id];
+    if (!u || (ev.updatedAt || 0) > (u.updatedAt || 0)) {
+      usersCache[ev.id] = ev;
+      await dbPut('users', ev);
+      return true;
+    }
+  } else if (ev.type === 'sync_request' && ev.toUserId === currentUser.id) {
+    await respondToSyncRequest(ev.fromUserId, ev.scope);
+  } else if (ev.type === 'sync_response' && ev.toUserId === currentUser.id) {
+    await applySyncResponse(ev.data);
+    return true;
+  } else if (ev.type === 'file_request' && ev.toUserId === currentUser.id) {
+    await respondWithFile(ev.fileId, ev.fromUserId);
+  }
+  return false;
+}
+
+async function respondToSyncRequest(toUserId, scope) {
+  var messages = [], groups = [], users = [], tombs = [];
+  for (var id in messagesCache) {
+    var m = messagesCache[id];
+    if (m.isDeleted) continue;
+    if (scope === 'all' ||
+        (scope.indexOf('chat:') === 0 && (m.senderId === toUserId || m.receiverId === toUserId)) ||
+        (scope.indexOf('group:') === 0 && m.groupId === scope.substring(6))) {
+      messages.push(m);
+    }
+  }
+  for (var gid in groupsCache) {
+    var g = groupsCache[gid];
+    if (g.isDeleted) continue;
+    if (g.members.indexOf(toUserId) !== -1) groups.push(g);
+  }
+  for (var uid in usersCache) users.push(usersCache[uid]);
+  for (var k in tombstonesCache) tombs.push(tombstonesCache[k]);
+  var chunkSize = 500;
+  var chunks = [];
+  for (var i = 0; i < messages.length; i += chunkSize) chunks.push(messages.slice(i, i + chunkSize));
+  if (chunks.length === 0) chunks.push([]);
+  for (var ci = 0; ci < chunks.length; ci++) {
+    await fetch('/api/respond-sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromUserId: currentUser.id,
+        toUserId: toUserId,
+        chunkIndex: ci,
+        totalChunks: chunks.length,
+        data: {
+          messages: chunks[ci],
+          groups: ci === 0 ? groups : [],
+          users: ci === 0 ? users : [],
+          tombstones: ci === 0 ? tombs : []
+        }
+      })
+    }).catch(function () {});
+  }
+}
+
+async function applySyncResponse(data) {
+  if (!data) return;
+  (data.messages || []).forEach(async function (m) {
+    if (tombstonesCache['message:' + m.id]) return;
+    if (!messagesCache[m.id]) {
+      messagesCache[m.id] = m;
+      await dbPut('messages', m);
+      if (m.fileUrl) downloadAndCacheFile(m).catch(function () {});
+    }
+  });
+  (data.groups || []).forEach(async function (g) {
+    if (tombstonesCache['group:' + g.id]) return;
+    if (!groupsCache[g.id]) { groupsCache[g.id] = g; await dbPut('groups', g); }
+  });
+  (data.users || []).forEach(async function (u) {
+    if (!usersCache[u.id] || (u.updatedAt || 0) > (usersCache[u.id].updatedAt || 0)) {
+      usersCache[u.id] = u;
+      await dbPut('users', u);
+    }
+  });
+  (data.tombstones || []).forEach(async function (t) {
+    var key = t.type + ':' + t.id;
+    if (!tombstonesCache[key]) {
+      tombstonesCache[key] = t;
+      await dbPut('tombstones', { key: key, ...t });
+      await applyDeleteLocally(t.type, t.id, t);
+    }
+  });
+}
+
+async function respondWithFile(fileId, toUserId) {
+  var entry = await getFileFromIDB(fileId);
+  if (!entry || !entry.blob) return;
+  try {
+    var file = new File([entry.blob], entry.fileName || 'file', { type: entry.fileType || 'application/octet-stream' });
+    var fileUrl = await uploadFileInChunks(file);
+    scheduleEvent({
+      type: 'file', id: fileId,
+      fileName: entry.fileName, fileType: entry.fileType,
+      fileSize: entry.fileSize, fileUrl: fileUrl, ownerId: currentUser.id
+    });
+  } catch (e) {}
+}
+
+/* ==================== SYNC LOOP ==================== */
+
+function startSyncLoop() {
+  // Проверка здоровья сервера
+  setInterval(async function () {
+    if (!currentUser) return;
+    var wasOnline = connectionState === 'online';
+    var ok = await checkServerHealth();
+    if (ok) {
+      if (!wasOnline) {
+        // Только что подключились — пушим и тянем
+        pushToServer();
+        pullFromServer();
+      }
+    }
+  }, 4000);
+  
+  // Пинг + пуш + пул
+  setInterval(async function () {
+    if (!currentUser) return;
+    if (connectionState !== 'online') return;
+    try {
+      await fetch('/api/ping', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar || '' })
+      });
+    } catch (e) {}
+    await pushToServer();
+    await pullFromServer();
+  }, 2000);
+}
+
+/* ==================== REGISTER (только через сервер) ==================== */
+
+async function registerUser() {
+  if (busyButtons['login-btn']) return;
+  var name = document.getElementById('auth-name').value.trim();
+  var errBox = document.getElementById('auth-error');
+  if (!name) { errBox.innerText = 'Введите имя'; errBox.style.display = 'block'; return; }
+  
+  // Проверяем соединение с сервером
+  if (connectionState !== 'online') {
+    errBox.innerText = connectionState === 'no-internet'
+      ? 'Нет подключения к интернету'
+      : 'Нет соединения с сервером';
+    errBox.style.display = 'block';
+    // Запускаем проверку чаще
+    checkServerHealth();
+    return;
+  }
+  
+  if (!lockButton('login-btn', 5000)) return;
+  try {
+    var res = await fetch('/api/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name })
+    });
+    if (!res.ok) {
+      var err = await res.json().catch(function () { return {}; });
+      errBox.innerText = err.error || 'Ошибка регистрации';
+      errBox.style.display = 'block';
+      return;
+    }
+    var data = await res.json();
+    if (!data.success) {
+      errBox.innerText = data.error || 'Ошибка';
+      errBox.style.display = 'block';
+      return;
+    }
+    // Профиль подтверждён сервером
+    currentUser = {
+      id: data.user.id,
+      name: data.user.name,
+      avatar: data.user.avatar || '',
+      contacts: [],
+      blockedContacts: [],
+      hiddenDialogs: [],
+      updatedAt: data.user.updatedAt || Date.now()
+    };
+    metaCache['profile'] = currentUser;
+    await dbPut('meta', { key: 'profile', value: currentUser });
+    await dbPut('users', currentUser);
+    startApp();
+  } catch (e) {
+    errBox.innerText = 'Сервер недоступен';
+    errBox.style.display = 'block';
+    setConnectionState(navigator.onLine ? 'server-offline' : 'no-internet');
+  }
+}
+
+async function startApp() {
+  document.getElementById('auth-screen').classList.remove('active');
+  document.getElementById('app-screen').classList.add('active');
+  updateMyProfileUI();
+  refreshUI();
+  startSyncLoop();
+  
+  // Запрос синхронизации у контактов
+  setTimeout(function () {
+    if (currentUser && currentUser.contacts && currentUser.contacts.length > 0 && connectionState === 'online') {
+      currentUser.contacts.forEach(function (cid) {
+        fetch('/api/request-sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fromUserId: currentUser.id, toUserId: cid, scope: 'all' })
+        }).catch(function () {});
+      });
+    }
+  }, 2000);
+}
+
 function updateMyProfileUI() {
+  if (!currentUser) return;
   document.getElementById('my-display-name').innerText = currentUser.name;
   document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
-/* ---------- РЕГИСТРАЦИЯ / СТАРТ ---------- */
-async function registerUser() {
-  if (busyButtons['login-btn']) return;
-  var nameInput = document.getElementById('auth-name');
-  var name = nameInput.value.trim();
-  var errBox = document.getElementById('auth-error');
-  if (!name) { errBox.innerText = 'Введите ваше имя.'; errBox.style.display = 'block'; return; }
-  if (!lockButton('login-btn', 3000)) return;
-  try {
-    var res = await fetch('/api/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
-    var data = await res.json();
-    if (!data.success) { errBox.innerText = data.error || 'Ошибка входа'; errBox.style.display = 'block'; }
-    else {
-      currentUser = data.user;
-      localStorage.setItem('messenger_user', JSON.stringify(currentUser));
-      startApp();
-    }
-  } catch (e) { errBox.innerText = 'Ошибка подключения к серверу.'; errBox.style.display = 'block'; }
-}
-function startApp() {
-  document.getElementById('auth-screen').classList.remove('active');
-  document.getElementById('app-screen').classList.add('active');
-  updateMyProfileUI();
-  sendPing();
-  loadDialogs();
-  if (dialogsPollingTimer) clearInterval(dialogsPollingTimer);
-  dialogsPollingTimer = setInterval(function () {
-    if (currentUser && !isRecording && !isUploading) {
-      sendPing();
-      loadDialogsQuiet();
-      if (activePeer) {
-        loadMessagesQuiet();
-        if (activePeer.type === 'group') refreshGroupInfo();
-        else refreshActivePeerStatus();
-      }
-    }
-  }, 2000);
-  window.addEventListener('online', resendPendingMessages);
-}
-async function resendPendingMessages() {
+/* ==================== UI ==================== */
+
+function refreshUI() {
   if (!currentUser) return;
-  var pending = localMessagesCache.filter(function (m) { return m.isPending && m.senderId === currentUser.id; });
-  for (var i = 0; i < pending.length; i++) {
-    var pm = pending[i];
-    localMessagesCache = localMessagesCache.filter(function (m) { return m.clientId !== pm.clientId; });
-    saveCache();
-    if (activePeer && ((activePeer.type === 'group' && pm.groupId === activePeer.id) || (activePeer.type !== 'group' && pm.receiverId === activePeer.id))) {
-      renderMessagesContainer(getChatMessages(activePeer));
-    }
-    try {
-      var res = await fetch('/api/messages/send', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          senderId: pm.senderId, receiverId: pm.receiverId, groupId: pm.groupId,
-          text: pm.text, fileData: pm.fileData, fileName: pm.fileName, fileType: pm.fileType, clientId: pm.clientId
-        })
-      });
-      if (res.ok) {
-        var data = await res.json();
-        if (data && data.message) {
-          var rm = Object.assign({}, data.message); rm.isPending = false;
-          mergeMessage(rm); saveCache();
-          if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
-        }
-      }
-    } catch (e) {}
-  }
-}
-async function sendPing() {
-  if (!currentUser) return;
-  try {
-    var knownList = [];
-    for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) knownList.push(localKnownUsers[k]);
-    var res = await fetch('/api/ping', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar || '',
-        contacts: currentUser.contacts || [], knownUsers: knownList
-      })
-    });
-    var data = await res.json();
-    if (data.success && data.user) {
-      var serverUser = data.user;
-      var changed = false;
-      if (serverUser.id !== currentUser.id) {
-        currentUser.id = serverUser.id;
-        changed = true;
-      }
-      if (serverUser.avatar !== undefined && serverUser.avatar !== currentUser.avatar) {
-        currentUser.avatar = serverUser.avatar;
-        changed = true;
-      }
-      if (serverUser.name && serverUser.name !== currentUser.name) {
-        currentUser.name = serverUser.name;
-        changed = true;
-      }
-      if (serverUser.blockedContacts) {
-        currentUser.blockedContacts = serverUser.blockedContacts;
-      }
-      if (changed) {
-        localStorage.setItem('messenger_user', JSON.stringify(currentUser));
-        updateMyProfileUI();
-      }
-    }
-  } catch (e) {}
-}
-async function refreshActivePeerStatus() {
-  if (!activePeer || activePeer.type === 'group') return;
-  try {
-    var res = await fetch('/api/users/' + activePeer.id);
-    if (res.ok) {
-      var info = await res.json();
-      activePeer.isOnline = info.isOnline;
-      activePeer.name = info.name;
-      var avatarChanged = activePeer.avatar !== info.avatar;
-      activePeer.avatar = info.avatar;
-      var statusEl = document.getElementById('active-peer-status');
-      if (info.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
-      else { statusEl.innerText = 'не в сети'; statusEl.style.color = 'var(--text-muted)'; }
-      renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), activePeer, info.isOnline);
-      if (avatarChanged) { lastDialogsHash = ''; loadDialogsQuiet(); }
-    }
-  } catch (e) {}
+  renderChatListFromCache();
+  if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
 }
 
-/* ---------- МОЙ ПРОФИЛЬ ---------- */
-function openMyProfile() {
-  if (isModalOpen('my-profile-modal')) return;
-  draftAvatar = null;
-  document.getElementById('edit-my-name-input').value = currentUser.name;
-  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
-  document.getElementById('my-profile-name-view').innerText = currentUser.name;
-  document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
-  document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
-  safeOpenModal('my-profile-modal');
-}
-function closeMyProfile() {
-  draftAvatar = null;
-  safeCloseModal('my-profile-modal');
-}
-function triggerAvatarInput() { var i = document.getElementById('avatar-file-input'); i.value = ''; i.click(); }
-function handleAvatarSelect(e) {
-  var file = e.target.files[0];
-  if (!file) return;
-  if (file.size > 10 * 1024 * 1024) {
-    alert('Файл слишком большой. Максимум 10 МБ.');
-    return;
+function renderChatListFromCache() {
+  if (!currentUser) return;
+  var list = [];
+  var peerIds = new Set();
+  var hidden = new Set(currentUser.hiddenDialogs || []);
+  (currentUser.contacts || []).forEach(function (c) { peerIds.add(c); });
+  for (var mid in messagesCache) {
+    var m = messagesCache[mid];
+    if (m.isDeleted || m.groupId) continue;
+    if (m.senderId === currentUser.id) peerIds.add(m.receiverId);
+    if (m.receiverId === currentUser.id) peerIds.add(m.senderId);
   }
-  compressImage(file, 200, 0.85, function (compressed) {
-    if (!compressed) { alert('Не удалось обработать изображение.'); return; }
-    draftAvatar = compressed;
-    renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { avatar: draftAvatar, name: currentUser.name }, true);
-    document.getElementById('remove-avatar-link-btn').style.display = 'block';
+  peerIds.forEach(function (pid) {
+    if (pid === currentUser.id || !pid) return;
+    if (hidden.has(pid)) return;
+    var u = usersCache[pid] || { id: pid, name: 'Пользователь', avatar: '' };
+    var lastTs = 0;
+    for (var m2id in messagesCache) {
+      var m2 = messagesCache[m2id];
+      if (m2.isDeleted) continue;
+      if ((m2.senderId === pid && m2.receiverId === currentUser.id) ||
+          (m2.senderId === currentUser.id && m2.receiverId === pid)) {
+        lastTs = Math.max(lastTs, m2.ts || 0);
+      }
+    }
+    list.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar, isOnline: u.isOnline, lastTs });
   });
-}
-function removeMyAvatar() {
-  draftAvatar = '';
-  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { avatar: '', name: currentUser.name }, true);
-  document.getElementById('remove-avatar-link-btn').style.display = 'none';
-}
-async function saveMyProfileChanges() {
-  if (!lockButton('save-my-profile-btn', 3000)) return;
-  var newName = document.getElementById('edit-my-name-input').value.trim();
-  if (newName) currentUser.name = newName;
-  if (draftAvatar !== null) {
-    currentUser.avatar = draftAvatar;
-    draftAvatar = null;
-  }
-  try {
-    var res = await fetch('/api/profile/update', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar })
-    });
-    var data = await res.json();
-    if (data.success) {
-      currentUser = data.user;
-      localStorage.setItem('messenger_user', JSON.stringify(currentUser));
-      updateMyProfileUI();
-      lastDialogsHash = '';
-      await loadDialogs();
-      closeMyProfile();
-    } else {
-      alert(data.error || 'Не удалось обновить профиль');
+  for (var gid in groupsCache) {
+    var g = groupsCache[gid];
+    if (g.isDeleted) continue;
+    if (g.members.indexOf(currentUser.id) === -1) continue;
+    var glastTs = 0;
+    for (var m3id in messagesCache) {
+      var m3 = messagesCache[m3id];
+      if (m3.isDeleted || m3.groupId !== gid) continue;
+      glastTs = Math.max(glastTs, m3.ts || 0);
     }
-  } catch (e) { alert('Не удалось обновить профиль'); }
+    list.push({
+      id: g.id, type: 'group', name: g.name, avatar: g.avatar,
+      members: g.members, ownerId: g.ownerId, memberCount: g.members.length, lastTs: glastTs
+    });
+  }
+  list.sort(function (a, b) { return (b.lastTs || 0) - (a.lastTs || 0); });
+  renderChatList(list);
 }
 
-/* ---------- ПРОФИЛЬ СОБЕСЕДНИКА ---------- */
-function openPeerProfile() {
-  if (!activePeer) return;
-  if (activePeer.type === 'group') { openGroupProfile(); return; }
-  profileTargetId = activePeer.id;
-  if (isModalOpen('peer-profile-modal')) return;
-  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
-  document.getElementById('peer-profile-name-view').innerText = activePeer.name;
-  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
-  updatePeerProfileButtons(activePeer);
-  safeOpenModal('peer-profile-modal');
-}
-function updatePeerProfileButtons(user) {
-  var blockBtn = document.getElementById('block-peer-btn');
-  var isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(user.id) !== -1;
-  blockBtn.innerText = isBlocked ? 'Разблокировать' : 'Заблокировать';
-  blockBtn.className = isBlocked ? 'btn btn-secondary' : 'btn btn-danger';
-  var muteBtn = document.getElementById('mute-peer-btn');
-  var isMuted = mutedPeers.indexOf(user.id) !== -1;
-  muteBtn.innerText = isMuted ? 'Включить звуковой сигнал' : 'Выключить звуковой сигнал';
-  muteBtn.className = isMuted ? 'btn' : 'btn btn-secondary';
-}
-function openMemberProfile(member) {
-  profileTargetId = member.id;
-  if (isModalOpen('peer-profile-modal')) return;
-  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, member.isOnline);
-  document.getElementById('peer-profile-name-view').innerText = member.name;
-  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + member.id;
-  updatePeerProfileButtons(member);
-  safeOpenModal('peer-profile-modal');
-}
-function closePeerProfile() { safeCloseModal('peer-profile-modal'); }
-function toggleMutePeer() {
-  if (!profileTargetId) return;
-  var index = mutedPeers.indexOf(profileTargetId);
-  if (index > -1) { mutedPeers.splice(index, 1); } else { mutedPeers.push(profileTargetId); }
-  localStorage.setItem('messenger_muted_peers', JSON.stringify(mutedPeers));
-  var user = { id: profileTargetId };
-  updatePeerProfileButtons(user);
-}
-async function toggleBlockPeer() {
-  if (!profileTargetId) return;
-  if (!lockButton('block-peer-btn', 2000)) return;
-  var isBlocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(profileTargetId) !== -1;
-  var nextBlock = !isBlocked;
-  try {
-    var res = await fetch('/api/users/block', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUser.id, peerId: profileTargetId, block: nextBlock })
-    });
-    var data = await res.json();
-    if (data.success) {
-      currentUser.blockedContacts = data.blockedContacts;
-      localStorage.setItem('messenger_user', JSON.stringify(currentUser));
-      closePeerProfile();
-    }
-  } catch (e) { alert('Ошибка при изменении статуса блокировки'); }
-}
-
-/* ---------- МЕНЮ ЧАТА ОБНОВЛЕНИЕ ---------- */
-function updateChatMenu() {
-  var menu = document.getElementById('chat-dropdown-menu');
-  if (activePeer && activePeer.type === 'group') {
-    menu.innerHTML =
-      '<button class="menu-item" onclick="openGroupProfile()">Профиль группы</button>' +
-      '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button>' +
-      '<button class="menu-item danger" onclick="leaveGroup()">Покинуть группу</button>';
-  } else {
-    menu.innerHTML =
-      '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button>' +
-      '<button class="menu-item danger" onclick="deleteCurrentChat()">Удалить чат</button>';
-  }
-}
-async function clearChatHistory() {
-  closeChatDropdown();
-  if (!activePeer || !confirm('Очистить всю историю этого чата?')) return;
-  var isGroup = activePeer.type === 'group';
-  try {
-    await fetch('/api/chat/clear', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(isGroup ? { userId: currentUser.id, groupId: activePeer.id } : { userId: currentUser.id, peerId: activePeer.id })
-    });
-    getChatMessages(activePeer).forEach(function (m) { m.isDeleted = true; });
-    saveCache(); lastMessagesHash = ''; loadMessages();
-  } catch (e) { alert('Не удалось очистить историю'); }
-}
-async function deleteCurrentChat() {
-  closeChatDropdown();
-  if (!activePeer || !confirm('Удалить чат? Он исчезнет из списка, пока вы снова не напишете этому человеку.')) return;
-  try {
-    await fetch('/api/chat/hide', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id })
-    });
-    resetActiveChat(); lastDialogsHash = ''; loadDialogs();
-  } catch (e) { alert('Не удалось удалить чат'); }
-}
-function resetActiveChat() {
-  pauseAllAudio(); cancelVoiceAttachment(); cancelAttachment(); closeMobileChat(); activePeer = null;
-  document.getElementById('input-bar').style.display = 'none';
-  document.getElementById('active-peer-name').innerText = 'Выберите чат';
-  document.getElementById('active-peer-status').innerText = 'нажмите для профиля';
-  document.getElementById('messages-container').innerHTML = '<div class="empty-state">Выберите диалог слева или найдите пользователя в поиске</div>';
-}
-
-/* ---------- ДИАЛОГИ ---------- */
-async function loadDialogs() {
-  if (document.getElementById('search-input').value.trim()) return;
-  try {
-    var res = await fetch('/api/dialogs/' + currentUser.id);
-    var dialogs = await res.json();
-    dialogs.forEach(function (d) { cacheUser(d); });
-    lastDialogsHash = JSON.stringify(dialogs);
-    renderChatList(dialogs);
-  } catch (e) {
-    var fallback = [];
-    for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
-      var u = localKnownUsers[k];
-      fallback.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: false, lastTs: 0 });
-    }
-    if (fallback.length) renderChatList(fallback);
-  }
-}
-async function loadDialogsQuiet() {
-  if (document.getElementById('search-input').value.trim()) return;
-  try {
-    var res = await fetch('/api/dialogs/' + currentUser.id);
-    var dialogs = await res.json();
-    dialogs.forEach(function (d) { cacheUser(d); });
-    var currentHash = JSON.stringify(dialogs.map(function (d) {
-      return {
-        id: d.id,
-        name: d.name,
-        avatarSig: d.avatar ? quickHash(d.avatar) : '',
-        isOnline: d.isOnline,
-        lastTs: d.lastTs,
-        memberCount: d.memberCount
-      };
-    }));
-    if (currentHash !== lastDialogsHash) {
-      lastDialogsHash = currentHash;
-      renderChatList(dialogs);
-    }
-  } catch (e) {}
-}
-async function onSearchInput() {
-  var q = document.getElementById('search-input').value.trim();
-  var clearBtn = document.getElementById('clear-search-btn');
-  if (!q) {
-    clearBtn.style.display = 'none';
-    lastDialogsHash = '';
-    loadDialogs();
-    return;
-  }
-  clearBtn.style.display = 'block';
-  try {
-    var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
-    var users = await res.json();
-    users.forEach(function (u) { cacheUser(u); });
-    renderChatList(users.filter(function (u) { return u.id !== currentUser.id; }));
-  } catch (e) {
-    var ql = q.toLowerCase();
-    var found = [];
-    for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
-      var u = localKnownUsers[k];
-      if ((u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
-        found.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: false });
-      }
-    }
-    renderChatList(found.filter(function (u) { return u.id !== currentUser.id; }));
-  }
-}
-function clearSearch() {
-  document.getElementById('search-input').value = '';
-  document.getElementById('clear-search-btn').style.display = 'none';
-  lastDialogsHash = '';
-  loadDialogs();
-}
 function renderChatList(list) {
   var container = document.getElementById('chat-list');
   var currentActiveId = activePeer ? activePeer.id : null;
+  var currentActiveType = activePeer ? (activePeer.type || 'user') : null;
   container.innerHTML = '';
   if (!list || list.length === 0) {
-    container.innerHTML = '<div style="padding:15px; color:var(--text-muted); font-size:12px; text-align:center;">Ничего не найдено</div>';
+    container.innerHTML = '<div style="padding:15px; color:var(--text-muted); font-size:12px; text-align:center;">Пусто</div>';
     return;
   }
   list.forEach(function (item) {
     var isGroup = item.type === 'group';
     var div = document.createElement('div');
-    div.className = 'chat-item ' + (currentActiveId === item.id ? 'active' : '');
+    var isActive = currentActiveId === item.id && currentActiveType === (item.type || 'user');
+    div.className = 'chat-item ' + (isActive ? 'active' : '');
     div.onclick = function () { openChat(item); };
-    var avatarId = 'chat_av_' + item.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    var avatarId = 'chat_av_' + (isGroup ? 'grp_' : 'usr_') + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     var subtitle;
-    if (isGroup) subtitle = '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || (item.members ? item.members.length : 0)) + ' участников</span>';
+    if (isGroup) subtitle = '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || 0) + '</span>';
     else subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
     div.innerHTML =
       '<div class="avatar-circle" id="' + avatarId + '">' +
@@ -1758,118 +1601,39 @@ function renderChatList(list) {
         '<div style="font-size:11px;">' + subtitle + '</div>' +
       '</div>';
     container.appendChild(div);
-    var avEl = document.getElementById(avatarId);
-    if (isGroup) {
-      renderAvatarIntoElement(avEl, { avatar: item.avatar, name: item.name }, false);
-    } else {
-      renderAvatarIntoElement(avEl, item, item.isOnline);
-    }
+    renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   });
 }
 
-/* ---------- ОТКРЫТИЕ ЧАТА ---------- */
-function openChat(peer) {
-  pauseAllAudio();
-  cancelVoiceAttachment();
-  if (!peer.type) peer.type = 'user';
-  activePeer = peer;
-  lastMessagesHash = '';
-  document.getElementById('active-peer-name').innerText = peer.name;
-  var statusEl = document.getElementById('active-peer-status');
-  if (peer.type === 'group') {
-    statusEl.innerText = (peer.memberCount || (peer.members ? peer.members.length : 0)) + ' участников';
-    statusEl.style.color = 'var(--text-muted)';
-    renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { name: peer.name, avatar: peer.avatar }, false);
-  } else {
-    if (peer.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
-    else { statusEl.innerText = 'не в сети'; statusEl.style.color = 'var(--text-muted)'; }
-    renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), peer, peer.isOnline);
-    if (!currentUser.contacts) currentUser.contacts = [];
-    if (currentUser.contacts.indexOf(peer.id) === -1) {
-      currentUser.contacts.push(peer.id);
-      localStorage.setItem('messenger_user', JSON.stringify(currentUser));
+function getChatMessages(chat) {
+  if (!chat || !currentUser) return [];
+  var list = [];
+  for (var id in messagesCache) {
+    var m = messagesCache[id];
+    if (m.isDeleted) continue;
+    if (chat.type === 'group') {
+      if (m.groupId === chat.id) list.push(m);
+    } else {
+      if (!m.groupId &&
+          ((m.senderId === currentUser.id && m.receiverId === chat.id) ||
+           (m.senderId === chat.id && m.receiverId === currentUser.id))) list.push(m);
     }
   }
-  document.getElementById('input-bar').style.display = 'flex';
-  updateChatMenu();
-  document.querySelectorAll('.chat-item').forEach(function (el) { el.classList.remove('active'); });
-  if (window.innerWidth <= 600) {
-    document.getElementById('app-screen').classList.add('app-mobile-chat');
-    document.getElementById('back-to-list-btn').style.display = 'block';
-  }
-  loadMessages();
-  if (peer.type === 'group') refreshGroupInfo();
-}
-function closeMobileChat() {
-  pauseAllAudio();
-  document.getElementById('app-screen').classList.remove('app-mobile-chat');
-}
-function msgFetchUrl() {
-  return activePeer.type === 'group'
-    ? '/api/messages/group/' + activePeer.id + '?userId=' + encodeURIComponent(currentUser.id)
-    : '/api/messages/' + currentUser.id + '/' + activePeer.id;
-}
-async function loadMessages() {
-  if (!activePeer) return;
-  try {
-    var res = await fetch(msgFetchUrl());
-    var messages = await res.json();
-    messages.forEach(mergeMessage);
-    saveCache();
-    renderMessagesContainer(getChatMessages(activePeer));
-    checkVisibleMessages();
-  } catch (e) { renderMessagesContainer(getChatMessages(activePeer)); }
-}
-async function loadMessagesQuiet() {
-  if (!activePeer) return;
-  try {
-    var res = await fetch(msgFetchUrl());
-    var messages = await res.json();
-    var hasNewMsg = false;
-    messages.forEach(function (msg) {
-      var known = localMessagesCache.some(function (m) { return m.id === msg.id || (msg.clientId && m.clientId === msg.clientId); });
-      if (!known && msg.senderId !== currentUser.id) hasNewMsg = true;
-      mergeMessage(msg);
-    });
-    saveCache();
-    var peerMsgs = getChatMessages(activePeer);
-    var currentHash = JSON.stringify(peerMsgs.map(function (m) { return m.id + '_' + m.isRead + '_' + (m.readBy ? m.readBy.length : 0) + '_' + m.isDeleted; }));
-    if (currentHash !== lastMessagesHash) {
-      if (hasNewMsg && lastMessagesHash !== '' && mutedPeers.indexOf(activePeer.id) === -1) playNotificationSound();
-      lastMessagesHash = currentHash;
-      renderMessagesContainer(peerMsgs);
-      checkVisibleMessages();
-    }
-  } catch (e) {}
-}
-function openImageViewer(src) {
-  if (document.getElementById('image-viewer-modal').classList.contains('active')) return;
-  document.getElementById('full-screen-img').src = src;
-  document.getElementById('image-viewer-modal').classList.add('active');
-}
-function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
-function isGroupMsgRead(m) {
-  if (!activePeer || activePeer.type !== 'group') return m.isRead;
-  var others = (activePeer.members || []).filter(function (x) { return x !== currentUser.id; });
-  var rb = (m.readBy || []).filter(function (x) { return x !== currentUser.id; });
-  return others.length > 0 && rb.length >= others.length;
+  return list.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
 }
 
-/* ---------- РЕНДЕР СООБЩЕНИЙ ---------- */
 function renderMessagesContainer(messages) {
   var container = document.getElementById('messages-container');
-  var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
+  var isAtBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
   container.innerHTML = '';
   if (!messages || messages.length === 0) {
-    cleanupAudioPool([]);
-    container.innerHTML = '<div class="empty-state">Нет сообщений. Напишите первыми!</div>';
+    container.innerHTML = '<div class="empty-state">Нет сообщений</div>';
     return;
   }
   var isGroup = activePeer && activePeer.type === 'group';
-  var validIds = [];
   messages.forEach(function (m) {
     var div = document.createElement('div');
-    div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '') + (m.isPending ? ' pending' : '');
+    div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '');
     div.setAttribute('data-msg-id', m.id);
     div.setAttribute('data-sender-id', m.senderId);
     div.oncontextmenu = function (e) {
@@ -1884,107 +1648,283 @@ function renderMessagesContainer(messages) {
     div.ontouchmove = function () { clearTimeout(longTouchTimer); };
     var html = '';
     if (isGroup && m.senderId !== currentUser.id) {
-      html += '<div class="msg-sender">' + escapeHtml(getUserName(m.senderId)) + '</div>';
+      var uname = usersCache[m.senderId] ? usersCache[m.senderId].name : 'Пользователь';
+      html += '<div class="msg-sender">' + escapeHtml(uname) + '</div>';
     }
     if (m.text) html += '<div>' + escapeHtml(m.text) + '</div>';
-    var fileType = m.fileType || '';
-    
-    if (m.fileUrl) {
-      // Файл с сервера (видео/большие файлы, загруженные чанками)
-      if (fileType.indexOf('image/') === 0) {
-        html += '<img src="' + m.fileUrl + '" class="media-preview" data-full="1">';
-      } else if (fileType.indexOf('video/') === 0) {
-        html += '<video src="' + m.fileUrl + '" controls class="video-preview" preload="metadata"></video>';
-      } else if (fileType.indexOf('audio/') === 0) {
-        html += '<audio src="' + m.fileUrl + '" controls class="audio-preview" preload="metadata"></audio>';
-      } else {
-        html += '<a class="file-link" href="' + m.fileUrl + '" download="' + escapeHtml(m.fileName || 'file') + '" target="_blank">📁 ' + escapeHtml(m.fileName || 'Файл') + (m.fileSize ? ' (' + formatBytes(m.fileSize) + ')' : '') + '</a>';
-      }
-    } else if (m.fileData) {
-      if (fileType.indexOf('image/') === 0) {
-        html += '<img src="' + m.fileData + '" class="media-preview" data-full="1">';
-      } else if (fileType.indexOf('video/') === 0) {
-        html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
-      } else if (fileType.indexOf('audio/') === 0) {
-        html += '<div class="audio-slot" data-audio-msg-id="' + m.id + '"></div>';
-        validIds.push(m.id);
-      } else {
-        html += '<a class="file-link" data-download="1">📁 ' + escapeHtml(m.fileName || 'Файл') + '</a>';
-      }
+    var ft = m.fileType || '';
+    if (m.fileData) {
+      if (ft.indexOf('image/') === 0) html += '<img src="' + m.fileData + '" class="media-preview" data-full="1">';
+      else if (ft.indexOf('video/') === 0) html += '<video src="' + m.fileData + '" controls class="video-preview"></video>';
+      else if (ft.indexOf('audio/') === 0) html += '<audio src="' + m.fileData + '" controls class="audio-preview"></audio>';
+      else html += '<a class="file-link" href="' + m.fileData + '" download="' + escapeHtml(m.fileName || 'file') + '">📁 ' + escapeHtml(m.fileName || 'Файл') + '</a>';
+    } else if (m.fileUrl) {
+      html += '<div data-file-url-msg-id="' + m.id + '"></div>';
     }
-    
-    var ticksHtml = '';
+    var ticks = '';
     if (m.senderId === currentUser.id) {
-      var read = isGroupMsgRead(m);
-      var isReadClass = read ? 'ticks read' : 'ticks';
-      var ticksSymbol = m.isPending ? '🕐' : (read ? '✓✓' : '✓');
-      ticksHtml = '<span class="' + isReadClass + '">' + ticksSymbol + '</span>';
+      var read = m.isRead;
+      if (isGroup && activePeer && activePeer.members) {
+        var others = activePeer.members.filter(function (x) { return x !== currentUser.id; });
+        var rb = (m.readBy || []).filter(function (x) { return x !== currentUser.id; });
+        read = others.length > 0 && rb.length >= others.length;
+      }
+      ticks = '<span class="ticks' + (read ? ' read' : '') + '">' + (read ? '✓✓' : '✓') + '</span>';
     }
-    html += '<div class="msg-footer"><span>' + escapeHtml(m.timestamp || '') + '</span>' + ticksHtml + '</div>';
+    html += '<div class="msg-footer"><span>' + escapeHtml(m.timestamp || '') + '</span>' + ticks + '</div>';
     div.innerHTML = html;
+    var placeholder = div.querySelector('[data-file-url-msg-id]');
+    if (placeholder) loadFileIntoElement(m, placeholder);
     var imgEl = div.querySelector('img[data-full]');
-    if (imgEl) imgEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(m.fileUrl || m.fileData); });
-    var dl = div.querySelector('a[data-download]');
-    if (dl) dl.addEventListener('click', function (e) { e.stopPropagation(); downloadData(m.fileData, m.fileName); });
-    var slot = div.querySelector('.audio-slot');
-    if (slot) slot.replaceWith(getOrCreateAudioElement(m));
+    if (imgEl) imgEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(imgEl.src); });
     container.appendChild(div);
   });
-  cleanupAudioPool(validIds);
-  if (isScrolledToBottom) container.scrollTop = container.scrollHeight;
+  if (isAtBottom) container.scrollTop = container.scrollHeight;
 }
-function downloadData(data, name) {
-  if (!data) return;
-  var a = document.createElement('a');
-  a.href = data; a.download = name || 'download';
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-}
-function checkVisibleMessages() {
-  if (visibleMsgDebounce) clearTimeout(visibleMsgDebounce);
-  visibleMsgDebounce = setTimeout(function () { doCheckVisibleMessages(); }, 300);
-}
-function doCheckVisibleMessages() {
-  if (!activePeer) return;
-  var container = document.getElementById('messages-container');
-  var msgElements = container.querySelectorAll('.msg');
-  var containerRect = container.getBoundingClientRect();
-  var isGroup = activePeer.type === 'group';
-  var unreadMsgIds = [];
-  msgElements.forEach(function (el) {
-    var senderId = el.getAttribute('data-sender-id');
-    var msgId = el.getAttribute('data-msg-id');
-    if (senderId === currentUser.id || msgId.indexOf('tmp_') === 0 || msgId.indexOf('cid_') === 0) return;
-    var rect = el.getBoundingClientRect();
-    if (rect.top >= containerRect.top && rect.bottom <= containerRect.bottom) {
-      var msgObj = localMessagesCache.find(function (m) { return m.id === msgId; });
-      if (!msgObj || msgObj.isPending) return;
-      if (isGroup) {
-        if (!msgObj.readBy) msgObj.readBy = [];
-        if (msgObj.readBy.indexOf(currentUser.id) === -1) { msgObj.readBy.push(currentUser.id); unreadMsgIds.push(msgId); }
-      } else if (!msgObj.isRead) { msgObj.isRead = true; unreadMsgIds.push(msgId); }
-    }
-  });
-  if (unreadMsgIds.length > 0) {
-    saveCache();
-    fetch('/api/messages/read', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ msgIds: unreadMsgIds, userId: currentUser.id })
-    }).catch(function () {});
+
+async function loadFileIntoElement(msg, placeholder) {
+  var entry = await getFileFromIDB(msg.id);
+  if (entry && entry.blob) {
+    var url = URL.createObjectURL(entry.blob);
+    fileUrlCache.set(msg.id, url);
+    renderFileElement(placeholder, msg, url);
+    return;
+  }
+  var ok = false;
+  try { var head = await fetch(msg.fileUrl, { method: 'HEAD' }); ok = head.ok; } catch (e) {}
+  if (ok) {
+    renderFileElement(placeholder, msg, msg.fileUrl);
+    downloadAndCacheFile(msg).then(function (saved) {
+      if (saved) {
+        getFileUrlForMessage(msg).then(function (newUrl) {
+          if (newUrl && newUrl !== msg.fileUrl) renderFileElement(placeholder, msg, newUrl);
+        });
+      }
+    });
+  } else {
+    placeholder.outerHTML = '<div class="file-placeholder">⚠️ Файл недоступен</div>';
   }
 }
-function openMsgActions(msg, element) {
-  if (msg.isPending) return;
+
+function renderFileElement(placeholder, msg, url) {
+  var ft = msg.fileType || '';
+  var html = '';
+  if (ft.indexOf('image/') === 0) html = '<img src="' + url + '" class="media-preview" data-full="1">';
+  else if (ft.indexOf('video/') === 0) html = '<video src="' + url + '" controls class="video-preview" preload="metadata"></video>';
+  else if (ft.indexOf('audio/') === 0) html = '<audio src="' + url + '" controls class="audio-preview" preload="metadata"></audio>';
+  else html = '<a class="file-link" href="' + url + '" download="' + escapeHtml(msg.fileName || 'file') + '">📁 ' + escapeHtml(msg.fileName || 'Файл') + (msg.fileSize ? ' (' + formatBytes(msg.fileSize) + ')' : '') + '</a>';
+  var wrapper = document.createElement('div');
+  wrapper.innerHTML = html;
+  var newEl = wrapper.firstChild;
+  newEl.addEventListener('click', function (e) { e.stopPropagation(); });
+  placeholder.parentNode.replaceChild(newEl, placeholder);
+  if (newEl.tagName === 'IMG') newEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(newEl.src); });
+}
+
+/* ==================== OPEN CHAT ==================== */
+
+function openChat(peer) {
+  if (!peer.type) peer.type = 'user';
+  activePeer = peer;
+  document.getElementById('active-peer-name').innerText = peer.name;
+  var statusEl = document.getElementById('active-peer-status');
+  if (peer.type === 'group') {
+    statusEl.innerText = (peer.memberCount || 0) + ' участников';
+    statusEl.style.color = 'var(--text-muted)';
+  } else {
+    if (peer.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
+    else { statusEl.innerText = 'не в сети'; statusEl.style.color = 'var(--text-muted)'; }
+    if (!currentUser.contacts) currentUser.contacts = [];
+    if (currentUser.contacts.indexOf(peer.id) === -1) {
+      currentUser.contacts.push(peer.id);
+      setMeta('profile', currentUser);
+    }
+  }
+  renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { id: peer.id, avatar: peer.avatar, name: peer.name }, peer.isOnline || false);
+  document.getElementById('input-bar').style.display = 'flex';
+  updateChatMenu();
+  document.querySelectorAll('.chat-item').forEach(function (el) { el.classList.remove('active'); });
+  if (window.innerWidth <= 600) {
+    document.getElementById('app-screen').classList.add('app-mobile-chat');
+    document.getElementById('back-to-list-btn').style.display = 'block';
+  }
+  renderMessagesContainer(getChatMessages(peer));
+  checkVisibleMessages();
+}
+
+function closeMobileChat() {
+  document.getElementById('app-screen').classList.remove('app-mobile-chat');
+}
+
+function resetActiveChat() {
+  activePeer = null;
+  document.getElementById('input-bar').style.display = 'none';
+  document.getElementById('active-peer-name').innerText = 'Выберите чат';
+  document.getElementById('active-peer-status').innerText = 'нажмите для профиля';
+  document.getElementById('messages-container').innerHTML = '<div class="empty-state">Выберите диалог</div>';
+  closeMobileChat();
+}
+
+function updateChatMenu() {
+  var menu = document.getElementById('chat-dropdown-menu');
+  if (activePeer && activePeer.type === 'group') {
+    menu.innerHTML =
+      '<button class="menu-item" onclick="openGroupProfile()">Профиль группы</button>' +
+      '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button>' +
+      '<button class="menu-item danger" onclick="leaveGroup()">Покинуть</button>';
+  } else {
+    menu.innerHTML =
+      '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button>' +
+      '<button class="menu-item danger" onclick="deleteCurrentChat()">Удалить чат</button>';
+  }
+}
+
+async function clearChatHistory() {
+  closeChatDropdown();
+  if (!activePeer) return;
+  if (!confirm('Очистить историю?')) return;
+  var ids = [];
+  for (var id in messagesCache) {
+    var m = messagesCache[id];
+    if (activePeer.type === 'group' && m.groupId === activePeer.id) ids.push(id);
+    else if (activePeer.type !== 'group' &&
+      ((m.senderId === currentUser.id && m.receiverId === activePeer.id) ||
+       (m.senderId === activePeer.id && m.receiverId === currentUser.id))) ids.push(id);
+  }
+  for (var i = 0; i < ids.length; i++) await markDeleted('message', ids[i]);
+  renderMessagesContainer(getChatMessages(activePeer));
+  renderChatListFromCache();
+}
+
+async function deleteCurrentChat() {
+  closeChatDropdown();
+  if (!activePeer) return;
+  if (!confirm('Удалить чат?')) return;
+  await markDeleted('chat_hide', currentUser.id + ':' + activePeer.id, {
+    userId: currentUser.id, peerId: activePeer.id
+  });
+  resetActiveChat();
+  renderChatListFromCache();
+}
+
+/* ==================== SEND ==================== */
+
+async function sendMsg() {
+  if (!activePeer) return;
+  if (isUploading) return;
+  if (connectionState !== 'online') {
+    showStatusTransient(connectionState === 'no-internet' ? '⚠ Нет подключения к интернету' : '⌛ Соединение...', connectionState);
+    return;
+  }
+  if (!lockButton('send-btn', 1000)) return;
+  var input = document.getElementById('msg-input');
+  var text = input.value.trim();
+  var fileToSend = selectedFile;
+  var voiceToSend = pendingVoice;
+  if (!text && !fileToSend && !voiceToSend) return;
+  input.value = '';
+  var isGroup = activePeer.type === 'group';
+  var msgId = 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+  var msg = {
+    id: msgId, senderId: currentUser.id,
+    receiverId: isGroup ? '' : activePeer.id,
+    groupId: isGroup ? activePeer.id : '',
+    text: text,
+    fileName: fileToSend ? fileToSend.name : (voiceToSend ? voiceToSend.name : ''),
+    fileType: fileToSend ? fileToSend.type : (voiceToSend ? voiceToSend.type : ''),
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    ts: Date.now(), isRead: false, readBy: [], isDeleted: false
+  };
+  if (voiceToSend) msg.fileData = voiceToSend.data;
+  else if (fileToSend && !fileToSend.isLarge) msg.fileData = fileToSend.data;
+  messagesCache[msgId] = msg;
+  await dbPut('messages', msg);
+  if (fileToSend && fileToSend.isLarge && fileToSend.file) {
+    isUploading = true;
+    var inputBar = document.getElementById('input-bar');
+    var orig = inputBar.innerHTML;
+    inputBar.innerHTML = '<div class="upload-progress-container"><div class="upload-progress-track"><div class="upload-progress-bar" id="upload-progress-bar"></div></div><span class="upload-progress-text" id="upload-progress-text">0%</span></div>';
+    try {
+      var fileUrl = await uploadFileInChunks(fileToSend.file, function (done, total) {
+        var p = Math.round(done / total * 100);
+        var bar = document.getElementById('upload-progress-bar');
+        var txt = document.getElementById('upload-progress-text');
+        if (bar) bar.style.width = p + '%';
+        if (txt) txt.innerText = p + '%';
+      });
+      msg.fileUrl = fileUrl;
+      msg.fileSize = fileToSend.file.size;
+      messagesCache[msgId] = msg;
+      await dbPut('messages', msg);
+      await saveFileToIDB(msgId, fileToSend.file, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: fileToSend.file.size });
+    } catch (e) { alert('Ошибка загрузки'); }
+    inputBar.innerHTML = orig;
+    isUploading = false;
+  }
+  scheduleEvent({
+    type: 'message', id: msgId,
+    senderId: msg.senderId, receiverId: msg.receiverId, groupId: msg.groupId,
+    text: msg.text, fileName: msg.fileName, fileType: msg.fileType,
+    fileData: msg.fileData || '', fileUrl: msg.fileUrl || '',
+    fileSize: msg.fileSize || 0, timestamp: msg.timestamp, ts: msg.ts,
+    isRead: false, readBy: []
+  });
+  renderMessagesContainer(getChatMessages(activePeer));
+  cancelAttachment();
+  cancelVoiceAttachment();
+}
+
+function showStatusTransient(text, cls) {
+  var bar = document.getElementById('status-bar');
+  if (!bar) return;
+  bar.innerText = text;
+  bar.className = 'visible ' + (cls === 'no-internet' ? 'internet-off' : 'server-off');
+  if (statusBarTimeout) clearTimeout(statusBarTimeout);
+  statusBarTimeout = setTimeout(function () { updateStatusBar(); }, 3000);
+}
+
+async function uploadFileInChunks(file, onProgress) {
+  var init = await fetch('/api/upload/init', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ senderId: currentUser.id, fileName: file.name, fileSize: file.size, fileType: file.type })
+  });
+  if (!init.ok) throw new Error('init failed');
+  var data = await init.json();
+  var fileId = data.fileId;
+  var totalChunks = data.totalChunks;
+  for (var i = 0; i < totalChunks; i++) {
+    var start = i * CHUNK_SIZE;
+    var end = Math.min(start + CHUNK_SIZE, file.size);
+    var chunk = file.slice(start, end);
+    var res = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, {
+      method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk
+    });
+    if (!res.ok) throw new Error('chunk ' + i);
+    if (onProgress) onProgress(i + 1, totalChunks);
+  }
+  var fin = await fetch('/api/upload/finish', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileId: fileId })
+  });
+  if (!fin.ok) throw new Error('finish');
+  var fdata = await fin.json();
+  return fdata.url;
+}
+
+/* ==================== MSG ACTIONS ==================== */
+
+function openMsgActions(msg, el) {
   if (document.getElementById('msg-actions-sheet').classList.contains('active')) return;
   selectedMsgId = msg.id; selectedMsgObj = msg;
-  document.querySelectorAll('.msg').forEach(function (el) { el.classList.remove('selected-msg'); });
-  element.classList.add('selected-msg');
+  document.querySelectorAll('.msg').forEach(function (x) { x.classList.remove('selected-msg'); });
+  el.classList.add('selected-msg');
   document.getElementById('action-btn-copy').style.display = (msg.text && !msg.fileData && !msg.fileUrl) ? 'block' : 'none';
   document.getElementById('action-btn-download').style.display = (msg.fileData || msg.fileUrl) ? 'block' : 'none';
   document.getElementById('msg-actions-sheet').classList.add('active');
 }
 function closeMsgActions() {
   selectedMsgId = null; selectedMsgObj = null;
-  document.querySelectorAll('.msg').forEach(function (el) { el.classList.remove('selected-msg'); });
+  document.querySelectorAll('.msg').forEach(function (x) { x.classList.remove('selected-msg'); });
   document.getElementById('msg-actions-sheet').classList.remove('active');
 }
 function actionCopyText() {
@@ -1992,86 +1932,454 @@ function actionCopyText() {
   closeMsgActions();
   if (t) navigator.clipboard.writeText(t).catch(function () {});
 }
-function actionDownloadFile() {
+async function actionDownloadFile() {
   var obj = selectedMsgObj;
   closeMsgActions();
-  if (obj && obj.fileUrl) {
-    var a = document.createElement('a');
-    a.href = obj.fileUrl;
-    a.download = obj.fileName || 'download';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  } else if (obj && obj.fileData) {
-    downloadData(obj.fileData, obj.fileName);
-  }
+  if (!obj) return;
+  var url = await getFileUrlForMessage(obj);
+  if (!url && obj.fileData) url = obj.fileData;
+  if (!url) { alert('Файл недоступен'); return; }
+  var a = document.createElement('a');
+  a.href = url; a.download = obj.fileName || 'file';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 async function deleteSelectedMessage() {
   var id = selectedMsgId;
   closeMsgActions();
   if (!id) return;
-  localMessagesCache.forEach(function (m) { if (m.id === id) m.isDeleted = true; });
-  saveCache();
-  lastMessagesHash = '';
+  await markDeleted('message', id);
   if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
-  try { await fetch('/api/messages/' + id, { method: 'DELETE' }); }
-  catch (e) { alert('Не удалось удалить сообщение на сервере.'); }
+  renderChatListFromCache();
 }
 
-/* ---------- ВЛОЖЕНИЯ ---------- */
-function triggerFileInput() { 
-  if (isUploading) return;
-  document.getElementById('file-input').click(); 
+/* ==================== READ ==================== */
+
+function checkVisibleMessages() { setTimeout(doCheckVisibleMessages, 300); }
+async function doCheckVisibleMessages() {
+  if (!activePeer || !currentUser) return;
+  var container = document.getElementById('messages-container');
+  var els = container.querySelectorAll('.msg');
+  var cr = container.getBoundingClientRect();
+  var ids = [];
+  els.forEach(function (el) {
+    var sid = el.getAttribute('data-sender-id');
+    var mid = el.getAttribute('data-msg-id');
+    if (sid === currentUser.id) return;
+    var r = el.getBoundingClientRect();
+    if (r.top >= cr.top && r.bottom <= cr.bottom) {
+      var m = messagesCache[mid];
+      if (!m) return;
+      if (m.groupId) {
+        if (!m.readBy) m.readBy = [];
+        if (m.readBy.indexOf(currentUser.id) === -1) { m.readBy.push(currentUser.id); dbPut('messages', m); ids.push(mid); }
+      } else if (!m.isRead) {
+        m.isRead = true;
+        dbPut('messages', m);
+        ids.push(mid);
+      }
+    }
+  });
+  for (var i = 0; i < ids.length; i++) {
+    var mm = messagesCache[ids[i]];
+    if (!mm) continue;
+    scheduleEvent({
+      type: 'message_read', id: ids[i], readerId: currentUser.id,
+      senderId: mm.senderId, receiverId: mm.receiverId, groupId: mm.groupId || ''
+    });
+  }
 }
-function handleFileSelect(e) {
-  var file = e.target.files[0]; 
+
+/* ==================== PROFILE ==================== */
+
+function openMyProfile() {
+  if (isModalOpen('my-profile-modal')) return;
+  draftAvatar = null;
+  document.getElementById('edit-my-name-input').value = currentUser.name;
+  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
+  document.getElementById('my-profile-name-view').innerText = currentUser.name;
+  document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
+  document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
+  safeOpenModal('my-profile-modal');
+}
+function closeMyProfile() { draftAvatar = null; safeCloseModal('my-profile-modal'); }
+function triggerAvatarInput() { var i = document.getElementById('avatar-file-input'); i.value = ''; i.click(); }
+function handleAvatarSelect(e) {
+  var file = e.target.files[0];
   if (!file) return;
-  
-  if (file.size > MAX_FILE_SIZE) {
-    alert('Файл слишком большой. Максимум 200 МБ.');
-    e.target.value = '';
+  if (file.size > 10 * 1024 * 1024) { alert('Максимум 10 МБ'); return; }
+  compressImage(file, 200, 0.85, function (c) {
+    if (!c) return;
+    draftAvatar = c;
+    renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: c, name: currentUser.name }, true);
+    document.getElementById('remove-avatar-link-btn').style.display = 'block';
+  });
+}
+function removeMyAvatar() {
+  draftAvatar = '';
+  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: '', name: currentUser.name }, true);
+  document.getElementById('remove-avatar-link-btn').style.display = 'none';
+}
+async function saveMyProfileChanges() {
+  if (connectionState !== 'online') {
+    alert(connectionState === 'no-internet' ? 'Нет подключения к интернету' : 'Соединение...');
     return;
   }
-  
-  // Для больших файлов (> 1 МБ) — используем чанки, не читаем в base64
-  if (file.size > 1024 * 1024) {
-    selectedFile = {
-      file: file,
-      name: file.name,
-      type: file.type,
-      data: null,
-      isLarge: true
+  if (!lockButton('save-my-profile-btn', 2000)) return;
+  var newName = document.getElementById('edit-my-name-input').value.trim();
+  if (newName) currentUser.name = newName;
+  if (draftAvatar !== null) { currentUser.avatar = draftAvatar; draftAvatar = null; }
+  currentUser.updatedAt = Date.now();
+  await setMeta('profile', currentUser);
+  await dbPut('users', currentUser);
+  updateMyProfileUI();
+  scheduleEvent({
+    type: 'profile', id: currentUser.id,
+    name: currentUser.name, avatar: currentUser.avatar, updatedAt: Date.now()
+  });
+  closeMyProfile();
+}
+
+function openPeerProfile() {
+  if (!activePeer) return;
+  if (activePeer.type === 'group') { openGroupProfile(); return; }
+  profileTargetId = activePeer.id;
+  if (isModalOpen('peer-profile-modal')) return;
+  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
+  document.getElementById('peer-profile-name-view').innerText = activePeer.name;
+  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
+  updatePeerProfileButtons(activePeer);
+  safeOpenModal('peer-profile-modal');
+}
+function updatePeerProfileButtons(user) {
+  var b = document.getElementById('block-peer-btn');
+  var blocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(user.id) !== -1;
+  b.innerText = blocked ? 'Разблокировать' : 'Заблокировать';
+  b.className = blocked ? 'btn btn-secondary' : 'btn btn-danger';
+  var m = document.getElementById('mute-peer-btn');
+  var muted = mutedPeers.indexOf(user.id) !== -1;
+  m.innerText = muted ? 'Включить звук' : 'Выключить звук';
+  m.className = muted ? 'btn' : 'btn btn-secondary';
+}
+function openMemberProfile(member) {
+  profileTargetId = member.id;
+  if (isModalOpen('peer-profile-modal')) return;
+  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, member.isOnline);
+  document.getElementById('peer-profile-name-view').innerText = member.name;
+  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + member.id;
+  updatePeerProfileButtons(member);
+  safeOpenModal('peer-profile-modal');
+}
+function closePeerProfile() { safeCloseModal('peer-profile-modal'); }
+function toggleMutePeer() {
+  if (!profileTargetId) return;
+  var i = mutedPeers.indexOf(profileTargetId);
+  if (i > -1) mutedPeers.splice(i, 1); else mutedPeers.push(profileTargetId);
+  setMeta('mutedPeers', mutedPeers);
+  updatePeerProfileButtons({ id: profileTargetId });
+}
+async function toggleBlockPeer() {
+  if (!profileTargetId) return;
+  if (!lockButton('block-peer-btn', 1500)) return;
+  var blocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(profileTargetId) !== -1;
+  if (!currentUser.blockedContacts) currentUser.blockedContacts = [];
+  if (blocked) currentUser.blockedContacts = currentUser.blockedContacts.filter(function (x) { return x !== profileTargetId; });
+  else currentUser.blockedContacts.push(profileTargetId);
+  await setMeta('profile', currentUser);
+  closePeerProfile();
+}
+
+/* ==================== GROUPS ==================== */
+
+function openCreateGroup() {
+  if (connectionState !== 'online') { alert('Нет соединения с сервером'); return; }
+  if (isModalOpen('create-group-modal')) return;
+  groupDraftAvatar = '';
+  document.getElementById('create-group-name').value = '';
+  renderAvatarIntoElement(document.getElementById('create-group-avatar'), { avatar: '', name: '👥' }, false);
+  var cached = [];
+  for (var uid in usersCache) if (uid !== currentUser.id) cached.push(usersCache[uid]);
+  renderCheckList('create-group-contacts', cached, new Set());
+  safeOpenModal('create-group-modal');
+}
+function closeCreateGroup() { safeCloseModal('create-group-modal'); }
+function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
+function handleGroupAvatarSelect(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  compressImage(file, 200, 0.85, function (c) {
+    if (!c) return;
+    groupDraftAvatar = c;
+    renderAvatarIntoElement(document.getElementById('create-group-avatar'), { avatar: c, name: '👥' }, false);
+  });
+}
+function renderCheckList(containerId, users, excludeSet) {
+  var c = document.getElementById(containerId);
+  c.innerHTML = '';
+  var list = users.filter(function (u) { return !excludeSet.has(u.id); });
+  if (list.length === 0) { c.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px;">Нет контактов</div>'; return; }
+  list.forEach(function (u) {
+    var row = document.createElement('label');
+    row.className = 'check-row';
+    row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:8px; cursor:pointer; border-bottom:1px solid var(--border);';
+    var avId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    row.innerHTML =
+      '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;">' +
+      '<div class="avatar-circle" id="' + avId + '" style="width:32px;height:32px;font-size:13px;"></div>' +
+      '<span style="flex:1;">' + escapeHtml(u.name) + '</span>';
+    c.appendChild(row);
+    renderAvatarIntoElement(document.getElementById(avId), u, false);
+  });
+}
+function getChecked(id) {
+  return Array.from(document.querySelectorAll('#' + id + ' input[type=checkbox]:checked')).map(function (i) { return i.value; });
+}
+async function submitCreateGroup() {
+  if (connectionState !== 'online') { alert('Нет соединения с сервером'); return; }
+  var name = document.getElementById('create-group-name').value.trim();
+  if (!name) { alert('Введите название'); return; }
+  var members = getChecked('create-group-contacts');
+  if (members.length === 0) { alert('Выберите участников'); return; }
+  if (!lockButton('create-group-submit-btn', 2000)) return;
+  var gid = 'grp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+  var g = {
+    id: gid, name, avatar: groupDraftAvatar || '',
+    ownerId: currentUser.id,
+    members: [currentUser.id].concat(members),
+    createdAt: Date.now()
+  };
+  groupsCache[gid] = g;
+  await dbPut('groups', g);
+  scheduleEvent({
+    type: 'group', id: gid,
+    name: g.name, avatar: g.avatar, ownerId: g.ownerId,
+    members: g.members, createdAt: g.createdAt
+  });
+  closeCreateGroup();
+  renderChatListFromCache();
+  openChat({ id: gid, type: 'group', name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId, memberCount: g.members.length });
+}
+
+async function openGroupProfile() {
+  closeChatDropdown();
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (isModalOpen('group-profile-modal')) return;
+  var g = groupsCache[activePeer.id];
+  if (!g) return;
+  activePeer = Object.assign({}, activePeer, { members: g.members, ownerId: g.ownerId, name: g.name, avatar: g.avatar });
+  editGroupDraftAvatar = '';
+  renderAvatarIntoElement(document.getElementById('group-profile-avatar'), { id: g.id, avatar: g.avatar, name: g.name }, false);
+  document.getElementById('group-profile-name').innerText = g.name;
+  document.getElementById('group-profile-count').innerText = g.members.length + ' участников';
+  var isOwner = g.ownerId === currentUser.id;
+  document.getElementById('group-owner-controls').style.display = isOwner ? 'block' : 'none';
+  document.getElementById('delete-group-btn').style.display = isOwner ? 'block' : 'none';
+  if (isOwner) document.getElementById('edit-group-name').value = g.name;
+  renderMembersList('group-members-list', g.members, g.ownerId);
+  safeOpenModal('group-profile-modal');
+}
+function closeGroupProfile() {
+  editGroupDraftAvatar = '';
+  safeCloseModal('group-profile-modal');
+  closeMemberDropdown();
+}
+function renderMembersList(containerId, memberIds, ownerId) {
+  var c = document.getElementById(containerId);
+  c.innerHTML = '';
+  var amOwner = ownerId === currentUser.id;
+  memberIds.forEach(function (mid) {
+    var u = usersCache[mid] || { id: mid, name: 'Пользователь', avatar: '' };
+    var isOwner = mid === ownerId;
+    var isMe = mid === currentUser.id;
+    var row = document.createElement('div');
+    row.className = 'member-row';
+    var info = document.createElement('div');
+    info.style.cssText = 'display:flex; align-items:center; gap:10px; flex:1; overflow:hidden;';
+    info.innerHTML =
+      '<div class="avatar-circle" style="width:32px;height:32px;font-size:13px;"></div>' +
+      '<div style="flex:1; text-align:left;">' +
+        '<div>' + escapeHtml(u.name) + (isMe ? ' (вы)' : '') + '</div>' +
+        (isOwner ? '<div style="font-size:11px;color:var(--accent);">создатель</div>' : '') +
+      '</div>';
+    info.onclick = function (e) {
+      e.stopPropagation();
+      if (isMe) { closeGroupProfile(); openMyProfile(); }
+      else openMemberProfile(u);
     };
-    var thumbImg = document.getElementById('attachment-thumb-img');
+    row.appendChild(info);
+    renderAvatarIntoElement(info.querySelector('.avatar-circle'), u, u.isOnline || false);
+    if (amOwner && !isMe && !isOwner) {
+      var btn = document.createElement('button');
+      btn.className = 'member-menu-btn';
+      btn.innerText = '⋮';
+      btn.onclick = function (e) {
+        e.stopPropagation();
+        if (activeMemberDropdown && activeMemberDropdown.dataset.memberId === u.id) closeMemberDropdown();
+        else openMemberDropdown(row, u);
+      };
+      row.appendChild(btn);
+    }
+    c.appendChild(row);
+  });
+}
+function openMemberDropdown(rowEl, member) {
+  closeMemberDropdown();
+  var dd = document.createElement('div');
+  dd.className = 'member-dropdown active';
+  dd.dataset.memberId = member.id;
+  dd.innerHTML =
+    '<button class="menu-item" data-action="profile">Профиль</button>' +
+    '<button class="menu-item danger" data-action="kick">Выгнать</button>';
+  dd.addEventListener('click', function (e) {
+    e.stopPropagation();
+    var a = e.target.getAttribute('data-action');
+    if (a === 'profile') { closeMemberDropdown(); openMemberProfile(member); }
+    else if (a === 'kick') { closeMemberDropdown(); kickMember(member); }
+  });
+  rowEl.appendChild(dd);
+  activeMemberDropdown = dd;
+  setTimeout(function () {
+    document.addEventListener('click', function h(ev) {
+      if (activeMemberDropdown && !activeMemberDropdown.contains(ev.target)) {
+        closeMemberDropdown();
+        document.removeEventListener('click', h);
+      }
+    });
+  }, 0);
+}
+function closeMemberDropdown() {
+  if (activeMemberDropdown && activeMemberDropdown.parentNode) activeMemberDropdown.parentNode.removeChild(activeMemberDropdown);
+  activeMemberDropdown = null;
+}
+async function kickMember(member) {
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (!confirm('Выгнать ' + member.name + '?')) return;
+  var g = groupsCache[activePeer.id];
+  if (!g) return;
+  g.members = g.members.filter(function (m) { return m !== member.id; });
+  await dbPut('groups', g);
+  await markDeleted('group_kick', activePeer.id + ':' + member.id, {
+    groupId: activePeer.id, memberId: member.id, members: g.members
+  });
+  scheduleEvent({
+    type: 'group_update', id: activePeer.id,
+    name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId
+  });
+  activePeer.members = g.members;
+  renderMembersList('group-members-list', g.members, g.ownerId);
+  document.getElementById('group-profile-count').innerText = g.members.length + ' участников';
+  renderChatListFromCache();
+}
+async function deleteGroup() {
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (!confirm('Удалить группу?')) return;
+  await markDeleted('group', activePeer.id);
+  closeGroupProfile();
+  resetActiveChat();
+  renderChatListFromCache();
+}
+function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
+function handleEditGroupAvatarSelect(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  compressImage(file, 200, 0.85, function (c) {
+    if (!c) return;
+    editGroupDraftAvatar = c;
+    renderAvatarIntoElement(document.getElementById('group-profile-avatar'), { avatar: c, name: '👥' }, false);
+  });
+}
+async function saveGroupChanges() {
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (!lockButton('save-group-btn', 2000)) return;
+  var name = document.getElementById('edit-group-name').value.trim();
+  if (!name) { alert('Введите название'); return; }
+  var g = groupsCache[activePeer.id];
+  if (!g) return;
+  g.name = name;
+  if (editGroupDraftAvatar) g.avatar = editGroupDraftAvatar;
+  await dbPut('groups', g);
+  editGroupDraftAvatar = '';
+  scheduleEvent({
+    type: 'group_update', id: g.id,
+    name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId
+  });
+  renderChatListFromCache();
+  closeGroupProfile();
+}
+async function openAddMembers() {
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (isModalOpen('add-members-modal')) return;
+  var g = groupsCache[activePeer.id];
+  if (!g) return;
+  var exclude = new Set(g.members);
+  var cached = [];
+  for (var uid in usersCache) if (!exclude.has(uid)) cached.push(usersCache[uid]);
+  renderCheckList('add-members-contacts', cached, exclude);
+  safeOpenModal('add-members-modal');
+}
+function closeAddMembers() { safeCloseModal('add-members-modal'); }
+async function submitAddMembers() {
+  var members = getChecked('add-members-contacts');
+  if (members.length === 0) { alert('Выберите участников'); return; }
+  var g = groupsCache[activePeer.id];
+  if (!g) return;
+  members.forEach(function (m) { if (g.members.indexOf(m) === -1) g.members.push(m); });
+  await dbPut('groups', g);
+  scheduleEvent({
+    type: 'group_update', id: g.id,
+    name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId
+  });
+  closeAddMembers();
+  activePeer.members = g.members;
+  renderMembersList('group-members-list', g.members, g.ownerId);
+  document.getElementById('group-profile-count').innerText = g.members.length + ' участников';
+}
+async function leaveGroup() {
+  closeChatDropdown();
+  if (!activePeer || activePeer.type !== 'group') return;
+  if (!confirm('Покинуть группу?')) return;
+  var g = groupsCache[activePeer.id];
+  if (g) {
+    g.members = g.members.filter(function (m) { return m !== currentUser.id; });
+    await dbPut('groups', g);
+    scheduleEvent({
+      type: 'group_update', id: g.id,
+      name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId
+    });
+  }
+  await markDeleted('group', activePeer.id);
+  closeGroupProfile();
+  resetActiveChat();
+  renderChatListFromCache();
+}
+
+/* ==================== ATTACHMENTS ==================== */
+
+function triggerFileInput() { if (isUploading) return; document.getElementById('file-input').click(); }
+function handleFileSelect(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  if (file.size > MAX_FILE_SIZE) { alert('Максимум 200 МБ'); return; }
+  if (file.size > 1024 * 1024) {
+    selectedFile = { file: file, name: file.name, type: file.type, data: null, isLarge: true };
+    var thumb = document.getElementById('attachment-thumb-img');
     document.getElementById('attachment-name-label').innerText = file.name;
-    var typeLabel = document.getElementById('attachment-type-label');
-    typeLabel.innerText = formatBytes(file.size) + ' • ' + 
-      (file.type.indexOf('video/') === 0 ? 'Видео' : 
-       file.type.indexOf('audio/') === 0 ? 'Аудио' : 
-       file.type.indexOf('image/') === 0 ? 'Изображение' : 'Файл');
-    
+    document.getElementById('attachment-type-label').innerText = formatBytes(file.size);
     if (file.type.indexOf('image/') === 0) {
       var r = new FileReader();
-      r.onload = function (ev) { thumbImg.src = ev.target.result; thumbImg.style.display = 'block'; };
+      r.onload = function (ev) { thumb.src = ev.target.result; thumb.style.display = 'block'; };
       r.readAsDataURL(file);
-    } else {
-      thumbImg.src = ''; thumbImg.style.display = 'none';
-    }
+    } else thumb.style.display = 'none';
     document.getElementById('attachment-preview-container').classList.add('active');
     return;
   }
-  
-  // Маленький файл — base64
   var reader = new FileReader();
   reader.onload = function (evt) {
     selectedFile = { data: evt.target.result, name: file.name, type: file.type, file: file, isLarge: false };
-    var thumbImg = document.getElementById('attachment-thumb-img');
+    var thumb = document.getElementById('attachment-thumb-img');
     document.getElementById('attachment-name-label').innerText = file.name;
-    var typeLabel = document.getElementById('attachment-type-label');
-    if (file.type.indexOf('image/') === 0) {
-      thumbImg.src = evt.target.result; thumbImg.style.display = 'block'; typeLabel.innerText = 'Фото';
-    } else {
-      thumbImg.src = ''; thumbImg.style.display = 'none';
-      typeLabel.innerText = file.type.indexOf('video/') === 0 ? 'Видео' : (file.type.indexOf('audio/') === 0 ? 'Аудио' : 'Файл');
-    }
+    document.getElementById('attachment-type-label').innerText = formatBytes(file.size);
+    if (file.type.indexOf('image/') === 0) { thumb.src = evt.target.result; thumb.style.display = 'block'; }
+    else thumb.style.display = 'none';
     document.getElementById('attachment-preview-container').classList.add('active');
   };
   reader.readAsDataURL(file);
@@ -2083,20 +2391,23 @@ function cancelAttachment() {
   document.getElementById('attachment-preview-container').classList.remove('active');
 }
 
-/* ---------- ГОЛОСОВОЕ ПРЕВЬЮ ---------- */
+/* ==================== VOICE ==================== */
+
 function cancelVoiceAttachment() {
   if (pendingVoice && pendingVoice.url && pendingVoice.url.indexOf('blob:') === 0) {
     try { URL.revokeObjectURL(pendingVoice.url); } catch (e) {}
   }
   pendingVoice = null;
-  var box = document.getElementById('audio-attachment-preview');
-  if (box) box.classList.remove('active');
-  var player = document.getElementById('audio-preview-player');
-  if (player) {
-    player.pause();
-    player.removeAttribute('src');
-    try { player.load(); } catch (e) {}
-  }
+  document.getElementById('audio-attachment-preview').classList.remove('active');
+  var p = document.getElementById('audio-preview-player');
+  if (p) { p.pause(); p.removeAttribute('src'); try { p.load(); } catch (e) {} }
+}
+function cleanupRecordingNodes() {
+  try { if (recordProcessor) recordProcessor.disconnect(); } catch (e) {}
+  try { if (recordSourceNode) recordSourceNode.disconnect(); } catch (e) {}
+  try { if (recordSilentGain) recordSilentGain.disconnect(); } catch (e) {}
+  try { if (recordAudioCtx && recordAudioCtx.state !== 'closed') recordAudioCtx.close(); } catch (e) {}
+  recordProcessor = recordSourceNode = recordSilentGain = recordAudioCtx = null;
 }
 function floatTo16BitPCM(output, offset, input) {
   for (var i = 0; i < input.length; i++, offset += 2) {
@@ -2118,22 +2429,14 @@ function encodeWAV(samples, sampleRate) {
   floatTo16BitPCM(view, 44, samples);
   return new Blob([view], { type: 'audio/wav' });
 }
-function cleanupRecordingNodes() {
-  try { if (recordProcessor) recordProcessor.disconnect(); } catch (e) {}
-  try { if (recordSourceNode) recordSourceNode.disconnect(); } catch (e) {}
-  try { if (recordSilentGain) recordSilentGain.disconnect(); } catch (e) {}
-  try { if (recordAudioCtx && recordAudioCtx.state !== 'closed') recordAudioCtx.close(); } catch (e) {}
-  recordProcessor = recordSourceNode = recordSilentGain = recordAudioCtx = null;
-}
 function startRecordingTimer() {
   recordStartedAt = Date.now();
-  var panel = document.getElementById('record-panel');
-  var timerEl = document.getElementById('recording-timer');
-  panel.classList.add('active'); timerEl.innerText = '0:00';
+  document.getElementById('record-panel').classList.add('active');
+  document.getElementById('recording-timer').innerText = '0:00';
   if (recordingTimerInterval) clearInterval(recordingTimerInterval);
   recordingTimerInterval = setInterval(function () {
     var s = Math.floor((Date.now() - recordStartedAt) / 1000);
-    timerEl.innerText = Math.floor(s / 60) + ':' + (s % 60).toString().padStart(2, '0');
+    document.getElementById('recording-timer').innerText = Math.floor(s / 60) + ':' + (s % 60).toString().padStart(2, '0');
   }, 200);
 }
 function stopRecordingTimer() {
@@ -2141,28 +2444,33 @@ function stopRecordingTimer() {
   if (recordingTimerInterval) { clearInterval(recordingTimerInterval); recordingTimerInterval = null; }
 }
 async function toggleVoiceRecord() {
-  var micBtn = document.getElementById('mic-btn');
+  var mic = document.getElementById('mic-btn');
   if (isRecording) {
-    isRecording = false; micBtn.innerText = '🎙️'; micBtn.classList.remove('recording'); stopRecordingTimer();
+    isRecording = false;
+    mic.innerText = '🎙️';
+    mic.classList.remove('recording');
+    stopRecordingTimer();
     var chunks = audioChunks.slice();
-    var capturedRate = recordAudioCtx ? recordAudioCtx.sampleRate : 48000;
+    var rate = recordAudioCtx ? recordAudioCtx.sampleRate : 48000;
     cleanupRecordingNodes();
     try { if (activeStream) activeStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
     activeStream = null;
-    if (chunks.length === 0) { alert('Запись получилась пустой.'); return; }
-    var totalLen = 0; for (var i = 0; i < chunks.length; i++) totalLen += chunks[i].length;
-    var merged = new Float32Array(totalLen);
-    var off = 0; for (var j = 0; j < chunks.length; j++) { merged.set(chunks[j], off); off += chunks[j].length; }
+    if (chunks.length === 0) { alert('Пустая запись'); return; }
+    var total = 0;
+    for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
+    var merged = new Float32Array(total);
+    var off = 0;
+    for (var j = 0; j < chunks.length; j++) { merged.set(chunks[j], off); off += chunks[j].length; }
     var targetRate = 16000;
-    var finalSamples = merged, finalRate = capturedRate;
-    if (capturedRate > targetRate) {
-      var ratio = capturedRate / targetRate;
-      var newLen = Math.floor(merged.length / ratio);
-      var down = new Float32Array(newLen);
-      for (var k = 0; k < newLen; k++) down[k] = merged[Math.floor(k * ratio)] || 0;
-      finalSamples = down; finalRate = targetRate;
+    var final = merged, fr = rate;
+    if (rate > targetRate) {
+      var ratio = rate / targetRate;
+      var nl = Math.floor(merged.length / ratio);
+      var down = new Float32Array(nl);
+      for (var k = 0; k < nl; k++) down[k] = merged[Math.floor(k * ratio)] || 0;
+      final = down; fr = targetRate;
     }
-    var wavBlob = encodeWAV(finalSamples, finalRate);
+    var wavBlob = encodeWAV(final, fr);
     var reader = new FileReader();
     reader.onload = function (evt) {
       cancelVoiceAttachment();
@@ -2170,607 +2478,159 @@ async function toggleVoiceRecord() {
       var url = '';
       try { url = URL.createObjectURL(wavBlob); } catch (e) { url = dataUrl; }
       pendingVoice = { data: dataUrl, name: 'voice_' + Date.now() + '.wav', type: 'audio/wav', url: url };
-      var player = document.getElementById('audio-preview-player');
-      player.src = url;
+      document.getElementById('audio-preview-player').src = url;
       document.getElementById('audio-attachment-preview').classList.add('active');
     };
     reader.readAsDataURL(wavBlob);
     return;
   }
-  if (!activePeer) { alert('Сначала выберите чат.'); return; }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert('Ваш браузер не поддерживает запись с микрофона.'); return; }
+  if (!activePeer) { alert('Выберите чат'); return; }
+  if (!navigator.mediaDevices) { alert('Нет доступа'); return; }
   try {
     var stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }, video: false
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
     });
     activeStream = stream;
     var AC = window.AudioContext || window.webkitAudioContext;
-    var ctx = new AC(); recordAudioCtx = ctx;
+    var ctx = new AC();
+    recordAudioCtx = ctx;
     if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
-    var source = ctx.createMediaStreamSource(stream); recordSourceNode = source;
-    var processor = ctx.createScriptProcessor(4096, 1, 1); recordProcessor = processor; audioChunks = [];
+    var source = ctx.createMediaStreamSource(stream);
+    recordSourceNode = source;
+    var processor = ctx.createScriptProcessor(4096, 1, 1);
+    recordProcessor = processor;
+    audioChunks = [];
     processor.onaudioprocess = function (e) { if (!isRecording) return; audioChunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
-    var silentGain = ctx.createGain(); silentGain.gain.value = 0; recordSilentGain = silentGain;
-    source.connect(processor); processor.connect(silentGain); silentGain.connect(ctx.destination);
-    isRecording = true; micBtn.innerText = '🔴'; micBtn.classList.add('recording'); startRecordingTimer();
+    var sg = ctx.createGain();
+    sg.gain.value = 0;
+    recordSilentGain = sg;
+    source.connect(processor);
+    processor.connect(sg);
+    sg.connect(ctx.destination);
+    isRecording = true;
+    mic.innerText = '🔴';
+    mic.classList.add('recording');
+    startRecordingTimer();
   } catch (err) {
-    var msg = 'Нет доступа к микрофону.';
-    if (err && err.name === 'NotAllowedError') msg = 'Вы отклонили доступ к микрофону.';
-    else if (err && err.name === 'NotFoundError') msg = 'Микрофон не найден.';
-    else if (err && err.name === 'NotReadableError') msg = 'Микрофон занят другим приложением.';
-    alert(msg);
+    alert('Нет доступа к микрофону');
     cleanupRecordingNodes();
     try { if (activeStream) activeStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-    activeStream = null; isRecording = false; micBtn.innerText = '🎙️'; micBtn.classList.remove('recording'); stopRecordingTimer();
+    activeStream = null;
+    isRecording = false;
+    mic.innerText = '🎙️';
+    mic.classList.remove('recording');
+    stopRecordingTimer();
   }
 }
 
-/* ---------- ЧАНКОВАННАЯ ЗАГРУЗКА ФАЙЛОВ ---------- */
-async function uploadFileInChunks(file, onProgress) {
-  var initRes = await fetch('/api/upload/init', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      fileName: file.name,
-      fileSize: file.size,
-      fileType: file.type,
-      senderId: currentUser.id,
-      receiverId: activePeer && activePeer.type !== 'group' ? activePeer.id : '',
-      groupId: activePeer && activePeer.type === 'group' ? activePeer.id : '',
-      clientId: 'up_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8)
-    })
-  });
-  
-  if (!initRes.ok) {
-    var err = await initRes.json().catch(function () { return {}; });
-    throw new Error(err.error || 'Ошибка инициализации загрузки');
-  }
-  
-  var initData = await initRes.json();
-  var fileId = initData.fileId;
-  var totalChunks = initData.totalChunks;
-  
-  for (var i = 0; i < totalChunks; i++) {
-    var start = i * CHUNK_SIZE;
-    var end = Math.min(start + CHUNK_SIZE, file.size);
-    var chunk = file.slice(start, end);
-    
-    var chunkRes = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: chunk
-    });
-    
-    if (!chunkRes.ok) {
-      throw new Error('Ошибка загрузки чанка ' + (i + 1) + '/' + totalChunks);
-    }
-    
-    if (onProgress) {
-      onProgress(i + 1, totalChunks);
-    }
-  }
-  
-  var finishRes = await fetch('/api/upload/finish', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ 
-      fileId: fileId, 
-      text: document.getElementById('msg-input').value.trim() 
-    })
-  });
-  
-  if (!finishRes.ok) {
-    var ferr = await finishRes.json().catch(function () { return {}; });
-    throw new Error(ferr.error || 'Ошибка завершения загрузки');
-  }
-  
-  return await finishRes.json();
-}
+/* ==================== IMAGE ==================== */
 
-async function sendLargeFile(file, text) {
-  if (!activePeer) return;
-  if (file.size > MAX_FILE_SIZE) {
-    alert('Файл слишком большой (макс. 200 МБ)');
-    return;
-  }
-  
-  isUploading = true;
-  var inputBar = document.getElementById('input-bar');
-  var originalHTML = inputBar.innerHTML;
-  
-  inputBar.innerHTML =
-    '<div class="upload-progress-container">' +
-      '<div class="upload-progress-track">' +
-        '<div class="upload-progress-bar" id="upload-progress-bar"></div>' +
-      '</div>' +
-      '<span class="upload-progress-text" id="upload-progress-text">0%</span>' +
-    '</div>';
-  
-  var onProgress = function (done, total) {
-    var percent = Math.round((done / total) * 100);
-    var bar = document.getElementById('upload-progress-bar');
-    var txt = document.getElementById('upload-progress-text');
-    if (bar) bar.style.width = percent + '%';
-    if (txt) txt.innerText = percent + '% • ' + formatBytes(Math.min(done * CHUNK_SIZE, file.size)) + ' / ' + formatBytes(file.size);
-  };
-  
-  try {
-    var result = await uploadFileInChunks(file, onProgress);
-    
-    inputBar.innerHTML = originalHTML;
-    document.getElementById('msg-input').value = '';
-    document.getElementById('file-input').value = '';
-    selectedFile = null;
-    document.getElementById('attachment-preview-container').classList.remove('active');
-    
-    if (result.message) {
-      var rm = Object.assign({}, result.message); rm.isPending = false;
-      mergeMessage(rm);
-      saveCache();
-      renderMessagesContainer(getChatMessages(activePeer));
-      loadDialogsQuiet();
-    }
-  } catch (e) {
-    inputBar.innerHTML = originalHTML;
-    alert('Ошибка загрузки: ' + e.message);
-  } finally {
-    isUploading = false;
-  }
-}
-
-/* ---------- ОТПРАВКА ---------- */
-async function sendMessagePayload(payload) {
-  var text = payload.text || '';
-  var file = payload.file || null;
-  if (!activePeer) return;
-  
-  if (file && file.isLarge && file.file) {
-    return sendLargeFile(file.file, text);
-  }
-  
-  var isGroup = activePeer.type === 'group';
-  var clientId = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
-  var optimisticMsg = {
-    id: clientId, clientId: clientId,
-    senderId: currentUser.id,
-    receiverId: isGroup ? '' : activePeer.id,
-    groupId: isGroup ? activePeer.id : '',
-    text: text, fileData: file ? file.data : '', fileName: file ? file.name : '', fileType: file ? file.type : '',
-    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true
-  };
-  mergeMessage(optimisticMsg);
-  renderMessagesContainer(getChatMessages(activePeer));
-  var container = document.getElementById('messages-container');
-  container.scrollTop = container.scrollHeight;
-  var body = {
-    senderId: currentUser.id,
-    receiverId: isGroup ? '' : activePeer.id,
-    groupId: isGroup ? activePeer.id : '',
-    text: text, fileData: file ? file.data : '', fileName: file ? file.name : '', fileType: file ? file.type : '',
-    clientId: clientId
-  };
-  var payloadStr = JSON.stringify(body);
-  var maxAttempts = 3;
-  for (var attempt = 0; attempt < maxAttempts; attempt++) {
-    var controller = new AbortController();
-    var timeoutId = setTimeout(function () { controller.abort(); }, 90000);
-    try {
-      var res = await fetch('/api/messages/send', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: payloadStr, signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      if (res.status === 403) {
-        localMessagesCache = localMessagesCache.filter(function (m) { return m.clientId !== clientId; });
-        saveCache();
-        renderMessagesContainer(getChatMessages(activePeer));
-        alert('Сообщение не доставлено: чат заблокирован.');
-        return;
-      }
-      if (!res.ok) {
-        var errText = 'Ошибка сервера (' + res.status + ')';
-        try { var j = await res.json(); if (j && j.error) errText = j.error; } catch (e) {}
-        throw new Error(errText);
-      }
-      var data = await res.json();
-      if (data && data.message) {
-        var rm = Object.assign({}, data.message); rm.isPending = false;
-        mergeMessage(rm);
-        saveCache();
-        renderMessagesContainer(getChatMessages(activePeer));
-        loadDialogsQuiet();
-        return;
-      } else { throw new Error('Пустой ответ сервера'); }
-    } catch (e) {
-      clearTimeout(timeoutId);
-      var isAbort = e && e.name === 'AbortError';
-      var isNetwork = e && (e.name === 'TypeError' || /network|failed/i.test(String(e.message)));
-      if (!isAbort && !isNetwork) break;
-      if (attempt < maxAttempts - 1) await new Promise(function (r) { setTimeout(r, 800 * (attempt + 1)); });
-    }
-  }
-}
-async function sendMsg() {
-  if (!activePeer) return;
-  if (isUploading) return;
-  if (!lockButton('send-btn', 1200)) return;
-  var input = document.getElementById('msg-input');
-  var text = input.value.trim();
-  var fileToSend = selectedFile;
-  var voiceToSend = pendingVoice;
-  if (!text && !fileToSend && !voiceToSend) return;
-  input.value = '';
-  if (voiceToSend) {
-    var voiceData = { data: voiceToSend.data, name: voiceToSend.name, type: voiceToSend.type };
-    cancelVoiceAttachment();
-    sendMessagePayload({ text: '', file: voiceData });
-    return;
-  }
-  cancelAttachment();
-  sendMessagePayload({ text: text, file: fileToSend });
-}
-
-/* ---------- ГРУППЫ ---------- */
-async function getContactUsers() {
-  var arr = [];
-  for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
-    var u = localKnownUsers[k];
-    if (u.id && u.id !== currentUser.id) {
-      arr.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
-    }
-  }
-  try {
-    var res = await fetch('/api/dialogs/' + currentUser.id);
-    var list = await res.json();
-    var serverUsers = list.filter(function (d) { return d.type !== 'group' && d.id !== currentUser.id; });
-    serverUsers.forEach(function (u) { cacheUser(u); });
-    return serverUsers;
-  } catch (e) {
-    return arr;
-  }
-}
-function renderCheckList(containerId, users, excludeSet) {
-  var c = document.getElementById(containerId);
-  c.innerHTML = '';
-  var list = users.filter(function (u) { return !excludeSet.has(u.id); });
-  if (list.length === 0) {
-    c.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px;">Нет доступных контактов. Сначала начните с кем-нибудь чат.</div>';
-    return;
-  }
-  list.forEach(function (u) {
-    var row = document.createElement('label');
-    row.className = 'check-row';
-    row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:8px; cursor:pointer; border-bottom:1px solid var(--border); border-radius:8px;';
-    var avatarId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    row.innerHTML =
-      '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;flex-shrink:0;">' +
-      '<div class="avatar-circle" id="' + avatarId + '" style="width:32px;height:32px;font-size:13px;"></div>' +
-      '<span style="flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">' + escapeHtml(u.name) + '</span>';
-    c.appendChild(row);
-    renderAvatarIntoElement(document.getElementById(avatarId), u, false);
-  });
-}
-function getChecked(containerId) {
-  return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; });
-}
-function openCreateGroup() {
-  if (isModalOpen('create-group-modal')) return;
-  groupDraftAvatar = '';
-  document.getElementById('create-group-name').value = '';
-  fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥');
-
-  var cached = [];
-  for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
-    var u = localKnownUsers[k];
-    if (u.id && u.id !== currentUser.id) {
-      cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
-    }
-  }
-  renderCheckList('create-group-contacts', cached, new Set());
-
-  safeOpenModal('create-group-modal');
-
-  getContactUsers().then(function (contacts) {
-    if (contacts.length !== cached.length) {
-      renderCheckList('create-group-contacts', contacts, new Set());
-    }
-  }).catch(function () {});
-}
-function closeCreateGroup() { safeCloseModal('create-group-modal'); }
-function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
-function handleGroupAvatarSelect(e) {
-  var file = e.target.files[0]; if (!file) return;
-  if (file.size > 10 * 1024 * 1024) {
-    alert('Файл слишком большой. Максимум 10 МБ.');
-    return;
-  }
-  compressImage(file, 200, 0.85, function (compressed) {
-    if (!compressed) { alert('Не удалось обработать изображение.'); return; }
-    groupDraftAvatar = compressed;
-    fillAvatarBox(document.getElementById('create-group-avatar'), groupDraftAvatar, '👥');
-  });
-}
-async function submitCreateGroup() {
-  var name = document.getElementById('create-group-name').value.trim();
-  if (!name) { alert('Введите название группы'); return; }
-  var members = getChecked('create-group-contacts');
-  if (members.length === 0) {
-    alert('Выберите хотя бы одного участника для группы');
-    return;
-  }
-  if (!lockButton('create-group-submit-btn', 5000)) return;
-  try {
-    var res = await fetch('/api/groups/create', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUser.id, name: name, members: members, avatar: groupDraftAvatar })
-    });
-    var data = await res.json();
-    if (data.success) {
-      closeCreateGroup();
-      lastDialogsHash = '';
-      await loadDialogs();
-      var g = data.group;
-      openChat({ id: g.id, type: 'group', name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId, memberCount: g.members.length });
-    } else { alert(data.error || 'Не удалось создать группу'); }
-  } catch (e) { alert('Ошибка создания группы'); }
-}
-async function refreshGroupInfo() {
-  if (!activePeer || activePeer.type !== 'group') return;
-  try {
-    var res = await fetch('/api/groups/' + activePeer.id);
-    if (!res.ok) return;
-    var g = await res.json();
-    activePeer.name = g.name; activePeer.avatar = g.avatar;
-    activePeer.members = g.members; activePeer.ownerId = g.ownerId;
-    activePeer.memberDetails = g.memberDetails; activePeer.memberCount = g.members.length;
-    (g.memberDetails || []).forEach(function (u) { cacheUser(u); });
-    document.getElementById('active-peer-name').innerText = g.name;
-    document.getElementById('active-peer-status').innerText = g.members.length + ' участников';
-    renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { name: g.name, avatar: g.avatar }, false);
-  } catch (e) {}
-}
-async function openGroupProfile() {
-  closeChatDropdown();
-  if (!activePeer || activePeer.type !== 'group') return;
-  if (isModalOpen('group-profile-modal')) return;
-  await refreshGroupInfo();
-  var g = activePeer;
-  editGroupDraftAvatar = '';
-  fillAvatarBox(document.getElementById('group-profile-avatar'), g.avatar, '👥');
-  document.getElementById('group-profile-name').innerText = g.name;
-  document.getElementById('group-profile-count').innerText = (g.members ? g.members.length : 0) + ' участников';
-  var isOwner = g.ownerId === currentUser.id;
-  var ownerControls = document.getElementById('group-owner-controls');
-  ownerControls.style.display = isOwner ? 'block' : 'none';
-  document.getElementById('delete-group-btn').style.display = isOwner ? 'block' : 'none';
-  if (isOwner) { document.getElementById('edit-group-name').value = g.name; }
-  renderMembersList('group-members-list', g.memberDetails || [], g.ownerId);
-  safeOpenModal('group-profile-modal');
-}
-function closeGroupProfile() {
-  editGroupDraftAvatar = '';
-  safeCloseModal('group-profile-modal');
-  closeMemberDropdown();
-}
-function renderMembersList(containerId, memberDetails, ownerId) {
-  var c = document.getElementById(containerId); c.innerHTML = '';
-  var amIOwner = ownerId === currentUser.id;
-  memberDetails.forEach(function (u) {
-    var row = document.createElement('div'); row.className = 'member-row';
-    var isOwner = u.id === ownerId;
-    var isMe = u.id === currentUser.id;
-
-    var info = document.createElement('div');
-    info.style.cssText = 'display:flex; align-items:center; gap:10px; flex:1; overflow:hidden;';
-    info.innerHTML =
-      '<div class="avatar-circle" style="width:32px;height:32px;font-size:13px;"></div>' +
-      '<div style="flex:1; text-align:left; overflow:hidden;">' +
-        '<div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(u.name) + (isMe ? ' (вы)' : '') + '</div>' +
-        (isOwner ? '<div style="font-size:11px; color:var(--accent);">создатель</div>' : '') +
-      '</div>';
-    info.onclick = function (e) {
-      e.stopPropagation();
-      if (isMe) { closeGroupProfile(); openMyProfile(); }
-      else { openMemberProfile(u); }
+function compressImage(file, maxSize, quality, callback) {
+  if (!file || file.type.indexOf('image/') !== 0) { callback(null); return; }
+  var reader = new FileReader();
+  reader.onload = function (e) {
+    var img = new Image();
+    img.onload = function () {
+      var canvas = document.createElement('canvas');
+      var w = img.width, h = img.height;
+      var r = Math.min(maxSize / w, maxSize / h, 1);
+      w = Math.round(w * r);
+      h = Math.round(h * r);
+      canvas.width = w;
+      canvas.height = h;
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      var isPng = file.type === 'image/png';
+      try { callback(canvas.toDataURL(isPng ? 'image/png' : 'image/jpeg', isPng ? undefined : quality)); }
+      catch (err) { callback(e.target.result); }
     };
-    row.appendChild(info);
-    renderAvatarIntoElement(info.querySelector('.avatar-circle'), u, u.isOnline);
-
-    if (amIOwner && !isMe && !isOwner) {
-      var dotsBtn = document.createElement('button');
-      dotsBtn.className = 'member-menu-btn';
-      dotsBtn.innerText = '⋮';
-      dotsBtn.onclick = function (e) {
-        e.stopPropagation();
-        if (activeMemberDropdown && activeMemberDropdown.dataset.memberId === u.id) {
-          closeMemberDropdown();
-        } else {
-          openMemberDropdown(row, u);
-        }
-      };
-      row.appendChild(dotsBtn);
-    }
-
-    c.appendChild(row);
-  });
+    img.onerror = function () { callback(e.target.result); };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
 }
-function openMemberDropdown(rowEl, member) {
-  closeMemberDropdown();
-  var dd = document.createElement('div');
-  dd.className = 'member-dropdown active';
-  dd.dataset.memberId = member.id;
-  dd.innerHTML =
-    '<button class="menu-item" data-action="profile">Открыть профиль</button>' +
-    '<button class="menu-item danger" data-action="kick">Выгнать из группы</button>';
-  dd.addEventListener('click', function (e) {
-    e.stopPropagation();
-    var action = e.target.getAttribute('data-action');
-    if (action === 'profile') { closeMemberDropdown(); openMemberProfile(member); }
-    else if (action === 'kick') { closeMemberDropdown(); kickMember(member); }
-  });
-  rowEl.appendChild(dd);
-  activeMemberDropdown = dd;
-  setTimeout(function () {
-    document.addEventListener('click', outsideMemberDropdownHandler, { once: true });
-  }, 0);
+
+/* ==================== MENUS ==================== */
+
+function toggleChatDropdown() {
+  var m = document.getElementById('chat-dropdown-menu');
+  if (m) m.classList.toggle('active');
 }
-function outsideMemberDropdownHandler(e) {
-  if (activeMemberDropdown && !activeMemberDropdown.contains(e.target)) {
-    closeMemberDropdown();
+function closeChatDropdown() {
+  var m = document.getElementById('chat-dropdown-menu');
+  if (m) m.classList.remove('active');
+}
+document.addEventListener('click', function (e) {
+  var m = document.getElementById('chat-dropdown-menu');
+  var b = document.getElementById('chat-menu-dots-btn');
+  if (m && m.classList.contains('active')) {
+    if (!m.contains(e.target) && e.target !== b && !b.contains(e.target)) m.classList.remove('active');
   }
+});
+function openImageViewer(src) {
+  document.getElementById('full-screen-img').src = src;
+  document.getElementById('image-viewer-modal').classList.add('active');
 }
-function closeMemberDropdown() {
-  if (activeMemberDropdown && activeMemberDropdown.parentNode) {
-    activeMemberDropdown.parentNode.removeChild(activeMemberDropdown);
-  }
-  activeMemberDropdown = null;
+function closeImageViewer() {
+  document.getElementById('image-viewer-modal').classList.remove('active');
 }
-async function kickMember(member) {
-  if (!activePeer || activePeer.type !== 'group') return;
-  if (!confirm('Выгнать ' + member.name + ' из группы «' + activePeer.name + '»?')) return;
-  try {
-    var res = await fetch('/api/groups/kick', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id, memberId: member.id })
-    });
-    var data = await res.json();
-    if (data.success) {
-      await refreshGroupInfo();
-      renderMembersList('group-members-list', activePeer.memberDetails || [], activePeer.ownerId);
-      document.getElementById('group-profile-count').innerText = (activePeer.members ? activePeer.members.length : 0) + ' участников';
-      lastDialogsHash = '';
-      loadDialogsQuiet();
-    } else { alert(data.error || 'Не удалось выгнать участника'); }
-  } catch (e) { alert('Ошибка при выгоне участника'); }
-}
-async function deleteGroup() {
-  if (!activePeer || activePeer.type !== 'group') return;
-  if (!confirm('Удалить группу «' + activePeer.name + '»? Это действие нельзя отменить.')) return;
-  if (!lockButton('delete-group-btn', 3000)) return;
-  try {
-    var res = await fetch('/api/groups/delete', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id })
-    });
-    var data = await res.json();
-    if (data.success) {
-      closeGroupProfile();
-      resetActiveChat();
-      lastDialogsHash = '';
-      loadDialogs();
-    } else { alert(data.error || 'Не удалось удалить группу'); }
-  } catch (e) { alert('Ошибка при удалении группы'); }
-}
-function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
-function handleEditGroupAvatarSelect(e) {
-  var file = e.target.files[0]; if (!file) return;
-  if (file.size > 10 * 1024 * 1024) {
-    alert('Файл слишком большой. Максимум 10 МБ.');
-    return;
-  }
-  compressImage(file, 200, 0.85, function (compressed) {
-    if (!compressed) { alert('Не удалось обработать изображение.'); return; }
-    editGroupDraftAvatar = compressed;
-    fillAvatarBox(document.getElementById('group-profile-avatar'), compressed, '👥');
-  });
-}
-async function saveGroupChanges() {
-  if (!activePeer || activePeer.type !== 'group') return;
-  if (!lockButton('save-group-btn', 3000)) return;
-  var name = document.getElementById('edit-group-name').value.trim();
-  if (!name) { alert('Введите название группы'); return; }
-  var body = { groupId: activePeer.id, userId: currentUser.id, name: name };
-  if (editGroupDraftAvatar) body.avatar = editGroupDraftAvatar;
-  try {
-    var res = await fetch('/api/groups/update', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-    });
-    var data = await res.json();
-    if (data.success) {
-      editGroupDraftAvatar = '';
-      await refreshGroupInfo();
-      lastDialogsHash = '';
-      await loadDialogsQuiet();
-      openGroupProfile();
-    } else { alert(data.error || 'Не удалось сохранить'); }
-  } catch (e) { alert('Ошибка сохранения группы'); }
-}
-async function openAddMembers() {
-  if (!activePeer || activePeer.type !== 'group') return;
-  if (isModalOpen('add-members-modal')) return;
 
-  var exclude = new Set(activePeer.members || []);
+/* ==================== SEARCH ==================== */
 
-  var cached = [];
-  for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
-    var u = localKnownUsers[k];
-    if (u.id && u.id !== currentUser.id && !exclude.has(u.id)) {
-      cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
+async function onSearchInput() {
+  var q = document.getElementById('search-input').value.trim();
+  var clr = document.getElementById('clear-search-btn');
+  if (!q) { clr.style.display = 'none'; refreshUI(); return; }
+  clr.style.display = 'block';
+  var ql = q.toLowerCase();
+  var found = [];
+  for (var uid in usersCache) {
+    if (uid === currentUser.id) continue;
+    var u = usersCache[uid];
+    if ((u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
+      found.push({ id: uid, type: 'user', name: u.name, avatar: u.avatar, isOnline: u.isOnline });
     }
   }
-  renderCheckList('add-members-contacts', cached, exclude);
-
-  safeOpenModal('add-members-modal');
-
-  getContactUsers().then(function (contacts) {
-    renderCheckList('add-members-contacts', contacts, exclude);
-  }).catch(function () {});
+  renderChatList(found);
 }
-function closeAddMembers() { safeCloseModal('add-members-modal'); }
-async function submitAddMembers() {
-  var members = getChecked('add-members-contacts');
-  if (members.length === 0) {
-    alert('Выберите хотя бы одного участника');
-    return;
-  }
-  if (!lockButton('add-members-submit-btn', 3000)) return;
-  try {
-    var res = await fetch('/api/groups/add', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id, members: members })
-    });
-    var data = await res.json();
-    if (data.success) {
-      closeAddMembers();
-      await refreshGroupInfo();
-      renderMembersList('group-members-list', activePeer.memberDetails || [], activePeer.ownerId);
-      document.getElementById('group-profile-count').innerText = (activePeer.members ? activePeer.members.length : 0) + ' участников';
-      lastDialogsHash = '';
-      loadDialogsQuiet();
-    } else { alert(data.error || 'Не удалось добавить'); }
-  } catch (e) { alert('Ошибка добавления участников'); }
-}
-async function leaveGroup() {
-  closeChatDropdown();
-  if (!activePeer || activePeer.type !== 'group') return;
-  if (!confirm('Покинуть группу «' + activePeer.name + '»?')) return;
-  try {
-    await fetch('/api/groups/leave', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id })
-    });
-    closeGroupProfile();
-    resetActiveChat();
-    lastDialogsHash = '';
-    loadDialogs();
-  } catch (e) { alert('Не удалось покинуть группу'); }
+function clearSearch() {
+  document.getElementById('search-input').value = '';
+  document.getElementById('clear-search-btn').style.display = 'none';
+  refreshUI();
 }
 
-/* ---------- ИНИЦИАЛИЗАЦИЯ ---------- */
-window.addEventListener('DOMContentLoaded', function () {
+/* ==================== INIT ==================== */
+
+window.addEventListener('DOMContentLoaded', async function () {
   updateThemeIcon(savedTheme);
   document.querySelectorAll('.modal-overlay').forEach(function (ov) {
     ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); });
   });
-  var savedUser = localStorage.getItem('messenger_user');
-  if (savedUser) {
-    try { currentUser = JSON.parse(savedUser); startApp(); } catch (e) {}
+  await loadAllFromDB();
+  
+  // Проверяем соединение
+  await checkServerHealth();
+  // Периодически проверяем пока не залогинен
+  if (!currentUser) {
+    var checkTimer = setInterval(async function () {
+      if (currentUser) { clearInterval(checkTimer); return; }
+      await checkServerHealth();
+      updateLoadingScreen();
+    }, 3000);
+  }
+  
+  if (currentUser) {
+    startApp();
+  } else {
+    document.getElementById('auth-screen').classList.add('active');
+    document.getElementById('app-screen').classList.remove('active');
+    updateLoadingScreen();
   }
 });
 `;
 
-/* ==================== РАЗДАЧА КЛИЕНТА ==================== */
+/* ==================== ROUTES ==================== */
+
 app.get('/client.js', function (req, res) {
   res.set('Content-Type', 'application/javascript; charset=utf-8');
   res.send(CLIENT_JS);
@@ -2781,21 +2641,15 @@ app.use(function (req, res) {
   res.send(CLIENT_HTML);
 });
 
-/* ==================== ОБРАБОТКА ОШИБОК ==================== */
 app.use(function (err, req, res, next) {
-  if (err && err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'Файл слишком большой' });
-  }
-  if (err && (err instanceof SyntaxError || err.type === 'entity.parse.failed')) {
-    return res.status(400).json({ error: 'Некорректный JSON' });
-  }
-  console.error('[ОШИБКА EXPRESS]:', err && err.message);
-  if (!res.headersSent) res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Too big' });
+  if (err && (err instanceof SyntaxError || err.type === 'entity.parse.failed')) return res.status(400).json({ error: 'Bad JSON' });
+  console.error('[EXPRESS]', err && err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'Server error' });
 });
 
-/* ==================== СТАРТ ==================== */
 const httpServer = app.listen(PORT, '0.0.0.0', function () {
-  console.log('[СЕРВЕР ЗАПУЩЕН] Порт: ' + PORT);
+  console.log('[STARTED] port ' + PORT);
 });
 httpServer.keepAliveTimeout = 65000;
 httpServer.headersTimeout = 66000;
