@@ -5,6 +5,16 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+/* ============================================================
+   ВЕРСИЯ КОДА
+   При несовместимых изменениях — увеличивайте MIN_CLIENT_VERSION.
+   Клиент с меньшей версией localStorage будет мигрирован.
+   Клиент с меньшей версией в коде — получит сообщение об обновлении.
+   ============================================================ */
+const SERVER_VERSION = '2.0.0';
+const MIN_CLIENT_VERSION = '2.0.0';   // минимальная совместимая версия клиента
+const API_VERSION = 'v2';
+
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
 app.use('/api/upload/chunk', express.raw({ type: 'application/octet-stream', limit: '5mb' }));
@@ -26,11 +36,21 @@ const FILES_DIR = path.join(ARXIV_DIR, 'files');
 const ACCOUNTS_FILE = path.join(ACCOUNTS_DIR, 'accounts.json');
 const MESSAGES_FILE = path.join(MESSAGES_DIR, 'messages.json');
 const GROUPS_FILE = path.join(GROUPS_DIR, 'groups.json');
+const META_FILE = path.join(ARXIV_DIR, 'server_meta.json');
 
 const CHUNK_SIZE_LIMIT = 1024 * 1024;
 const MAX_FILE_SIZE = 200 * 1024 * 1024;
 const uploads = new Map();
 
+/* ==================== СЛУЖЕБНАЯ МЕТА СЕРВЕРА ==================== */
+function readServerMeta() {
+  return safeReadJSON(META_FILE, { version: SERVER_VERSION, firstStart: Date.now() });
+}
+function writeServerMeta(m) {
+  safeWriteJSON(META_FILE, m);
+}
+
+/* ==================== ФАЙЛОВЫЕ ОПЕРАЦИИ ==================== */
 function safeReadJSON(filePath, fallback) {
   if (fallback === undefined) fallback = [];
   try {
@@ -55,6 +75,44 @@ function writeMessages(d) { safeWriteJSON(MESSAGES_FILE, d); }
 function readGroups() { return safeReadJSON(GROUPS_FILE, []); }
 function writeGroups(d) { safeWriteJSON(GROUPS_FILE, d); }
 
+/* ==================== МИГРАЦИИ ДАННЫХ ==================== */
+// При старте сервера — миграция, если нужно.
+(function runServerMigrations() {
+  const meta = readServerMeta();
+  const fromVersion = meta.version || '1.0.0';
+  
+  if (fromVersion === SERVER_VERSION) {
+    console.log('[MIGRATIONS] Уже на версии ' + SERVER_VERSION);
+    return;
+  }
+  
+  console.log('[MIGRATIONS] Обновление с ' + fromVersion + ' на ' + SERVER_VERSION);
+  
+  // ВСЕ МИГРАЦИИ ЗДЕСЬ.
+  // Например, если в 2.1.0 добавили поле "pin" в аккаунты:
+  // if (compareVersions(fromVersion, '2.1.0') < 0) { ... }
+  
+  // Пока миграций с изменением структуры нет — просто фиксируем версию.
+  meta.version = SERVER_VERSION;
+  meta.lastMigration = Date.now();
+  meta.firstStart = meta.firstStart || Date.now();
+  writeServerMeta(meta);
+  console.log('[MIGRATIONS] Готово');
+})();
+
+function compareVersions(a, b) {
+  const aParts = String(a).split('.').map(Number);
+  const bParts = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
+    const av = aParts[i] || 0;
+    const bv = bParts[i] || 0;
+    if (av > bv) return 1;
+    if (av < bv) return -1;
+  }
+  return 0;
+}
+
+/* ==================== УТИЛИТЫ ==================== */
 function encryptText(text) {
   if (!text) return '';
   try { return Buffer.from(String(text), 'utf8').toString('base64'); }
@@ -71,9 +129,15 @@ function decryptText(text) {
 function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
 
-/* ==================== HEALTH ==================== */
+/* ==================== HEALTH С ВЕРСИЕЙ ==================== */
 app.get('/api/health', function (req, res) {
-  res.json({ ok: true, serverTime: Date.now() });
+  res.json({
+    ok: true,
+    serverTime: Date.now(),
+    serverVersion: SERVER_VERSION,
+    minClientVersion: MIN_CLIENT_VERSION,
+    apiVersion: API_VERSION
+  });
 });
 
 /* ==================== АККАУНТЫ ==================== */
@@ -96,7 +160,9 @@ app.post('/api/register', function (req, res) {
     user = {
       id: finalId, name: name.trim(), avatar: avatar || '',
       contacts: Array.isArray(contacts) ? contacts : [],
-      blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now()
+      blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now(),
+      createdAt: Date.now(),
+      schemaVersion: SERVER_VERSION
     };
     accounts.push(user);
   }
@@ -117,7 +183,8 @@ app.post('/api/ping', function (req, res) {
       if (!existing) {
         accounts.push({
           id: kUser.id, name: kUser.name || 'Пользователь', avatar: kUser.avatar || '',
-          contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0
+          contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0,
+          createdAt: Date.now(), schemaVersion: SERVER_VERSION
         });
       } else {
         if (kUser.name) existing.name = kUser.name;
@@ -131,7 +198,8 @@ app.post('/api/ping', function (req, res) {
     user = {
       id: id, name: name || 'Пользователь', avatar: avatar || '',
       contacts: Array.isArray(contacts) ? contacts : [],
-      blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now()
+      blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now(),
+      createdAt: Date.now(), schemaVersion: SERVER_VERSION
     };
     accounts.push(user);
   } else {
@@ -234,7 +302,8 @@ app.post('/api/groups/create', function (req, res) {
   const groups = readGroups();
   const group = {
     id: genId('grp_'), name: name.trim(), avatar: avatar || '',
-    ownerId: userId, members: Array.from(memberSet), createdAt: Date.now()
+    ownerId: userId, members: Array.from(memberSet), createdAt: Date.now(),
+    schemaVersion: SERVER_VERSION
   };
   groups.push(group);
   writeGroups(groups);
@@ -347,6 +416,7 @@ app.post('/api/groups/leave', function (req, res) {
 app.post('/api/messages/send', function (req, res) {
   const senderId = req.body.senderId, receiverId = req.body.receiverId, groupId = req.body.groupId;
   const text = req.body.text, fileData = req.body.fileData, fileName = req.body.fileName, fileType = req.body.fileType, clientId = req.body.clientId;
+  const fileUrl = req.body.fileUrl, fileSize = req.body.fileSize;
   const accounts = readAccounts();
   const messages = readMessages();
 
@@ -383,7 +453,11 @@ app.post('/api/messages/send', function (req, res) {
     receiverId: groupId ? '' : receiverId,
     groupId: groupId || '',
     text: encryptText(text || ''),
-    fileData: fileData || '', fileName: fileName || '', fileType: fileType || '',
+    fileData: fileData || '',
+    fileUrl: fileUrl || '',
+    fileName: fileName || '',
+    fileType: fileType || '',
+    fileSize: fileSize || 0,
     timestamp: timeStr(), ts: Date.now(),
     isRead: false, readBy: [], isDeleted: false,
     clearedFor: []
@@ -590,6 +664,8 @@ app.get('/files/:name', function (req, res) {
 });
 
 /* ==================== HTML ==================== */
+// (Стили и HTML — оставляю как в предыдущей версии, они не изменились.
+//  Единственное добавление: элемент для показа "устаревшая версия", см. JS.)
 const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
@@ -627,12 +703,14 @@ const CLIENT_HTML = `<!DOCTYPE html>
   #status-bar.server-off { background: #f9a825; color: #000; }
   #status-bar.reconnected { background: #4cd964; color: #fff; }
   
-  #loading-screen { display: none; position: fixed; inset: 0; background: var(--bg-app); z-index: 10000; flex-direction: column; align-items: center; justify-content: center; gap: 20px; }
+  #loading-screen { display: none; position: fixed; inset: 0; background: var(--bg-app); z-index: 10000; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 20px; text-align: center; }
   #loading-screen.active { display: flex; }
   .spinner { width: 50px; height: 50px; border: 4px solid var(--bg-input); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .loading-text { color: var(--text-muted); font-size: 15px; text-align: center; padding: 0 20px; }
   .loading-title { font-size: 20px; font-weight: bold; color: var(--text-main); text-align: center; }
+  
+  .version-info { position: fixed; bottom: 8px; right: 10px; font-size: 10px; color: var(--text-muted); z-index: 9998; opacity: 0.6; }
   
   #app-container { display: flex; width: 100%; height: 100%; }
   .sidebar { width: 320px; background: var(--bg-sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
@@ -738,11 +816,14 @@ const CLIENT_HTML = `<!DOCTYPE html>
 </head>
 <body>
   <div id="status-bar"></div>
+  <div class="version-info" id="version-info"></div>
+  
   <div id="loading-screen">
     <div class="loading-title" id="loading-title">Соединение...</div>
     <div class="spinner"></div>
     <div class="loading-text" id="loading-text">Подключаемся к серверу</div>
   </div>
+  
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Вход в мессенджер</h2>
@@ -753,6 +834,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
       <button class="btn" id="login-btn" onclick="registerUser()">Войти</button>
     </div>
   </div>
+  
   <div id="app-screen" class="screen">
     <div id="app-container">
       <div class="sidebar">
@@ -932,6 +1014,16 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
+/* ============================================================
+   ВЕРСИЯ КЛИЕНТА
+   При обновлении кода — увеличьте CLIENT_VERSION здесь и
+   в SERVER_VERSION выше. Если у пользователя в localStorage
+   сохранена меньшая версия — будет вызвана миграция.
+   ============================================================ */
+var CLIENT_VERSION = '2.0.0';
+var MIN_COMPATIBLE_VERSION = '1.0.0';   // ниже этой версии — считаем устаревшим
+var SCHEMA_VERSION_KEY = 'messenger_schema_version';
+
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -949,9 +1041,9 @@ var selectedMsgObj = null;
 var longTouchTimer = null;
 var groupDraftAvatar = '';
 var editGroupDraftAvatar = '';
-var localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}');
-var mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]');
-var localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]');
+var localKnownUsers = {};
+var mutedPeers = [];
+var localMessagesCache = [];
 var savedTheme = localStorage.getItem('app_theme') || 'dark';
 document.documentElement.setAttribute('data-theme', savedTheme);
 var audioPool = new Map();
@@ -967,7 +1059,98 @@ var connectionState = 'checking';
 var statusBarTimeout = null;
 var CHUNK_SIZE = 500 * 1024;
 var MAX_FILE_SIZE = 200 * 1024 * 1024;
-var lastKnownGroupsHash = '';
+var serverVersion = 'unknown';
+var serverMinClientVersion = '0.0.0';
+
+/* ==================== ВЕРСИИ И МИГРАЦИЯ ==================== */
+function compareVersions(a, b) {
+  var aP = String(a || '0').split('.').map(function (n) { return parseInt(n, 10) || 0; });
+  var bP = String(b || '0').split('.').map(function (n) { return parseInt(n, 10) || 0; });
+  var max = Math.max(aP.length, bP.length);
+  for (var i = 0; i < max; i++) {
+    var av = aP[i] || 0;
+    var bv = bP[i] || 0;
+    if (av > bv) return 1;
+    if (av < bv) return -1;
+  }
+  return 0;
+}
+
+/* Миграция localStorage при обновлении версии.
+   Здесь можно безопасно менять структуру данных —
+   старые данные будут сконвертированы в новые. */
+function runClientMigrations() {
+  var storedVersion = localStorage.getItem(SCHEMA_VERSION_KEY) || '1.0.0';
+  var userVersion = CLIENT_VERSION;
+  
+  console.log('[MIGRATION] schema=' + storedVersion + ' client=' + userVersion);
+  
+  if (storedVersion === userVersion) {
+    console.log('[MIGRATION] Уже на версии ' + userVersion);
+    return;
+  }
+  
+  // === ЗАГРУЖАЕМ СЫРЫЕ ДАННЫЕ ===
+  var rawUser = null, rawKnown = {}, rawMsgs = [], rawMuted = [];
+  try { rawUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) {}
+  try { rawKnown = JSON.parse(localStorage.getItem('messenger_known_users') || '{}'); } catch (e) {}
+  try { rawMsgs = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]'); } catch (e) {}
+  try { rawMuted = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]'); } catch (e) {}
+  
+  // === ЗДЕСЬ БУДУЩИЕ МИГРАЦИИ ===
+  // Пример: если в 2.1.0 добавили поле "pin" — здесь его инициализируем.
+  // if (compareVersions(storedVersion, '2.1.0') < 0) { ... }
+  
+  // Гарантируем наличие полей у профиля
+  if (rawUser && typeof rawUser === 'object') {
+    if (!Array.isArray(rawUser.contacts)) rawUser.contacts = [];
+    if (!Array.isArray(rawUser.blockedContacts)) rawUser.blockedContacts = [];
+    if (!Array.isArray(rawUser.hiddenDialogs)) rawUser.hiddenDialogs = [];
+    if (!rawUser.name) rawUser.name = 'Пользователь';
+  }
+  
+  // Гарантируем что каждый known user имеет структуру
+  Object.keys(rawKnown).forEach(function (uid) {
+    var u = rawKnown[uid];
+    if (u && typeof u === 'object') {
+      if (!u.id) u.id = uid;
+      if (!u.name) u.name = 'Пользователь';
+      if (u.avatar === undefined) u.avatar = '';
+    }
+  });
+  
+  // Гарантируем что каждое сообщение имеет нужные поля
+  rawMsgs.forEach(function (m) {
+    if (!m || typeof m !== 'object') return;
+    if (!m.id) m.id = 'msg_migrated_' + Math.random().toString(36).substr(2, 9);
+    if (m.text === undefined) m.text = '';
+    if (m.fileData === undefined) m.fileData = '';
+    if (m.fileUrl === undefined) m.fileUrl = '';
+    if (m.fileName === undefined) m.fileName = '';
+    if (m.fileType === undefined) m.fileType = '';
+    if (m.fileSize === undefined) m.fileSize = 0;
+    if (!m.timestamp) m.timestamp = '';
+    if (typeof m.ts !== 'number') m.ts = Date.now();
+    if (!Array.isArray(m.readBy)) m.readBy = [];
+    if (typeof m.isRead !== 'boolean') m.isRead = false;
+    if (typeof m.isDeleted !== 'boolean') m.isDeleted = false;
+    if (!Array.isArray(m.clearedFor)) m.clearedFor = [];
+    if (!m.senderId) m.senderId = '';
+    if (m.receiverId === undefined) m.receiverId = '';
+    if (m.groupId === undefined) m.groupId = '';
+  });
+  
+  // === СОХРАНЯЕМ ОБРАТНО ===
+  try {
+    if (rawUser) localStorage.setItem('messenger_user', JSON.stringify(rawUser));
+    localStorage.setItem('messenger_known_users', JSON.stringify(rawKnown));
+    localStorage.setItem('messenger_messages_cache', JSON.stringify(rawMsgs));
+    localStorage.setItem('messenger_muted_peers', JSON.stringify(rawMuted));
+  } catch (e) { console.warn('Ошибка записи миграции:', e); }
+  
+  localStorage.setItem(SCHEMA_VERSION_KEY, userVersion);
+  console.log('[MIGRATION] Готово → ' + userVersion);
+}
 
 /* ==================== СОХРАНЕНИЕ ==================== */
 function saveCache() {
@@ -1022,7 +1205,6 @@ function setConnectionState(state) {
   updateStatusBar();
   updateLoadingScreen();
 }
-
 function updateStatusBar() {
   var bar = document.getElementById('status-bar');
   if (!bar) return;
@@ -1047,7 +1229,6 @@ function updateStatusBar() {
     bar.dataset.wasOffline = '1';
   }
 }
-
 function updateLoadingScreen() {
   var ls = document.getElementById('loading-screen');
   var title = document.getElementById('loading-title');
@@ -1082,6 +1263,17 @@ async function checkServerHealth() {
     var res = await fetch('/api/health?_=' + Date.now(), { signal: ctrl.signal });
     clearTimeout(tm);
     if (res.ok) {
+      var data = await res.json();
+      serverVersion = data.serverVersion || 'unknown';
+      serverMinClientVersion = data.minClientVersion || '0.0.0';
+      updateVersionInfo();
+      
+      // Проверка совместимости
+      if (compareVersions(CLIENT_VERSION, serverMinClientVersion) < 0) {
+        showUpdateRequired();
+        return false;
+      }
+      
       setConnectionState('online');
       return true;
     }
@@ -1092,6 +1284,25 @@ async function checkServerHealth() {
     else setConnectionState('server-offline');
     return false;
   }
+}
+
+function updateVersionInfo() {
+  var el = document.getElementById('version-info');
+  if (!el) return;
+  el.innerText = 'client v' + CLIENT_VERSION + ' · server v' + serverVersion;
+}
+
+function showUpdateRequired() {
+  var ls = document.getElementById('loading-screen');
+  var title = document.getElementById('loading-title');
+  var text = document.getElementById('loading-text');
+  if (!ls) return;
+  ls.classList.add('active');
+  title.innerText = 'Требуется обновление';
+  text.innerText = 'Пожалуйста, обновите страницу (Ctrl+Shift+R или Cmd+Shift+R)';
+  // Прячем спиннер
+  var sp = ls.querySelector('.spinner');
+  if (sp) sp.style.display = 'none';
 }
 
 window.addEventListener('online', async function () {
@@ -1139,25 +1350,6 @@ function quickHash(str) {
   var sample = head + '|' + tail + '|' + len;
   for (var i = 0; i < sample.length; i++) h = ((h << 5) - h + sample.charCodeAt(i)) | 0;
   return len + '_' + (h >>> 0).toString(36);
-}
-function dataUrlToBlobUrl(dataUrl) {
-  var commaIdx = dataUrl.indexOf(',');
-  if (commaIdx === -1) return null;
-  var meta = dataUrl.substring(5, commaIdx);
-  var isBase64 = meta.indexOf(';base64') !== -1;
-  var mime = meta.split(';')[0] || 'application/octet-stream';
-  var blob;
-  if (isBase64) {
-    var b64 = dataUrl.substring(commaIdx + 1);
-    var bin = atob(b64);
-    var bytes = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    blob = new Blob([bytes], { type: mime });
-  } else {
-    var decoded = decodeURIComponent(dataUrl.substring(commaIdx + 1));
-    blob = new Blob([decoded], { type: mime });
-  }
-  return URL.createObjectURL(blob);
 }
 function pauseAllAudio() { audioPool.forEach(function (entry) { try { entry.element.pause(); } catch (e) {} }); }
 function playNotificationSound() {
@@ -1271,7 +1463,6 @@ function renderAvatarIntoElement(el, userObj, isOnline) {
 function fillAvatarBox(el, avatar, fallback) {
   renderAvatarIntoElement(el, { avatar: avatar, name: fallback || '?' }, false);
 }
-
 function cacheUser(user) {
   if (!user || !user.id || user.type === 'group') return;
   localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar, updatedAt: Date.now() };
@@ -1333,6 +1524,7 @@ async function registerUser() {
     if (!data.success) { errBox.innerText = data.error || 'Ошибка'; errBox.style.display = 'block'; return; }
     currentUser = data.user;
     localStorage.setItem('messenger_user', JSON.stringify(currentUser));
+    localStorage.setItem(SCHEMA_VERSION_KEY, CLIENT_VERSION);
     startApp();
   } catch (e) {
     errBox.innerText = 'Сервер недоступен';
@@ -1361,7 +1553,6 @@ function startApp() {
     }
   }, 2000);
   
-  // Проверка health каждые 4 сек
   setInterval(async function () {
     if (!currentUser) return;
     var wasOnline = connectionState === 'online';
@@ -1627,7 +1818,6 @@ async function onSearchInput() {
   if (!q) { clearBtn.style.display = 'none'; lastDialogsHash = ''; loadDialogs(); return; }
   clearBtn.style.display = 'block';
   
-  // Локальные совпадения
   var ql = q.toLowerCase();
   var localFound = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
@@ -1639,7 +1829,6 @@ async function onSearchInput() {
   }
   renderChatList(localFound);
   
-  // Серверный поиск
   if (connectionState !== 'online') return;
   try {
     var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
@@ -1806,7 +1995,6 @@ function renderMessagesContainer(messages) {
     var fileType = m.fileType || '';
     
     if (m.fileUrl) {
-      // Загруженный на сервер файл
       if (fileType.indexOf('image/') === 0) {
         html += '<img src="' + m.fileUrl + '" class="media-preview" data-full="1">';
       } else if (fileType.indexOf('video/') === 0) {
@@ -2105,7 +2293,9 @@ async function sendMsg() {
     senderId: currentUser.id,
     receiverId: isGroup ? '' : activePeer.id,
     groupId: isGroup ? activePeer.id : '',
-    text: text, fileData: fileToSend && !fileToSend.isLarge ? fileToSend.data : '', fileName: fileToSend ? fileToSend.name : (voiceToSend ? voiceToSend.name : ''),
+    text: text,
+    fileData: fileToSend && !fileToSend.isLarge ? fileToSend.data : '',
+    fileName: fileToSend ? fileToSend.name : (voiceToSend ? voiceToSend.name : ''),
     fileType: fileToSend ? fileToSend.type : (voiceToSend ? voiceToSend.type : ''),
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true
@@ -2124,7 +2314,6 @@ async function sendMsg() {
   }
   
   if (fileToSend && fileToSend.isLarge && fileToSend.file) {
-    // Загрузка чанками
     isUploading = true;
     var inputBar = document.getElementById('input-bar');
     var originalHTML = inputBar.innerHTML;
@@ -2137,7 +2326,6 @@ async function sendMsg() {
         if (bar) bar.style.width = p + '%';
         if (txt) txt.innerText = p + '% • ' + formatBytes(Math.min(done * CHUNK_SIZE, fileToSend.file.size));
       });
-      // Отправляем сообщение с fileUrl
       await sendLargeFileMessage({
         clientId: clientId,
         fileName: fileToSend.name,
@@ -2570,23 +2758,37 @@ window.addEventListener('DOMContentLoaded', async function () {
     ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); });
   });
   
+  // Миграция localStorage ПЕРЕД загрузкой
+  runClientMigrations();
+  
+  // Загрузка данных
+  try {
+    currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null');
+  } catch (e) { currentUser = null; }
+  try {
+    localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}');
+  } catch (e) { localKnownUsers = {}; }
+  try {
+    localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]');
+  } catch (e) { localMessagesCache = []; }
+  try {
+    mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]');
+  } catch (e) { mutedPeers = []; }
+  
+  updateVersionInfo();
+  
   // Проверка соединения
   await checkServerHealth();
   
-  // Периодическая проверка пока не залогинен
-  if (!localStorage.getItem('messenger_user')) {
+  if (!currentUser) {
     setInterval(async function () {
       await checkServerHealth();
       updateLoadingScreen();
     }, 3000);
   }
   
-  var savedUser = localStorage.getItem('messenger_user');
-  if (savedUser) {
-    try {
-      currentUser = JSON.parse(savedUser);
-      startApp();
-    } catch (e) {}
+  if (currentUser) {
+    startApp();
   } else {
     updateLoadingScreen();
   }
@@ -2612,7 +2814,7 @@ app.use(function (err, req, res, next) {
 });
 
 const httpServer = app.listen(PORT, '0.0.0.0', function () {
-  console.log('[STARTED] port ' + PORT);
+  console.log('[STARTED v' + SERVER_VERSION + '] port ' + PORT);
 });
 httpServer.keepAliveTimeout = 65000;
 httpServer.headersTimeout = 66000;
