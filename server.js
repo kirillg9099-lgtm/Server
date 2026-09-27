@@ -91,12 +91,11 @@ function pushEvent(ev) {
 
 /* ==================== API ==================== */
 
-// Проверка соединения клиента с сервером
 app.get('/api/health', function (req, res) {
   res.json({ ok: true, serverTime: Date.now() });
 });
 
-// РЕГИСТРАЦИЯ — только через сервер. Если сервер жив, но не подтвердил — отказ
+// РЕГИСТРАЦИЯ — только через сервер
 app.post('/api/register', function (req, res) {
   const { name } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите имя' });
@@ -139,6 +138,28 @@ app.get('/api/profiles', function (req, res) {
   const result = Object.keys(profilesCache).map(id => {
     const p = profilesCache[id];
     return { id, name: p.name, avatar: p.avatar || '', isOnline: onlineUsers.has(id) };
+  });
+  res.json(result);
+});
+
+// ПОИСК ПОЛЬЗОВАТЕЛЕЙ
+app.get('/api/users/search', function (req, res) {
+  const q = (req.query.q || '').toLowerCase().trim();
+  if (!q) return res.json([]);
+  const result = [];
+  Object.keys(profilesCache).forEach(id => {
+    const p = profilesCache[id];
+    if (!p.name) return;
+    if ((p.id && p.id.toLowerCase().indexOf(q) !== -1) ||
+        (p.name && p.name.toLowerCase().indexOf(q) !== -1)) {
+      result.push({
+        id: p.id,
+        type: 'user',
+        name: p.name,
+        avatar: p.avatar || '',
+        isOnline: onlineUsers.has(p.id)
+      });
+    }
   });
   res.json(result);
 });
@@ -381,14 +402,12 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .btn-danger { background: #e53935; color: #fff; }
   .error-msg { color: #e53935; font-size: 12px; margin-top: 8px; display: none; }
   
-  /* STATUS BAR - состояние соединения */
   #status-bar { position: fixed; top: 0; left: 0; right: 0; padding: 8px; text-align: center; font-size: 13px; font-weight: 600; z-index: 9999; transition: transform 0.3s, opacity 0.3s; transform: translateY(-100%); }
   #status-bar.visible { transform: translateY(0); }
   #status-bar.internet-off { background: #e53935; color: #fff; }
   #status-bar.server-off { background: #f9a825; color: #000; }
   #status-bar.reconnected { background: #4cd964; color: #fff; }
   
-  /* LOADING SCREEN */
   #loading-screen { display: none; position: fixed; inset: 0; background: var(--bg-app); z-index: 10000; flex-direction: column; align-items: center; justify-content: center; gap: 20px; }
   #loading-screen.active { display: flex; }
   .spinner { width: 50px; height: 50px; border: 4px solid var(--bg-input); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
@@ -500,10 +519,8 @@ const CLIENT_HTML = `<!DOCTYPE html>
 </head>
 <body>
   
-  <!-- STATUS BAR -->
   <div id="status-bar"></div>
   
-  <!-- LOADING SCREEN -->
   <div id="loading-screen">
     <div class="loading-title" id="loading-title">Соединение...</div>
     <div class="spinner"></div>
@@ -702,10 +719,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
 /* ==================== CLIENT JS ==================== */
 
 const CLIENT_JS = `
-/* ============================================================
-   Соединение с сервером обязательно. Хранилище — IndexedDB.
-   ============================================================ */
-
 var appDB = null;
 var messagesCache = {};
 var usersCache = {};
@@ -724,8 +737,7 @@ var syncState = {
   isPulling: false
 };
 
-// Состояние соединения
-var connectionState = 'checking'; // 'checking' | 'online' | 'server-offline' | 'no-internet'
+var connectionState = 'checking';
 
 var savedTheme = localStorage.getItem('app_theme') || 'dark';
 document.documentElement.setAttribute('data-theme', savedTheme);
@@ -751,6 +763,7 @@ var busyButtons = {};
 var CHUNK_SIZE = 500 * 1024;
 var MAX_FILE_SIZE = 200 * 1024 * 1024;
 var statusBarTimeout = null;
+var searchDebounce = null;
 
 /* ==================== INDEXEDDB ==================== */
 
@@ -850,7 +863,6 @@ function updateStatusBar() {
   if (statusBarTimeout) { clearTimeout(statusBarTimeout); statusBarTimeout = null; }
   bar.className = '';
   if (connectionState === 'online') {
-    // Если только что восстановилось — показать зелёную плашку на 2 сек
     if (bar.dataset.wasOffline === '1') {
       bar.innerText = '✓ Подключено';
       bar.className = 'visible reconnected';
@@ -875,7 +887,6 @@ function updateLoadingScreen() {
   var title = document.getElementById('loading-title');
   var text = document.getElementById('loading-text');
   if (!ls) return;
-  // Показываем экран загрузки только если ещё не залогинились и связи нет
   if (currentUser) { ls.classList.remove('active'); return; }
   if (connectionState === 'online') {
     ls.classList.remove('active');
@@ -895,12 +906,10 @@ function updateLoadingScreen() {
 }
 
 async function checkServerHealth() {
-  // 1. Есть ли вообще интернет?
   if (!navigator.onLine) {
     setConnectionState('no-internet');
     return false;
   }
-  // 2. Отвечает ли сервер?
   try {
     var ctrl = new AbortController();
     var tm = setTimeout(function () { ctrl.abort(); }, 5000);
@@ -913,7 +922,6 @@ async function checkServerHealth() {
     setConnectionState('server-offline');
     return false;
   } catch (e) {
-    // Отличить internet-off от server-off
     if (!navigator.onLine) setConnectionState('no-internet');
     else setConnectionState('server-offline');
     return false;
@@ -1402,21 +1410,16 @@ async function respondWithFile(fileId, toUserId) {
 /* ==================== SYNC LOOP ==================== */
 
 function startSyncLoop() {
-  // Проверка здоровья сервера
   setInterval(async function () {
     if (!currentUser) return;
     var wasOnline = connectionState === 'online';
     var ok = await checkServerHealth();
-    if (ok) {
-      if (!wasOnline) {
-        // Только что подключились — пушим и тянем
-        pushToServer();
-        pullFromServer();
-      }
+    if (ok && !wasOnline) {
+      pushToServer();
+      pullFromServer();
     }
   }, 4000);
   
-  // Пинг + пуш + пул
   setInterval(async function () {
     if (!currentUser) return;
     if (connectionState !== 'online') return;
@@ -1432,7 +1435,7 @@ function startSyncLoop() {
   }, 2000);
 }
 
-/* ==================== REGISTER (только через сервер) ==================== */
+/* ==================== REGISTER ==================== */
 
 async function registerUser() {
   if (busyButtons['login-btn']) return;
@@ -1440,13 +1443,11 @@ async function registerUser() {
   var errBox = document.getElementById('auth-error');
   if (!name) { errBox.innerText = 'Введите имя'; errBox.style.display = 'block'; return; }
   
-  // Проверяем соединение с сервером
   if (connectionState !== 'online') {
     errBox.innerText = connectionState === 'no-internet'
       ? 'Нет подключения к интернету'
       : 'Нет соединения с сервером';
     errBox.style.display = 'block';
-    // Запускаем проверку чаще
     checkServerHealth();
     return;
   }
@@ -1470,7 +1471,6 @@ async function registerUser() {
       errBox.style.display = 'block';
       return;
     }
-    // Профиль подтверждён сервером
     currentUser = {
       id: data.user.id,
       name: data.user.name,
@@ -1498,7 +1498,6 @@ async function startApp() {
   refreshUI();
   startSyncLoop();
   
-  // Запрос синхронизации у контактов
   setTimeout(function () {
     if (currentUser && currentUser.contacts && currentUser.contacts.length > 0 && connectionState === 'online') {
       currentUser.contacts.forEach(function (cid) {
@@ -1523,7 +1522,9 @@ function updateMyProfileUI() {
 
 function refreshUI() {
   if (!currentUser) return;
-  renderChatListFromCache();
+  // Не сбрасываем список если пользователь сейчас ищет
+  var searchVal = document.getElementById('search-input').value.trim();
+  if (!searchVal) renderChatListFromCache();
   if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
 }
 
@@ -2580,23 +2581,68 @@ function closeImageViewer() {
 async function onSearchInput() {
   var q = document.getElementById('search-input').value.trim();
   var clr = document.getElementById('clear-search-btn');
-  if (!q) { clr.style.display = 'none'; refreshUI(); return; }
+  if (!q) { clr.style.display = 'none'; renderChatListFromCache(); return; }
   clr.style.display = 'block';
+  
+  // 1. Локальные совпадения показываем мгновенно
   var ql = q.toLowerCase();
-  var found = [];
+  var localFound = [];
   for (var uid in usersCache) {
     if (uid === currentUser.id) continue;
     var u = usersCache[uid];
-    if ((u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
-      found.push({ id: uid, type: 'user', name: u.name, avatar: u.avatar, isOnline: u.isOnline });
+    if ((u.id && u.id.toLowerCase().indexOf(ql) !== -1) ||
+        (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
+      localFound.push({ id: uid, type: 'user', name: u.name, avatar: u.avatar, isOnline: u.isOnline });
     }
   }
-  renderChatList(found);
+  renderChatList(localFound);
+  
+  // 2. Потом — запрос к серверу (найти всех, кого мы ещё не знаем)
+  if (connectionState !== 'online') return;
+  // Дебаунс чтобы не спамить
+  if (searchDebounce) clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(async function () {
+    try {
+      var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
+      if (!res.ok) return;
+      var users = await res.json();
+      
+      // Объединяем: серверные + локальные (без дублей)
+      var seen = new Set();
+      var merged = [];
+      
+      users.forEach(function (u) {
+        if (u.id === currentUser.id) return;
+        if (seen.has(u.id)) return;
+        seen.add(u.id);
+        // Кешируем найденных
+        if (!usersCache[u.id]) {
+          usersCache[u.id] = { id: u.id, name: u.name, avatar: u.avatar, isOnline: u.isOnline };
+          dbPut('users', usersCache[u.id]);
+        } else {
+          // Обновляем статус онлайна
+          usersCache[u.id].isOnline = u.isOnline;
+          if (u.name) usersCache[u.id].name = u.name;
+          if (u.avatar !== undefined) usersCache[u.id].avatar = u.avatar;
+        }
+        merged.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar, isOnline: u.isOnline });
+      });
+      
+      localFound.forEach(function (u) {
+        if (seen.has(u.id)) return;
+        seen.add(u.id);
+        merged.push(u);
+      });
+      
+      renderChatList(merged);
+    } catch (e) {}
+  }, 200);
 }
+
 function clearSearch() {
   document.getElementById('search-input').value = '';
   document.getElementById('clear-search-btn').style.display = 'none';
-  refreshUI();
+  renderChatListFromCache();
 }
 
 /* ==================== INIT ==================== */
@@ -2608,9 +2654,7 @@ window.addEventListener('DOMContentLoaded', async function () {
   });
   await loadAllFromDB();
   
-  // Проверяем соединение
   await checkServerHealth();
-  // Периодически проверяем пока не залогинен
   if (!currentUser) {
     var checkTimer = setInterval(async function () {
       if (currentUser) { clearInterval(checkTimer); return; }
