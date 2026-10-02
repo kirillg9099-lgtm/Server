@@ -10,6 +10,7 @@ const MIN_CLIENT_VERSION = '1.0.0';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
+app.use('/api/upload/chunk', express.raw({ type: 'application/octet-stream', limit: '5mb' }));
 
 process.on('uncaughtException', function (err) { console.error('[СЕРВЕР]:', err); });
 process.on('unhandledRejection', function (r) { console.error('[ПРОМИС]:', r); });
@@ -30,7 +31,9 @@ const MESSAGES_FILE = path.join(MESSAGES_DIR, 'messages.json');
 const GROUPS_FILE = path.join(GROUPS_DIR, 'groups.json');
 const META_FILE = path.join(ARXIV_DIR, 'server_meta.json');
 
+const CHUNK_SIZE_LIMIT = 1024 * 1024;
 const MAX_FILE_SIZE = 200 * 1024 * 1024;
+const uploads = new Map();
 
 /* ==================== ФАЙЛЫ ==================== */
 function safeReadJSON(fp, fb) {
@@ -81,6 +84,7 @@ function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toStri
     return;
   }
   console.log('[MIGRATIONS] ' + fromVersion + ' → ' + SERVER_VERSION);
+  // Тут будущие миграции данных accounts/messages/groups
   meta.version = SERVER_VERSION;
   meta.lastMigration = Date.now();
   meta.firstStart = meta.firstStart || Date.now();
@@ -367,12 +371,6 @@ app.post('/api/messages/send', function (req, res) {
   const senderId = req.body.senderId, receiverId = req.body.receiverId, groupId = req.body.groupId;
   const text = req.body.text, fileData = req.body.fileData, fileName = req.body.fileName, fileType = req.body.fileType, clientId = req.body.clientId;
   const fileUrl = req.body.fileUrl, fileSize = req.body.fileSize;
-  const videoGroupId = req.body.videoGroupId || '';
-  const videoPartIndex = typeof req.body.videoPartIndex === 'number' ? req.body.videoPartIndex : -1;
-  const videoPartTotal = req.body.videoPartTotal || 0;
-  const isVideoPart = !!req.body.isVideoPart;
-  const isVideoContainer = !!req.body.isVideoContainer;
-
   const accounts = readAccounts();
   const messages = readMessages();
 
@@ -414,11 +412,6 @@ app.post('/api/messages/send', function (req, res) {
     fileName: fileName || '',
     fileType: fileType || '',
     fileSize: fileSize || 0,
-    videoGroupId: videoGroupId,
-    videoPartIndex: videoPartIndex,
-    videoPartTotal: videoPartTotal,
-    isVideoPart: isVideoPart,
-    isVideoContainer: isVideoContainer,
     timestamp: timeStr(), ts: Date.now(),
     isRead: false, readBy: [], isDeleted: false, clearedFor: []
   };
@@ -459,6 +452,13 @@ app.delete('/api/messages/:msgId', function (req, res) {
     }
   });
   if (changed) writeMessages(messages);
+  // Удаляем файл с диска, если это был fileUrl
+  try {
+    const files = fs.readdirSync(FILES_DIR);
+    files.forEach(function (f) {
+      if (f.indexOf(msgId) === 0) { try { fs.unlinkSync(path.join(FILES_DIR, f)); } catch (e) {} }
+    });
+  } catch (e) {}
   res.json({ success: true });
 });
 
@@ -556,6 +556,76 @@ app.get('/api/dialogs/:userId', function (req, res) {
 
   const all = userDialogs.concat(groupDialogs).sort(function (a, b) { return (b.lastTs || 0) - (a.lastTs || 0); });
   res.json(all);
+});
+
+/* ==================== FILES ==================== */
+app.post('/api/upload/init', function (req, res) {
+  const { senderId, fileName, fileSize, fileType } = req.body;
+  if (!senderId) return res.status(400).json({ error: 'No sender' });
+  if (fileSize > MAX_FILE_SIZE) return res.status(413).json({ error: 'Too big' });
+  const fileId = 'f_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+  const totalChunks = Math.ceil((fileSize || 0) / CHUNK_SIZE_LIMIT);
+  uploads.set(fileId, { fileId, fileName, fileSize, fileType, senderId, totalChunks, chunks: [], received: 0, startedAt: Date.now() });
+  res.json({ success: true, fileId, totalChunks, chunkSize: CHUNK_SIZE_LIMIT });
+});
+
+app.post('/api/upload/chunk', function (req, res) {
+  const fileId = req.query.fileId;
+  const idx = parseInt(req.query.chunkIndex, 10);
+  const up = uploads.get(fileId);
+  if (!up) return res.status(404).json({ error: 'Not found' });
+  if (isNaN(idx) || idx < 0 || idx >= up.totalChunks) return res.status(400).json({ error: 'Bad chunk' });
+  up.chunks[idx] = Buffer.from(req.body);
+  up.received = up.chunks.filter(c => c).length;
+  res.json({ success: true, received: up.received, total: up.totalChunks });
+});
+
+app.post('/api/upload/finish', function (req, res) {
+  const { fileId } = req.body;
+  const up = uploads.get(fileId);
+  if (!up) return res.status(404).json({ error: 'Not found' });
+  for (let i = 0; i < up.totalChunks; i++) {
+    if (!up.chunks[i]) return res.status(400).json({ error: 'Missing chunk ' + i });
+  }
+  const buf = Buffer.concat(up.chunks);
+  const safeName = fileId + '_' + (up.fileName || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const fp = path.join(FILES_DIR, safeName);
+  fs.writeFileSync(fp, buf);
+  uploads.delete(fileId);
+  res.json({ success: true, fileId, url: '/files/' + safeName, fileName: up.fileName, fileType: up.fileType, fileSize: up.fileSize });
+});
+
+app.get('/files/:name', function (req, res) {
+  const name = req.params.name;
+  if (name.indexOf('..') !== -1 || name.indexOf('/') !== -1 || name.indexOf('\\') !== -1) return res.status(400).send('bad');
+  const fp = path.join(FILES_DIR, name);
+  if (!fs.existsSync(fp)) return res.status(404).send('not found');
+  const stat = fs.statSync(fp);
+  const range = req.headers.range;
+  const ext = path.extname(name).toLowerCase();
+  const mime = {
+    '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime',
+    '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.gif': 'image/gif', '.webp': 'image/webp',
+    '.pdf': 'application/pdf', '.txt': 'text/plain'
+  }[ext] || 'application/octet-stream';
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+    if (start >= stat.size) return res.status(416).set('Content-Range', 'bytes */' + stat.size).end();
+    res.writeHead(206, {
+      'Content-Range': 'bytes ' + start + '-' + end + '/' + stat.size,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': end - start + 1,
+      'Content-Type': mime
+    });
+    fs.createReadStream(fp, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': mime, 'Accept-Ranges': 'bytes' });
+    fs.createReadStream(fp).pipe(res);
+  }
 });
 
 /* ==================== HTML ==================== */
@@ -682,6 +752,10 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .member-dropdown { position: absolute; right: 8px; top: 90%; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 180px; z-index: 1500; display: none; }
   .member-dropdown.active { display: block; }
   .member-dropdown .menu-item { padding: 10px 14px; font-size: 13px; }
+  .upload-progress-container { flex: 1; display: flex; align-items: center; gap: 10px; }
+  .upload-progress-track { flex: 1; background: var(--bg-input); border-radius: 10px; overflow: hidden; height: 8px; }
+  .upload-progress-bar { height: 100%; background: var(--accent); width: 0%; transition: width 0.15s; }
+  .upload-progress-text { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
   #image-viewer-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: 0.15s; pointer-events: none; }
   #image-viewer-modal.active { visibility: visible; opacity: 1; pointer-events: auto; }
   #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
@@ -888,6 +962,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <button class="btn btn-danger" onclick="deleteSelectedMessage()">Удалить</button>
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
+  <div id="audio-pool" style="display:none; position:absolute; width:0; height:0; overflow:hidden;"></div>
   <script src="/client.js"></script>
 </body>
 </html>`;
@@ -930,9 +1005,100 @@ var serverMinClientVersion = '0.0.0';
 var pingFailCount = 0;
 var healthFailCount = 0;
 
+var CHUNK_SIZE = 500 * 1024;
 var MAX_FILE_SIZE = 200 * 1024 * 1024;
-var VIDEO_CHUNK_B64 = 1 * 1024 * 1024; // 1 МБ base64 на часть видео
-var VIDEO_WHOLE_LIMIT = 2 * 1024 * 1024; // если видео меньше — шлём целиком
+var SMALL_FILE_LIMIT = 5 * 1024 * 1024; // до 5 МБ — через base64 (для маленьких видео)
+var FILES_CACHE_MAX = 30;  // максимум 30 больших файлов в кэше
+var FILE_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 дней
+
+/* ==================== INDEXEDDB ДЛЯ ФАЙЛОВ ==================== */
+var filesDB = null;
+
+function openFilesDB() {
+  return new Promise(function (resolve, reject) {
+    if (filesDB) return resolve(filesDB);
+    if (!window.indexedDB) return reject(new Error('No IndexedDB'));
+    var req = indexedDB.open('messenger_files_cache', 1);
+    req.onupgradeneeded = function (e) {
+      var db = e.target.result;
+      if (!db.objectStoreNames.contains('files')) {
+        var store = db.createObjectStore('files', { keyPath: 'key' });
+        store.createIndex('by_ts', 'savedAt');
+      }
+    };
+    req.onsuccess = function (e) { filesDB = e.target.result; resolve(filesDB); };
+    req.onerror = function (e) { reject(e.target.error); };
+  });
+}
+
+async function saveFileToIDB(key, blob, meta) {
+  try {
+    var db = await openFilesDB();
+    return new Promise(function (res, rej) {
+      var tx = db.transaction('files', 'readwrite');
+      tx.objectStore('files').put({
+        key: key,
+        blob: blob,
+        fileName: (meta && meta.fileName) || '',
+        fileType: (meta && meta.fileType) || '',
+        fileSize: (meta && meta.fileSize) || (blob ? blob.size : 0),
+        savedAt: Date.now()
+      });
+      tx.oncomplete = function () { res(true); };
+      tx.onerror = function (e) { rej(e.target.error); };
+    });
+  } catch (e) { return false; }
+}
+
+async function getFileFromIDB(key) {
+  try {
+    var db = await openFilesDB();
+    return new Promise(function (res, rej) {
+      var tx = db.transaction('files', 'readonly');
+      var r = tx.objectStore('files').get(key);
+      r.onsuccess = function () { res(r.result || null); };
+      r.onerror = function (e) { rej(e.target.error); };
+    });
+  } catch (e) { return null; }
+}
+
+async function deleteFileFromIDB(key) {
+  try {
+    var db = await openFilesDB();
+    return new Promise(function (res) {
+      var tx = db.transaction('files', 'readwrite');
+      tx.objectStore('files').delete(key);
+      tx.oncomplete = function () { res(true); };
+      tx.onerror = function () { res(false); };
+    });
+  } catch (e) { return false; }
+}
+
+async function cleanupFilesCache() {
+  try {
+    var db = await openFilesDB();
+    return new Promise(function (res) {
+      var tx = db.transaction('files', 'readwrite');
+      var store = tx.objectStore('files');
+      var req = store.getAll();
+      req.onsuccess = function () {
+        var all = req.result || [];
+        var now = Date.now();
+        // Удаляем старые
+        all.forEach(function (entry) {
+          if (entry.savedAt && (now - entry.savedAt > FILE_CACHE_TTL)) store.delete(entry.key);
+        });
+        // Если больше лимита — удаляем самые старые
+        all.sort(function (a, b) { return (a.savedAt || 0) - (b.savedAt || 0); });
+        if (all.length > FILES_CACHE_MAX) {
+          all.slice(0, all.length - FILES_CACHE_MAX).forEach(function (e) { store.delete(e.key); });
+        }
+      };
+      tx.oncomplete = function () { res(true); };
+      tx.onerror = function () { res(false); };
+    });
+  } catch (e) {}
+}
 
 /* ==================== КНОПКИ ==================== */
 function lockButton(id, ms) {
@@ -1065,6 +1231,7 @@ function mergeMessage(msg) {
   for (var i = 0; i < localMessagesCache.length; i++) {
     var m = localMessagesCache[i];
     if (m.id === msg.id || (msg.clientId && m.clientId && m.clientId === msg.clientId)) {
+      // Сохраняем fileUrl/fileData если в новом нет
       if (!msg.fileUrl && m.fileUrl) msg.fileUrl = m.fileUrl;
       if (!msg.fileData && m.fileData) msg.fileData = m.fileData;
       localMessagesCache[i] = msg;
@@ -1079,6 +1246,7 @@ function saveCache() {
   try {
     localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache));
   } catch (e) {
+    // Переполнено — обрезаем самые старые
     var arr = localMessagesCache.slice();
     while (arr.length > 100) {
       arr = arr.slice(100);
@@ -1202,82 +1370,20 @@ function getUserName(id) {
   }
   return 'Пользователь';
 }
-
-/* ==================== СБОРКА ВИДЕО ИЗ ЧАСТЕЙ ==================== */
 function getChatMessages(chat) {
   if (!chat || !currentUser) return [];
-  var raw;
+  var list;
   if (chat.type === 'group') {
-    raw = localMessagesCache.filter(function (m) { return !m.isDeleted && m.groupId === chat.id; });
+    list = localMessagesCache.filter(function (m) { return !m.isDeleted && m.groupId === chat.id; });
   } else {
-    raw = localMessagesCache.filter(function (m) {
+    list = localMessagesCache.filter(function (m) {
       return !m.isDeleted && !m.groupId &&
         ((m.senderId === currentUser.id && m.receiverId === chat.id) ||
          (m.senderId === chat.id && m.receiverId === currentUser.id));
     });
   }
-  raw.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
-
-  var videoGroups = {};
-  var out = [];
-  for (var i = 0; i < raw.length; i++) {
-    var m = raw[i];
-    if (m.isVideoPart && m.videoGroupId) {
-      if (!videoGroups[m.videoGroupId]) videoGroups[m.videoGroupId] = { parts: [], container: null, firstTs: m.ts };
-      videoGroups[m.videoGroupId].parts.push(m);
-      if (m.ts < videoGroups[m.videoGroupId].firstTs) videoGroups[m.videoGroupId].firstTs = m.ts;
-    } else if (m.isVideoContainer && m.videoGroupId) {
-      if (!videoGroups[m.videoGroupId]) videoGroups[m.videoGroupId] = { parts: [], container: null, firstTs: m.ts };
-      videoGroups[m.videoGroupId].container = m;
-      if (m.ts < videoGroups[m.videoGroupId].firstTs) videoGroups[m.videoGroupId].firstTs = m.ts;
-    } else {
-      out.push(m);
-    }
-  }
-
-  for (var gid in videoGroups) {
-    if (!videoGroups.hasOwnProperty(gid)) continue;
-    var g = videoGroups[gid];
-    var parts = g.parts.slice().sort(function (a, b) { return (a.videoPartIndex || 0) - (b.videoPartIndex || 0); });
-    if (parts.length === 0 && !g.container) continue;
-    var first = parts[0] || g.container;
-    var total = (first.videoPartTotal || (g.container && g.container.videoPartTotal) || parts.length);
-    var haveIdx = {};
-    parts.forEach(function (p) { haveIdx[p.videoPartIndex] = true; });
-    var complete = true;
-    for (var t = 0; t < total; t++) { if (!haveIdx[t]) { complete = false; break; } }
-
-    var vm = {
-      id: 'vmsg_' + gid,
-      videoGroupId: gid,
-      senderId: first.senderId,
-      receiverId: first.receiverId || '',
-      groupId: first.groupId || '',
-      text: '',
-      fileName: first.fileName || (g.container && g.container.fileName) || 'video',
-      fileType: first.fileType || (g.container && g.container.fileType) || 'video/mp4',
-      fileSize: first.fileSize || (g.container && g.container.fileSize) || 0,
-      isVideoMessage: true,
-      videoParts: parts.map(function (p) {
-        return { index: p.videoPartIndex, data: p.fileData };
-      }),
-      videoComplete: complete,
-      videoHave: parts.length,
-      videoTotal: total,
-      timestamp: first.timestamp || (g.container && g.container.timestamp) || '',
-      ts: g.firstTs || Date.now(),
-      isRead: !!(first.isRead || (g.container && g.container.isRead)),
-      readBy: first.readBy || [],
-      isPending: !complete,
-      isDeleted: false
-    };
-    out.push(vm);
-  }
-
-  out.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
-  return out;
+  return list.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
 }
-
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
   document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
@@ -1390,11 +1496,7 @@ async function refreshActivePeerStatus() {
 /* ==================== RETRY ==================== */
 async function retryPendingMessages() {
   if (!currentUser) return;
-  var pending = localMessagesCache.filter(function (m) {
-    if (!m.isPending || m.senderId !== currentUser.id || !m.clientId) return false;
-    if (m.isVideoContainer) return false;
-    return true;
-  });
+  var pending = localMessagesCache.filter(function (m) { return m.isPending && m.senderId === currentUser.id && m.clientId; });
   if (pending.length === 0) return;
   for (var i = 0; i < pending.length; i++) {
     var pm = pending[i];
@@ -1405,23 +1507,15 @@ async function retryPendingMessages() {
           senderId: pm.senderId, receiverId: pm.receiverId || '', groupId: pm.groupId || '',
           text: pm.text || '', fileData: pm.fileData || '',
           fileName: pm.fileName || '', fileType: pm.fileType || '',
-          clientId: pm.clientId, fileUrl: pm.fileUrl || '', fileSize: pm.fileSize || 0,
-          videoGroupId: pm.videoGroupId || '',
-          videoPartIndex: pm.videoPartIndex,
-          videoPartTotal: pm.videoPartTotal || 0,
-          isVideoPart: pm.isVideoPart || false,
-          isVideoContainer: pm.isVideoContainer || false
+          clientId: pm.clientId, fileUrl: pm.fileUrl || '', fileSize: pm.fileSize || 0
         })
       });
       if (res.ok) {
         var data = await res.json();
         if (data && data.message) {
           var rm = Object.assign({}, data.message); rm.isPending = false;
-          if (pm.fileData) rm.fileData = pm.fileData;
-          if (pm.videoGroupId) rm.videoGroupId = pm.videoGroupId;
-          if (pm.videoPartIndex !== undefined) rm.videoPartIndex = pm.videoPartIndex;
-          if (pm.videoPartTotal) rm.videoPartTotal = pm.videoPartTotal;
-          if (pm.isVideoPart) rm.isVideoPart = true;
+          if (pm.fileUrl) rm.fileUrl = pm.fileUrl;
+          if (pm.fileSize) rm.fileSize = pm.fileSize;
           for (var j = 0; j < localMessagesCache.length; j++) {
             if (localMessagesCache[j].clientId === pm.clientId) { localMessagesCache[j] = rm; break; }
           }
@@ -1559,7 +1653,9 @@ async function clearChatHistory() {
   try {
     await fetch('/api/chat/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(isGroup ? { userId: currentUser.id, groupId: activePeer.id } : { userId: currentUser.id, peerId: activePeer.id }) });
   } catch (e) {}
-  getChatMessages(activePeer).forEach(function (m) { m.isDeleted = true; });
+  var ids = [];
+  getChatMessages(activePeer).forEach(function (m) { m.isDeleted = true; ids.push(m.id); });
+  for (var i = 0; i < ids.length; i++) await deleteFileFromIDB(ids[i]);
   saveCache();
   lastMessagesHash = '';
   loadMessages();
@@ -1702,7 +1798,7 @@ async function loadMessagesQuiet() {
     });
     saveCache();
     var peerMsgs = getChatMessages(activePeer);
-    var currentHash = JSON.stringify(peerMsgs.map(function (m) { return m.id + '_' + m.isRead + '_' + (m.readBy ? m.readBy.length : 0) + '_' + m.isDeleted + '_' + (m.videoHave || 0) + '_' + (m.videoTotal || 0); }));
+    var currentHash = JSON.stringify(peerMsgs.map(function (m) { return m.id + '_' + m.isRead + '_' + (m.readBy ? m.readBy.length : 0) + '_' + m.isDeleted + '_' + (m.fileUrl || 'x'); }));
     if (currentHash !== lastMessagesHash) {
       if (hasNewMsg && lastMessagesHash !== '' && mutedPeers.indexOf(activePeer.id) === -1) playNotificationSound();
       lastMessagesHash = currentHash;
@@ -1748,22 +1844,13 @@ function renderMessagesContainer(messages) {
     var html = '';
     if (isGroup && m.senderId !== currentUser.id) html += '<div class="msg-sender">' + escapeHtml(getUserName(m.senderId)) + '</div>';
     if (m.text) html += '<div>' + escapeHtml(m.text) + '</div>';
-    if (m.isVideoMessage) {
-      if (m.videoComplete) {
-        html += '<div class="media-loading" data-media-msg-id="' + m.id + '">🎬 Загрузка видео...</div>';
-      } else {
-        var pct = m.videoTotal ? Math.round((m.videoHave / m.videoTotal) * 100) : 0;
-        html += '<div class="media-loading" style="background:var(--bg-input);">🎬 ' + escapeHtml(m.fileName) + ' — ' + pct + '% (' + m.videoHave + '/' + m.videoTotal + ')</div>';
-      }
-    } else {
-      var ft = m.fileType || '';
-      if (m.fileData || m.fileUrl) {
-        var mid = m.id;
-        if (ft.indexOf('image/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">📷 Загрузка...</div>';
-        else if (ft.indexOf('video/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">🎬 Загрузка видео...</div>';
-        else if (ft.indexOf('audio/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">🎤 Загрузка...</div>';
-        else html += '<div class="media-loading" data-media-msg-id="' + mid + '">📁 ' + escapeHtml(m.fileName || 'Файл') + '</div>';
-      }
+    var ft = m.fileType || '';
+    if (m.fileData || m.fileUrl) {
+      var mid = m.id;
+      if (ft.indexOf('image/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">📷 Загрузка...</div>';
+      else if (ft.indexOf('video/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">🎬 Загрузка видео...</div>';
+      else if (ft.indexOf('audio/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">🎤 Загрузка...</div>';
+      else html += '<div class="media-loading" data-media-msg-id="' + mid + '">📁 ' + escapeHtml(m.fileName || 'Файл') + '</div>';
     }
     var ticksHtml = '';
     if (m.senderId === currentUser.id) {
@@ -1787,30 +1874,41 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
   var ft = msg.fileType || '';
   var url = null;
 
-  if (msg.isVideoMessage) {
-    await applyVideoMessage(msg, placeholder);
-    return;
-  }
-
+  // 1. Если это fileData (base64 — маленькие файлы и видео) — используем сразу
   if (msg.fileData) {
+    url = msg.fileData;
+    // Сохраняем в IDB для будущего использования
     try {
       var b = await fetch(msg.fileData).then(function (r) { return r.blob(); });
-      if (b) url = URL.createObjectURL(b);
+      if (b) await saveFileToIDB(msg.id, b, { fileName: msg.fileName, fileType: msg.fileType, fileSize: b.size });
     } catch (e) {}
-    if (!url) url = msg.fileData;
     applyMedia(msg, placeholder, url);
     return;
   }
 
+  // 2. Пробуем из IDB кэша
+  var entry = await getFileFromIDB(msg.id);
+  if (entry && entry.blob) {
+    var blobUrl = URL.createObjectURL(entry.blob);
+    applyMedia(msg, placeholder, blobUrl);
+    return;
+  }
+
+  // 3. Скачиваем с сервера и кладём в кэш
   if (msg.fileUrl) {
     try {
       var res = await fetch(msg.fileUrl);
       if (res.ok) {
         var blob = await res.blob();
-        url = URL.createObjectURL(blob);
+        await saveFileToIDB(msg.id, blob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: blob.size });
+        cleanupFilesCache();
+        var url2 = URL.createObjectURL(blob);
+        applyMedia(msg, placeholder, url2);
+        return;
       }
     } catch (e) {}
-    applyMedia(msg, placeholder, url || msg.fileUrl);
+    // Если скачать не удалось, но fileUrl есть — используем его напрямую
+    applyMedia(msg, placeholder, msg.fileUrl);
     return;
   }
 
@@ -1877,79 +1975,6 @@ function applyMedia(msg, placeholder, url) {
   placeholder.parentNode.replaceChild(newEl, placeholder);
 }
 
-async function applyVideoMessage(msg, placeholder) {
-  if (!placeholder.parentNode) return;
-  if (!msg.videoComplete) return;
-  var parts = (msg.videoParts || []).slice().sort(function (a, b) { return a.index - b.index; });
-  var partUrls = [];
-  for (var i = 0; i < parts.length; i++) {
-    try {
-      var b = await fetch(parts[i].data).then(function (r) { return r.blob(); });
-      partUrls.push({ index: parts[i].index, url: URL.createObjectURL(b) });
-    } catch (e) { partUrls.push(null); }
-  }
-  var valid = partUrls.filter(function (p) { return p; });
-  if (valid.length === 0) {
-    placeholder.outerHTML = '<div class="file-placeholder">⚠️ Видео недоступно</div>';
-    return;
-  }
-
-  var wrap = document.createElement('div');
-  wrap.style.cssText = 'position:relative; max-width:300px; width:100%; margin-top:6px; background:#000; border-radius:8px; overflow:hidden;';
-
-  var video = document.createElement('video');
-  video.className = 'video-preview';
-  video.controls = true;
-  video.preload = 'metadata';
-  video.playsInline = true;
-  video.setAttribute('webkit-playsinline', '');
-  video.setAttribute('playsinline', '');
-  video.style.cssText = 'width:100%; display:block; background:#000;';
-  video.src = valid[0].url;
-
-  var badge = document.createElement('div');
-  badge.style.cssText = 'position:absolute; top:6px; left:6px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border-radius:6px; padding:2px 8px; font-size:11px; pointer-events:none;';
-  badge.textContent = '🎬 1/' + valid.length;
-
-  var fsBtn = document.createElement('button');
-  fsBtn.type = 'button';
-  fsBtn.textContent = '⛶';
-  fsBtn.title = 'На весь экран';
-  fsBtn.style.cssText = 'position:absolute; top:6px; right:6px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:none; border-radius:6px; width:30px; height:30px; font-size:15px; cursor:pointer; line-height:1;';
-  fsBtn.addEventListener('click', function (ev) {
-    ev.stopPropagation();
-    if (video.requestFullscreen) video.requestFullscreen();
-    else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
-    else if (video.webkitRequestFullscreen) video.webkitRequestFullscreen();
-  });
-
-  video.addEventListener('contextmenu', function (ev) { ev.stopPropagation(); });
-  video.addEventListener('click', function (ev) { ev.stopPropagation(); });
-  video.onerror = function () {
-    if (wrap.parentNode) {
-      var ph = document.createElement('div');
-      ph.className = 'file-placeholder';
-      ph.textContent = '⚠️ Часть видео недоступна';
-      wrap.parentNode.replaceChild(ph, wrap);
-    }
-  };
-
-  var current = 0;
-  video.addEventListener('ended', function () {
-    current++;
-    if (current < valid.length) {
-      video.src = valid[current].url;
-      badge.textContent = '🎬 ' + (current + 1) + '/' + valid.length;
-      video.play().catch(function () {});
-    }
-  });
-
-  wrap.appendChild(video);
-  wrap.appendChild(badge);
-  wrap.appendChild(fsBtn);
-  placeholder.parentNode.replaceChild(wrap, placeholder);
-}
-
 function checkVisibleMessages() { setTimeout(doCheckVisibleMessages, 300); }
 function doCheckVisibleMessages() {
   if (!activePeer) return;
@@ -1983,7 +2008,7 @@ function openMsgActions(msg, el) {
   document.querySelectorAll('.msg').forEach(function (x) { x.classList.remove('selected-msg'); });
   el.classList.add('selected-msg');
   document.getElementById('action-btn-copy').style.display = (msg.text && !msg.fileData && !msg.fileUrl) ? 'block' : 'none';
-  document.getElementById('action-btn-download').style.display = (msg.fileData || msg.fileUrl || msg.isVideoMessage) ? 'block' : 'none';
+  document.getElementById('action-btn-download').style.display = (msg.fileData || msg.fileUrl) ? 'block' : 'none';
   document.getElementById('msg-actions-sheet').classList.add('active');
 }
 function closeMsgActions() {
@@ -1996,45 +2021,35 @@ async function actionDownloadFile() {
   var obj = selectedMsgObj;
   closeMsgActions();
   if (!obj) return;
-  if (obj.isVideoMessage) {
-    // Скачиваем первую часть как файл
-    if (!obj.videoParts || obj.videoParts.length === 0) { alert('Файл недоступен'); return; }
-    var data = obj.videoParts[0].data;
-    var a = document.createElement('a'); a.href = data; a.download = obj.fileName || 'video';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    return;
-  }
   var url = null;
   if (obj.fileData) url = obj.fileData;
-  else if (obj.fileUrl) url = obj.fileUrl;
+  else {
+    var entry = await getFileFromIDB(obj.id);
+    if (entry && entry.blob) url = URL.createObjectURL(entry.blob);
+    else if (obj.fileUrl) url = obj.fileUrl;
+  }
   if (!url) { alert('Файл недоступен'); return; }
-  var a2 = document.createElement('a'); a2.href = url; a2.download = obj.fileName || 'file';
-  document.body.appendChild(a2); a2.click(); document.body.removeChild(a2);
+  var a = document.createElement('a'); a.href = url; a.download = obj.fileName || 'file';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 async function deleteSelectedMessage() {
   var id = selectedMsgId;
-  var obj = selectedMsgObj;
   closeMsgActions();
   if (!id) return;
-  if (obj && obj.isVideoMessage) {
-    var gid = obj.videoGroupId;
-    localMessagesCache.forEach(function (m) {
-      if (m.videoGroupId === gid) m.isDeleted = true;
-    });
-    saveCache();
-    lastMessagesHash = '';
-    if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
-    // На сервере помечаем части удалёнными
-    for (var i = 0; i < (obj.videoParts || []).length; i++) {
-      try { await fetch('/api/messages/' + ('vmsg_' + gid), { method: 'DELETE' }); } catch (e) {}
-    }
-    return;
-  }
+  // Локально
   localMessagesCache.forEach(function (m) { if (m.id === id) m.isDeleted = true; });
   saveCache();
   lastMessagesHash = '';
+  // Удаляем из IDB кэша
+  await deleteFileFromIDB(id);
+  // UI
   if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
-  try { await fetch('/api/messages/' + id, { method: 'DELETE' }); } catch (e) {}
+  // Сервер — если не получилось, повторим позже
+  try {
+    await fetch('/api/messages/' + id, { method: 'DELETE' });
+  } catch (e) {
+    // Оставляем в кэше как удалённое — при следующем pull не вернётся
+  }
 }
 
 /* ==================== ВЛОЖЕНИЯ ==================== */
@@ -2042,10 +2057,13 @@ function triggerFileInput() { document.getElementById('file-input').click(); }
 function handleFileSelect(e) {
   var file = e.target.files[0]; if (!file) return;
   if (file.size > MAX_FILE_SIZE) { alert('Максимум 200 МБ'); e.target.value = ''; return; }
-  selectedFile = { file: file, name: file.name, type: file.type };
+  // Маленькие файлы (< 5 МБ) — через base64 сразу играется у собеседника
+  // Большие — через чанки на сервер
+  var isSmall = file.size <= SMALL_FILE_LIMIT;
+  selectedFile = { file: file, name: file.name, type: file.type, data: null, isLarge: !isSmall };
   var thumbImg = document.getElementById('attachment-thumb-img');
   document.getElementById('attachment-name-label').innerText = file.name;
-  document.getElementById('attachment-type-label').innerText = formatBytes(file.size) + ' • отправится в сообщении';
+  document.getElementById('attachment-type-label').innerText = formatBytes(file.size) + (isSmall ? ' • отправится сразу' : ' • загрузится на сервер');
   if (file.type.indexOf('image/') === 0) {
     var r = new FileReader();
     r.onload = function (ev) { thumbImg.src = ev.target.result; thumbImg.style.display = 'block'; };
@@ -2165,24 +2183,6 @@ async function toggleVoiceRecord() {
 }
 
 /* ==================== ОТПРАВКА ==================== */
-function fileToBase64Raw(file) {
-  return new Promise(function (resolve, reject) {
-    var r = new FileReader();
-    r.onload = function () {
-      var s = r.result;
-      var comma = s.indexOf(',');
-      var b64 = s.substring(comma + 1);
-      var meta = s.substring(0, comma);
-      var mime = 'application/octet-stream';
-      var m = meta.match(/data:([^;]+)/);
-      if (m) mime = m[1];
-      resolve({ b64: b64, mime: mime });
-    };
-    r.onerror = reject;
-    r.readAsDataURL(file);
-  });
-}
-
 async function sendMsg() {
   if (!activePeer) return;
   if (!lockButton('send-btn', 1000)) return;
@@ -2205,172 +2205,50 @@ async function sendMsg() {
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true
   };
+  // ГОЛОСОВОЕ
   if (voiceToSend) {
     optMsg.fileData = voiceToSend.data;
     optMsg.fileSize = voiceToSend.blob ? voiceToSend.blob.size : 0;
+    try { await saveFileToIDB(clientId, voiceToSend.blob, { fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: voiceToSend.blob.size }); } catch (e) {}
     cancelVoiceAttachment();
     mergeMessage(optMsg);
     renderMessagesContainer(getChatMessages(activePeer));
     await sendPayload({ clientId: clientId, text: '', fileData: voiceToSend.data, fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: optMsg.fileSize });
     return;
   }
-  if (fileToSend) {
-    await sendFileSmart(fileToSend.file, fileToSend.name, fileToSend.type, text);
+  // МАЛЕНЬКИЙ ФАЙЛ (фото, маленькое видео, документ)
+  if (fileToSend && !fileToSend.isLarge) {
+    try {
+      var dataUrl = await fileToDataUrl(fileToSend.file);
+      optMsg.fileData = dataUrl;
+      optMsg.fileSize = fileToSend.file.size;
+      try { var b = await fetch(dataUrl).then(function (r) { return r.blob(); }); if (b) await saveFileToIDB(clientId, b, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: b.size }); } catch (e) {}
+      cancelAttachment();
+      mergeMessage(optMsg);
+      renderMessagesContainer(getChatMessages(activePeer));
+      await sendPayload({ clientId: clientId, text: text, fileData: dataUrl, fileName: fileToSend.name, fileType: fileToSend.type, fileSize: optMsg.fileSize });
+    } catch (e) { alert('Ошибка чтения'); }
     return;
   }
+  // БОЛЬШОЙ ФАЙЛ (большое видео) — чанками
+  if (fileToSend && fileToSend.isLarge) {
+    optMsg.fileSize = fileToSend.file.size;
+    try { await saveFileToIDB(clientId, fileToSend.file, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: fileToSend.file.size }); } catch (e) {}
+    cancelAttachment();
+    mergeMessage(optMsg);
+    renderMessagesContainer(getChatMessages(activePeer));
+    // Сохраняем ссылку на сообщение чтобы обновить после загрузки
+    uploadLargeFileInBackground(clientId, fileToSend.file, fileToSend.name, fileToSend.type, text);
+    return;
+  }
+  // ТЕКСТ
   mergeMessage(optMsg);
   renderMessagesContainer(getChatMessages(activePeer));
   await sendPayload({ clientId: clientId, text: text });
 }
-
-async function sendFileSmart(file, fileName, fileType, text) {
-  if (!activePeer) return;
-  var isGroup = activePeer.type === 'group';
-  var isVideo = (fileType || '').indexOf('video/') === 0;
-
-  if (text) {
-    var tCid = 'cid_' + Date.now() + '_t_' + Math.random().toString(36).substr(2, 6);
-    var tMsg = {
-      id: tCid, clientId: tCid, senderId: currentUser.id,
-      receiverId: isGroup ? '' : activePeer.id,
-      groupId: isGroup ? activePeer.id : '',
-      text: text,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true
-    };
-    mergeMessage(tMsg);
-    renderMessagesContainer(getChatMessages(activePeer));
-    sendPayload({ clientId: tCid, text: text });
-  }
-
-  var res;
-  try { res = await fileToBase64Raw(file); }
-  catch (e) { alert('Не удалось прочитать файл'); return; }
-  var b64 = res.b64;
-  var mime = fileType || res.mime;
-
-  if (!isVideo || b64.length <= VIDEO_CHUNK_B64 || file.size <= VIDEO_WHOLE_LIMIT) {
-    await sendWholeFile(file, b64, mime, fileName, fileType);
-    return;
-  }
-
-  await sendVideoAsParts(file, b64, mime, fileName, fileType);
+function fileToDataUrl(file) {
+  return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = rej; r.readAsDataURL(file); });
 }
-
-async function sendWholeFile(file, b64, mime, fileName, fileType) {
-  var isGroup = activePeer.type === 'group';
-  var cid = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
-  var fileDataUrl = 'data:' + mime + ';base64,' + b64;
-  var optMsg = {
-    id: cid, clientId: cid, senderId: currentUser.id,
-    receiverId: isGroup ? '' : activePeer.id,
-    groupId: isGroup ? activePeer.id : '',
-    text: '',
-    fileData: fileDataUrl,
-    fileName: fileName, fileType: mime, fileSize: file.size,
-    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true
-  };
-  mergeMessage(optMsg);
-  renderMessagesContainer(getChatMessages(activePeer));
-  cancelAttachment();
-  await sendPayload({
-    clientId: cid, text: '',
-    fileData: fileDataUrl,
-    fileName: fileName, fileType: mime, fileSize: file.size
-  });
-}
-
-async function sendVideoAsParts(file, b64, mime, fileName, fileType) {
-  var isGroup = activePeer.type === 'group';
-  var videoGroupId = 'vg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
-  var parts = [];
-  for (var i = 0; i < b64.length; i += VIDEO_CHUNK_B64) {
-    parts.push(b64.substring(i, i + VIDEO_CHUNK_B64));
-  }
-  var total = parts.length;
-
-  var containerCid = 'cid_container_' + videoGroupId;
-  var containerMsg = {
-    id: containerCid, clientId: containerCid, senderId: currentUser.id,
-    receiverId: isGroup ? '' : activePeer.id,
-    groupId: isGroup ? activePeer.id : '',
-    text: '',
-    fileName: fileName, fileType: mime, fileSize: file.size,
-    videoGroupId: videoGroupId,
-    videoPartTotal: total,
-    isVideoContainer: true,
-    isPending: true,
-    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    ts: Date.now(), isRead: false, readBy: [], isDeleted: false
-  };
-  mergeMessage(containerMsg);
-  renderMessagesContainer(getChatMessages(activePeer));
-  cancelAttachment();
-
-  for (var k = 0; k < total; k++) {
-    var cid = 'cid_' + videoGroupId + '_' + k;
-    var partFileData = 'data:' + mime + ';base64,' + parts[k];
-    var partMsg = {
-      id: cid, clientId: cid, senderId: currentUser.id,
-      receiverId: isGroup ? '' : activePeer.id,
-      groupId: isGroup ? activePeer.id : '',
-      text: '',
-      fileData: partFileData,
-      fileName: fileName, fileType: mime, fileSize: file.size,
-      videoGroupId: videoGroupId,
-      videoPartIndex: k,
-      videoPartTotal: total,
-      isVideoPart: true,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true
-    };
-    mergeMessage(partMsg);
-
-    try {
-      var r = await fetch('/api/messages/send', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          senderId: currentUser.id, receiverId: isGroup ? '' : activePeer.id,
-          groupId: isGroup ? activePeer.id : '',
-          text: '', fileData: partFileData,
-          fileName: fileName, fileType: mime, fileSize: file.size,
-          clientId: cid,
-          videoGroupId: videoGroupId,
-          videoPartIndex: k,
-          videoPartTotal: total,
-          isVideoPart: true
-        })
-      });
-      if (r.ok) {
-        var d = await r.json();
-        if (d && d.message) {
-          var rm = Object.assign({}, d.message);
-          rm.isPending = false;
-          rm.fileData = partFileData;
-          rm.videoGroupId = videoGroupId;
-          rm.videoPartIndex = k;
-          rm.videoPartTotal = total;
-          rm.isVideoPart = true;
-          for (var jj = 0; jj < localMessagesCache.length; jj++) {
-            if (localMessagesCache[jj].clientId === cid) { localMessagesCache[jj] = rm; break; }
-          }
-          for (var kk = 0; kk < localMessagesCache.length; kk++) {
-            if (localMessagesCache[kk].id === containerCid) {
-              if (k === total - 1) localMessagesCache[kk].isPending = false;
-              break;
-            }
-          }
-          saveCache();
-          renderMessagesContainer(getChatMessages(activePeer));
-        }
-      }
-    } catch (e) {
-      break;
-    }
-  }
-}
-
 async function sendPayload(payload) {
   var isGroup = activePeer.type === 'group';
   try {
@@ -2390,6 +2268,15 @@ async function sendPayload(payload) {
       if (payload.fileUrl) rm.fileUrl = payload.fileUrl;
       if (payload.fileSize) rm.fileSize = payload.fileSize;
       if (payload.fileData) rm.fileData = payload.fileData;
+      // Перенос файла из IDB по clientId в IDB по реальному id
+      try {
+        var entry = await getFileFromIDB(payload.clientId);
+        if (entry && entry.blob) {
+          await saveFileToIDB(rm.id, entry.blob, { fileName: rm.fileName, fileType: rm.fileType, fileSize: entry.blob.size });
+          await deleteFileFromIDB(payload.clientId);
+        }
+      } catch (e) {}
+      // Убираем старое оптимистичное, вставляем новое
       var idx = localMessagesCache.findIndex(function (m) { return m.clientId === payload.clientId; });
       if (idx >= 0) localMessagesCache[idx] = rm;
       else mergeMessage(rm);
@@ -2401,6 +2288,63 @@ async function sendPayload(payload) {
   } catch (e) {
     if (!navigator.onLine) setConnectionState('no-internet');
     else setConnectionState('server-offline');
+  }
+}
+
+/* ==================== ЗАГРУЗКА БОЛЬШОГО ФАЙЛА ==================== */
+async function uploadLargeFileInBackground(clientId, file, fileName, fileType, text) {
+  var inputBar = document.getElementById('input-bar');
+  var originalHTML = inputBar.innerHTML;
+  // Показываем прогресс
+  var progressHTML = '<div class="upload-progress-container"><div class="upload-progress-track"><div class="upload-progress-bar" id="upload-progress-bar"></div></div><span class="upload-progress-text" id="upload-progress-text">0%</span></div>';
+  var progressVisible = false;
+  
+  try {
+    var initRes = await fetch('/api/upload/init', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ senderId: currentUser.id, fileName: fileName, fileSize: file.size, fileType: fileType }) });
+    if (!initRes.ok) throw new Error('init failed');
+    var initData = await initRes.json();
+    var fileId = initData.fileId;
+    var totalChunks = initData.totalChunks;
+    
+    inputBar.innerHTML = progressHTML;
+    progressVisible = true;
+    
+    for (var i = 0; i < totalChunks; i++) {
+      var start = i * CHUNK_SIZE;
+      var end = Math.min(start + CHUNK_SIZE, file.size);
+      var chunk = file.slice(start, end);
+      var res = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk });
+      if (!res.ok) throw new Error('chunk ' + i);
+      var p = Math.round((i + 1) / totalChunks * 100);
+      var bar = document.getElementById('upload-progress-bar');
+      var txt = document.getElementById('upload-progress-text');
+      if (bar) bar.style.width = p + '%';
+      if (txt) txt.innerText = p + '% • ' + formatBytes(Math.min((i + 1) * CHUNK_SIZE, file.size));
+    }
+    
+    var finRes = await fetch('/api/upload/finish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fileId: fileId }) });
+    if (!finRes.ok) throw new Error('finish');
+    var fdata = await finRes.json();
+    
+    // Обновляем локальное сообщение — добавляем fileUrl
+    for (var j = 0; j < localMessagesCache.length; j++) {
+      if (localMessagesCache[j].clientId === clientId) {
+        localMessagesCache[j].fileUrl = fdata.url;
+        break;
+      }
+    }
+    saveCache();
+    
+    // Восстанавливаем input-bar
+    inputBar.innerHTML = originalHTML;
+    progressVisible = false;
+    
+    // Отправляем на сервер
+    await sendPayload({ clientId: clientId, text: text || '', fileName: fileName, fileType: fileType, fileUrl: fdata.url, fileSize: file.size });
+  } catch (e) {
+    console.warn('Upload failed:', e);
+    if (progressVisible) inputBar.innerHTML = originalHTML;
+    // Оставляем isPending — можно отправить заново
   }
 }
 
@@ -2624,11 +2568,13 @@ window.addEventListener('DOMContentLoaded', async function () {
   document.querySelectorAll('.modal-overlay').forEach(function (ov) {
     ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); });
   });
+  // Загружаем данные пользователя — НЕ удаляем, только добавляем недостающие поля
   try { currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) { currentUser = null; }
   try { localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}'); } catch (e) { localKnownUsers = {}; }
   try { localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]'); } catch (e) { localMessagesCache = []; }
   try { mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]'); } catch (e) { mutedPeers = []; }
   
+  // Восстанавливаем структуру (если старые версии)
   if (currentUser && typeof currentUser === 'object') {
     if (!Array.isArray(currentUser.contacts)) currentUser.contacts = [];
     if (!Array.isArray(currentUser.blockedContacts)) currentUser.blockedContacts = [];
@@ -2661,11 +2607,6 @@ window.addEventListener('DOMContentLoaded', async function () {
     if (m.receiverId === undefined) m.receiverId = '';
     if (m.groupId === undefined) m.groupId = '';
     if (typeof m.isPending !== 'boolean') m.isPending = false;
-    if (m.videoGroupId === undefined) m.videoGroupId = '';
-    if (m.videoPartIndex === undefined) m.videoPartIndex = -1;
-    if (m.videoPartTotal === undefined) m.videoPartTotal = 0;
-    if (typeof m.isVideoPart !== 'boolean') m.isVideoPart = false;
-    if (typeof m.isVideoContainer !== 'boolean') m.isVideoContainer = false;
   });
   saveCache();
   try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
@@ -2683,6 +2624,9 @@ window.addEventListener('DOMContentLoaded', async function () {
   } else {
     updateLoadingScreen();
   }
+  
+  // Раз в день — чистим старые файлы из IDB кэша
+  setInterval(cleanupFilesCache, 24 * 60 * 60 * 1000);
 });
 `;
 
