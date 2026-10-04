@@ -1,3 +1,6 @@
+/* ============================================================
+   server.js — единый файл (сервер + клиент + шифрование)
+   ============================================================ */
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -6,7 +9,7 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const SERVER_VERSION = '3.5.0';
+const SERVER_VERSION = '3.6.0';
 const MIN_CLIENT_VERSION = '1.0.0';
 
 app.use(express.json({ limit: '200mb' }));
@@ -44,7 +47,6 @@ function safeReadJSON(filePath, fallback) {
     return JSON.parse(raw);
   } catch (e) { return fallback; }
 }
-
 function safeWriteJSON(filePath, data) {
   const tmpPath = filePath + '.tmp';
   try {
@@ -60,20 +62,14 @@ function writeMessages(d) { safeWriteJSON(MESSAGES_FILE, d); }
 function readGroups() { return safeReadJSON(GROUPS_FILE, []); }
 function writeGroups(d) { safeWriteJSON(GROUPS_FILE, d); }
 
-// Хеширование паролей
 function hashPassword(pwd) {
   if (!pwd) return '';
   return crypto.createHash('sha256').update(String(pwd)).digest('hex');
 }
-
-// Шифрование на сервере для двойной защиты данных на диске
 function encryptTextServer(text) {
   if (!text) return '';
-  try {
-    return Buffer.from(String(text), 'utf8').toString('base64');
-  } catch (e) { return text; }
+  try { return Buffer.from(String(text), 'utf8').toString('base64'); } catch (e) { return text; }
 }
-
 function decryptTextServer(text) {
   if (!text) return '';
   try {
@@ -82,35 +78,29 @@ function decryptTextServer(text) {
   } catch (e) {}
   return text;
 }
-
 function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
-
 function genSessionUID() {
   const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   let res = '';
-  for (let i = 0; i < 8; i++) {
-    res += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
+  for (let i = 0; i < 8; i++) res += chars.charAt(Math.floor(Math.random() * chars.length));
   return res;
 }
 
+/* ==================== HEALTH ==================== */
 app.get('/api/health', function (req, res) {
   res.json({ ok: true, serverTime: Date.now(), serverVersion: SERVER_VERSION, minClientVersion: MIN_CLIENT_VERSION });
 });
 
-/* ==================== АККАУНТЫ И АВТОРИЗАЦИЯ ==================== */
-
+/* ==================== АККАУНТЫ ==================== */
 app.post('/api/register', function (req, res) {
   let { name, password, avatar } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите имя' });
   if (!password || password.length < 6) return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
-  
+
   const accounts = readAccounts();
   let sessionUID = genSessionUID();
-  while (accounts.some(u => u.sessionUID === sessionUID)) {
-    sessionUID = genSessionUID();
-  }
+  while (accounts.some(u => u.sessionUID === sessionUID)) sessionUID = genSessionUID();
 
   const user = {
     id: 'id_' + Math.random().toString(36).substr(2, 9),
@@ -123,7 +113,6 @@ app.post('/api/register', function (req, res) {
     hiddenDialogs: [],
     updatedAt: Date.now()
   };
-
   accounts.push(user);
   writeAccounts(accounts);
 
@@ -135,28 +124,16 @@ app.post('/api/register', function (req, res) {
 app.post('/api/login', function (req, res) {
   const sessionUID = (req.body.sessionUID || '').toUpperCase().trim();
   const password = req.body.password || '';
-
-  if (!sessionUID || sessionUID.length !== 8) {
-    return res.status(400).json({ error: 'Идентификатор сессии должен состоять из 8 символов' });
-  }
-  if (!password) {
-    return res.status(400).json({ error: 'Введите пароль' });
-  }
+  if (!sessionUID || sessionUID.length !== 8) return res.status(400).json({ error: 'Идентификатор сессии должен состоять из 8 символов' });
+  if (!password) return res.status(400).json({ error: 'Введите пароль' });
 
   const accounts = readAccounts();
   const user = accounts.find(u => u.sessionUID === sessionUID);
-
-  if (!user) {
-    return res.status(404).json({ error: 'Аккаунт с таким Идентификатором сессии не найден' });
-  }
-
-  if (user.passwordHash && user.passwordHash !== hashPassword(password)) {
-    return res.status(400).json({ error: 'Неверный пароль' });
-  }
+  if (!user) return res.status(404).json({ error: 'Аккаунт с таким Идентификатором сессии не найден' });
+  if (user.passwordHash && user.passwordHash !== hashPassword(password)) return res.status(400).json({ error: 'Неверный пароль' });
 
   user.updatedAt = Date.now();
   writeAccounts(accounts);
-
   const safeUser = Object.assign({}, user);
   delete safeUser.passwordHash;
   res.json({ success: true, user: safeUser });
@@ -164,17 +141,13 @@ app.post('/api/login', function (req, res) {
 
 app.post('/api/profile/set-password', function (req, res) {
   const { userId, password } = req.body;
-  if (!password || password.length < 6) {
-    return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
-  }
+  if (!password || password.length < 6) return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
   const accounts = readAccounts();
   const user = accounts.find(u => u.id === userId);
   if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-
   user.passwordHash = hashPassword(password);
   user.updatedAt = Date.now();
   writeAccounts(accounts);
-
   const safeUser = Object.assign({}, user);
   delete safeUser.passwordHash;
   res.json({ success: true, user: safeUser });
@@ -183,10 +156,10 @@ app.post('/api/profile/set-password', function (req, res) {
 app.post('/api/ping', function (req, res) {
   const { id, name, avatar, contacts, knownUsers } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
-  
+
   const accounts = readAccounts();
   const groups = readGroups();
-  
+
   if (Array.isArray(knownUsers)) {
     knownUsers.forEach(function (kUser) {
       if (!kUser.id || kUser.id === id) return;
@@ -197,9 +170,7 @@ app.post('/api/ping', function (req, res) {
           sessionUID: genSessionUID(),
           name: kUser.name || 'Пользователь',
           avatar: kUser.avatar || '',
-          contacts: [],
-          blockedContacts: [],
-          hiddenDialogs: [],
+          contacts: [], blockedContacts: [], hiddenDialogs: [],
           updatedAt: 0
         });
       } else {
@@ -217,8 +188,7 @@ app.post('/api/ping', function (req, res) {
       name: name || 'Пользователь',
       avatar: avatar || '',
       contacts: Array.isArray(contacts) ? contacts : [],
-      blockedContacts: [],
-      hiddenDialogs: [],
+      blockedContacts: [], hiddenDialogs: [],
       updatedAt: Date.now()
     };
     accounts.push(user);
@@ -254,7 +224,6 @@ app.post('/api/profile/update', function (req, res) {
   if (avatar !== undefined) user.avatar = avatar;
   user.updatedAt = Date.now();
   writeAccounts(accounts);
-
   const safeUser = Object.assign({}, user);
   delete safeUser.passwordHash;
   res.json({ success: true, user: safeUser });
@@ -412,7 +381,13 @@ app.post('/api/groups/leave', function (req, res) {
 
 /* ==================== СООБЩЕНИЯ ==================== */
 app.post('/api/messages/send', function (req, res) {
-  const { senderId, receiverId, groupId, text, fileData, fileName, fileType, clientId, fileUrl, fileSize, thumbUrl } = req.body;
+  const {
+    senderId, receiverId, groupId, text, fileData, fileName, fileType, clientId,
+    fileUrl, fileSize, thumbUrl,
+    encFileData, fileIv, fileKeyEncByUser,
+    textKeyEncByUser, encryptionVersion
+  } = req.body;
+
   const accounts = readAccounts();
   const messages = readMessages();
 
@@ -454,13 +429,19 @@ app.post('/api/messages/send', function (req, res) {
     fileName: fileName || '',
     fileType: fileType || '',
     fileSize: fileSize || 0,
+    // Шифрованные поля (сервер их не читает)
+    encFileData: encFileData || '',
+    fileIv: fileIv || '',
+    fileKeyEncByUser: fileKeyEncByUser || null,
+    textKeyEncByUser: textKeyEncByUser || null,
+    encryptionVersion: encryptionVersion || 0,
     timestamp: timeStr(), ts: Date.now(),
     isRead: false, readBy: [], isDeleted: false, clearedFor: []
   };
 
   messages.push(newMsg);
   writeMessages(messages);
-  
+
   const copyMsg = Object.assign({}, newMsg);
   copyMsg.text = text || '';
   res.json({ success: true, message: copyMsg });
@@ -633,7 +614,8 @@ app.get('/files/:name', function (req, res) {
     '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
     '.gif': 'image/gif', '.webp': 'image/webp',
-    '.pdf': 'application/pdf', '.txt': 'text/plain'
+    '.pdf': 'application/pdf', '.txt': 'text/plain',
+    '.bin': 'application/octet-stream'
   }[ext] || 'application/octet-stream';
 
   if (range) {
@@ -654,7 +636,7 @@ app.get('/files/:name', function (req, res) {
   }
 });
 
-/* ==================== HTML И КЛИЕНТ ==================== */
+/* ==================== HTML ==================== */
 const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
@@ -727,13 +709,10 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .msg.pending { opacity: 0.6; }
   .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
   .msg-sender { font-size: 12px; font-weight: bold; color: var(--accent); margin-bottom: 2px; }
-  
-  /* Telegram-style Video Container */
-  .tg-video-wrapper { position: relative; width: 280px; max-width: 100%; border-radius: 10px; overflow: hidden; margin-top: 6px; background: #000; cursor: pointer; }
-  .tg-video-wrapper video { width: 100%; height: auto; display: block; max-height: 320px; }
-  .tg-video-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; transition: opacity 0.2s; }
-  .tg-video-play-btn { width: 50px; height: 50px; background: rgba(0,0,0,0.6); border-radius: 50%; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 22px; padding-left: 4px; backdrop-filter: blur(4px); border: 1px solid rgba(255,255,255,0.2); }
-  .tg-video-wrapper.playing .tg-video-overlay { opacity: 0; pointer-events: none; }
+
+  /* ==== ВИДЕО ==== */
+  .vid-wrapper { position: relative; width: 280px; max-width: 100%; border-radius: 10px; overflow: hidden; margin-top: 6px; background: #000; }
+  .vid-wrapper video { width: 100%; height: auto; display: block; max-height: 320px; }
 
   .media-preview { width: 280px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
   .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
@@ -783,7 +762,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .member-dropdown { position: absolute; right: 8px; top: 90%; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 180px; z-index: 1500; display: none; }
   .member-dropdown.active { display: block; }
   .member-dropdown .menu-item { padding: 10px 14px; font-size: 13px; }
-  
+
   #video-viewer-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.95); z-index: 3050; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: 0.15s; pointer-events: none; }
   #video-viewer-modal.active { visibility: visible; opacity: 1; pointer-events: auto; }
   #video-viewer-modal video { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
@@ -822,7 +801,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
       </div>
       <div id="auth-error" class="error-msg"></div>
 
-      <!-- ФОРМА РЕГИСТРАЦИИ -->
       <div id="form-reg">
         <div class="input-group">
           <input type="text" id="auth-name" placeholder="Ваше имя...">
@@ -833,7 +811,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
         <button class="btn" id="register-btn" onclick="registerUser()">Создать аккаунт</button>
       </div>
 
-      <!-- ФОРМА ВХОДА ПО SESSION UID И ПАРОЛЮ -->
       <div id="form-login" style="display:none;">
         <div class="input-group">
           <input type="text" id="login-uid-input" maxlength="8" style="text-transform:uppercase; text-align:center; font-family:monospace; letter-spacing:2px; font-size:16px;" placeholder="Session UID (8 символов)">
@@ -924,7 +901,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- МОДАЛЬНОЕ ОКНО ПРОФИЛЯ -->
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
       <div class="profile-avatar-big" id="my-profile-avatar-view">
@@ -932,7 +908,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
       </div>
       <div class="profile-name" id="my-profile-name-view">Имя</div>
       <div class="profile-id" id="my-profile-id-view">ID</div>
-      
+
       <div class="session-uid-box" onclick="toggleSessionUIDVisibility()">
         Session UID (нажмите для показа):<br>
         <b id="my-session-uid-view">########</b>
@@ -1052,7 +1028,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '3.5.0';
+var CLIENT_VERSION = '3.6.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -1094,138 +1070,191 @@ var deletedIds = {};
 var isUidVisible = false;
 var hasUserPassword = true;
 
-/* ==================== КАСТОМНОЕ КЛИЕНТСКОЕ ШИФРОВАНИЕ ==================== */
-function customEncrypt(text) {
-  if (!text) return '';
-  try {
-    var encoded = encodeURIComponent(text);
-    var result = '';
-    for (var i = 0; i < encoded.length; i++) {
-      var code = encoded.charCodeAt(i);
-      result += String.fromCharCode(code + 5);
-    }
-    return btoa(result);
-  } catch(e) { return text; }
+/* ==================== КЛИЕНТСКОЕ ШИФРОВАНИЕ ==================== */
+/* Схема:
+   - clientSalt — 32 случайных байта, только в localStorage клиента.
+   - userKey(userId) = HKDF(clientSalt, "msg-user-key-v1:" + userId)
+   - Каждый файл/текст шифруется своим одноразовым fileKey (AES-GCM 256).
+   - fileKey заворачивается под каждого получателя: wrap(fileKey, userKey(receiverId)).
+   - Сервер видит только зашифрованные данные и обёртки.
+*/
+
+function bufToBase64(buf) {
+  var bytes = new Uint8Array(buf);
+  var binary = '';
+  for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+function base64ToBuf(b64) {
+  var binary = atob(b64);
+  var bytes = new Uint8Array(binary.length);
+  for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+function strToU8(s) { return new TextEncoder().encode(s); }
+function u8ToStr(u) { return new TextDecoder().decode(u); }
+
+var clientSalt = null;
+function loadClientSalt() {
+  try { clientSalt = localStorage.getItem('messenger_client_salt'); } catch (e) {}
+  if (!clientSalt) {
+    var arr = new Uint8Array(32);
+    crypto.getRandomValues(arr);
+    clientSalt = bufToBase64(arr);
+    try { localStorage.setItem('messenger_client_salt', clientSalt); } catch (e) {}
+  }
+}
+loadClientSalt();
+
+var userKeyCache = {};
+async function getUserKey(userId) {
+  if (userKeyCache[userId]) return userKeyCache[userId];
+  var baseKey = await crypto.subtle.importKey(
+    'raw', base64ToBuf(clientSalt), { name: 'HKDF' }, false, ['deriveKey']
+  );
+  var key = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: strToU8('msg-user-key-v1:' + userId), info: strToU8('aes-gcm-256') },
+    baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+  );
+  userKeyCache[userId] = key;
+  return key;
 }
 
-function customDecrypt(cipher) {
-  if (!cipher) return '';
-  try {
-    var raw = atob(cipher);
-    var result = '';
-    for (var i = 0; i < raw.length; i++) {
-      var code = raw.charCodeAt(i);
-      result += String.fromCharCode(code - 5);
-    }
-    return decodeURIComponent(result);
-  } catch(e) { return cipher; }
+async function aesEncrypt(key, dataU8) {
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, dataU8);
+  return { iv: bufToBase64(iv), data: bufToBase64(enc) };
+}
+async function aesDecrypt(key, ivB64, dataB64) {
+  var iv = new Uint8Array(base64ToBuf(ivB64));
+  var data = base64ToBuf(dataB64);
+  var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, data);
+  return new Uint8Array(dec);
 }
 
-function loadDeletedIds() {
-  try {
-    var raw = localStorage.getItem('messenger_deleted_ids');
-    if (raw) deletedIds = JSON.parse(raw) || {};
-  } catch (e) { deletedIds = {}; }
+async function generateFileKey() {
+  return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
 }
-function saveDeletedIds() {
-  try { localStorage.setItem('messenger_deleted_ids', JSON.stringify(deletedIds)); } catch (e) {}
-}
-function markDeleted(msgId) {
-  deletedIds[msgId] = true;
-  saveDeletedIds();
+async function exportFileKeyB64(k) { return bufToBase64(await crypto.subtle.exportKey('raw', k)); }
+async function importFileKeyB64(b64) {
+  return crypto.subtle.importKey('raw', base64ToBuf(b64), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-function openFilesDB() {
-  return new Promise(function (resolve, reject) {
-    if (filesDB) return resolve(filesDB);
-    if (!window.indexedDB) return reject(new Error('No IndexedDB'));
-    var req = indexedDB.open('messenger_files_v1', 1);
-    req.onupgradeneeded = function (e) {
-      var db = e.target.result;
-      if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'key' });
+async function encryptBlob(blob) {
+  var fileKey = await generateFileKey();
+  var buf = await blob.arrayBuffer();
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
+  return {
+    blob: new Blob([enc], { type: 'application/octet-stream' }),
+    ivB64: bufToBase64(iv),
+    keyB64: await exportFileKeyB64(fileKey),
+    originalSize: blob.size
+  };
+}
+async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
+  var fileKey = await importFileKeyB64(keyB64);
+  var iv = new Uint8Array(base64ToBuf(ivB64));
+  var buf = await encBlob.arrayBuffer();
+  var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
+  return new Blob([dec], { type: originalType || 'application/octet-stream' });
+}
+
+async function wrapFileKeyForUser(fileKeyB64, userId) {
+  var uKey = await getUserKey(userId);
+  var enc = await aesEncrypt(uKey, strToU8(fileKeyB64));
+  return enc.iv + '.' + enc.data;
+}
+async function unwrapFileKeyForMe(wrapped, myId) {
+  if (!wrapped) return null;
+  var parts = wrapped.split('.');
+  if (parts.length !== 2) return null;
+  var uKey = await getUserKey(myId);
+  var dec = await aesDecrypt(uKey, parts[0], parts[1]);
+  return u8ToStr(dec);
+}
+
+/* Chat secret (не обязателен для новой схемы, но оставим для спец-сообщений) */
+var chatSecrets = {};
+function loadChatSecrets() {
+  try { chatSecrets = JSON.parse(localStorage.getItem('messenger_chat_secrets') || '{}'); } catch (e) { chatSecrets = {}; }
+}
+function saveChatSecrets() {
+  try { localStorage.setItem('messenger_chat_secrets', JSON.stringify(chatSecrets)); } catch (e) {}
+}
+loadChatSecrets();
+
+function blobToBase64(blob) {
+  return new Promise(function (res, rej) {
+    var r = new FileReader();
+    r.onload = function () {
+      var s = r.result;
+      var idx = s.indexOf(',');
+      res(idx >= 0 ? s.substring(idx + 1) : s);
     };
-    req.onsuccess = function (e) { filesDB = e.target.result; resolve(filesDB); };
-    req.onerror = function (e) { reject(e.target.error); };
+    r.onerror = rej;
+    r.readAsDataURL(blob);
   });
 }
-async function saveFileToIDB(key, blob, meta) {
-  try {
-    var db = await openFilesDB();
-    return new Promise(function (res, rej) {
-      var tx = db.transaction('files', 'readwrite');
-      tx.objectStore('files').put({ key: key, blob: blob, fileName: (meta && meta.fileName) || '', fileType: (meta && meta.fileType) || '', fileSize: (meta && meta.fileSize) || blob.size, savedAt: Date.now() });
-      tx.oncomplete = function () { res(true); };
-      tx.onerror = function (e) { rej(e.target.error); };
-    });
-  } catch (e) { return false; }
-}
-async function getFileFromIDB(key) {
-  try {
-    var db = await openFilesDB();
-    return new Promise(function (res, rej) {
-      var tx = db.transaction('files', 'readonly');
-      var r = tx.objectStore('files').get(key);
-      r.onsuccess = function () { res(r.result || null); };
-      r.onerror = function (e) { rej(e.target.error); };
-    });
-  } catch (e) { return null; }
-}
-async function deleteFileFromIDB(key) {
-  try {
-    var db = await openFilesDB();
-    return new Promise(function (res) {
-      var tx = db.transaction('files', 'readwrite');
-      tx.objectStore('files').delete(key);
-      tx.oncomplete = function () { res(true); };
-      tx.onerror = function () { res(false); };
-    });
-  } catch (e) { return false; }
-}
-async function blobFromDataUrl(dataUrl) {
-  try { var res = await fetch(dataUrl); return await res.blob(); } catch (e) { return null; }
+function fileToDataUrl(file) {
+  return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = rej; r.readAsDataURL(file); });
 }
 
-async function getFileUrl(msg) {
-  if (!msg) return null;
-  if (deletedIds[msg.id]) return null;
-  if (fileUrlCache.has(msg.id)) return fileUrlCache.get(msg.id);
-  
-  var entry = await getFileFromIDB(msg.id);
-  if (entry && entry.blob) {
-    var url = URL.createObjectURL(entry.blob);
-    fileUrlCache.set(msg.id, url);
-    return url;
+/* Возвращает список получателей для текущего чата (включая себя) */
+function getRecipients() {
+  if (!activePeer) return [];
+  if (activePeer.type === 'group') {
+    var m = (activePeer.members || []).slice();
+    if (m.indexOf(currentUser.id) === -1) m.push(currentUser.id);
+    return m;
   }
-  
-  if (msg.fileData) {
-    try {
-      var blob = await blobFromDataUrl(msg.fileData);
-      if (blob) {
-        await saveFileToIDB(msg.id, blob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: blob.size });
-        var url2 = URL.createObjectURL(blob);
-        fileUrlCache.set(msg.id, url2);
-        return url2;
-      }
-    } catch (e) {}
-    return msg.fileData;
-  }
-  
-  if (msg.fileUrl) {
-    try {
-      var res = await fetch(msg.fileUrl);
-      if (res.ok) {
-        var blob2 = await res.blob();
-        await saveFileToIDB(msg.id, blob2, { fileName: msg.fileName, fileType: msg.fileType, fileSize: blob2.size });
-        var url3 = URL.createObjectURL(blob2);
-        fileUrlCache.set(msg.id, url3);
-        return url3;
-      }
-    } catch (e) {}
-    return msg.fileUrl;
-  }
-  return null;
+  return [activePeer.id, currentUser.id];
 }
 
+/* Обёртка fileKey под каждого получателя */
+async function wrapKeyForRecipients(fileKeyB64) {
+  var recipients = getRecipients();
+  var map = {};
+  for (var i = 0; i < recipients.length; i++) {
+    try { map[recipients[i]] = await wrapFileKeyForUser(fileKeyB64, recipients[i]); } catch (e) {}
+  }
+  return map;
+}
+
+/* Универсальная отправка с шифрованием текста + файла */
+async function buildEncryptedPayload(opts) {
+  var recipients = getRecipients();
+  var payload = {
+    clientId: opts.clientId,
+    text: '',
+    fileData: '',
+    encFileData: opts.encFileData || '',
+    fileIv: opts.fileIv || '',
+    fileKeyEncByUser: opts.fileKeyEncByUser || null,
+    textKeyEncByUser: null,
+    fileName: opts.fileName || '',
+    fileType: opts.fileType || '',
+    fileUrl: opts.fileUrl || '',
+    fileSize: opts.fileSize || 0,
+    thumbUrl: opts.thumbUrl || '',
+    encryptionVersion: 2
+  };
+
+  // Текст
+  if (opts.plainText) {
+    var textKey = await generateFileKey();
+    var keyB64 = await exportFileKeyB64(textKey);
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, textKey, strToU8(opts.plainText));
+    var ivB64 = bufToBase64(iv);
+    var dataB64 = bufToBase64(enc);
+    payload.text = '__AESV2__:' + ivB64 + ':' + dataB64;
+    payload.textKeyEncByUser = await wrapKeyForRecipients(keyB64);
+  }
+  return payload;
+}
+
+/* ==================== УТИЛИТЫ ==================== */
 function lockButton(id, ms) {
   if (ms === undefined) ms = 1500;
   var el = document.getElementById(id);
@@ -1335,13 +1364,11 @@ function mergeMessage(msg) {
     var m = localMessagesCache[i];
     if (m.id === msg.id || (msg.clientId && m.clientId && m.clientId === msg.clientId)) {
       if (!msg.fileUrl && m.fileUrl) msg.fileUrl = m.fileUrl;
-      if (!msg.fileData && m.fileData) msg.fileData = m.fileData;
-      if (msg.isDeleted) {
-        localMessagesCache[i] = msg;
-        markDeleted(msg.id);
-      } else {
-        localMessagesCache[i] = msg;
-      }
+      if (!msg.encFileData && m.encFileData) msg.encFileData = m.encFileData;
+      if (!msg.fileIv && m.fileIv) msg.fileIv = m.fileIv;
+      if (!msg.fileKeyEncByUser && m.fileKeyEncByUser) msg.fileKeyEncByUser = m.fileKeyEncByUser;
+      if (!msg.textKeyEncByUser && m.textKeyEncByUser) msg.textKeyEncByUser = m.textKeyEncByUser;
+      localMessagesCache[i] = msg;
       saveCache();
       return;
     }
@@ -1373,7 +1400,7 @@ function playNotificationSound() {
 }
 function updateThemeIcon(theme) {
   var btn = document.getElementById('theme-toggle-btn');
-  if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️️';
+  if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️';
 }
 function toggleTheme() {
   var current = document.documentElement.getAttribute('data-theme');
@@ -1405,29 +1432,104 @@ function compressImage(file, maxSize, quality, callback) {
   reader.readAsDataURL(file);
 }
 
-// СОЗДАНИЕ ПРЕВЬЮ КАДРА ДЛЯ ВИДЕО
-function generateVideoThumbnail(file, callback) {
-  var video = document.createElement('video');
-  video.preload = 'metadata';
-  video.src = URL.createObjectURL(file);
-  video.muted = true;
-  video.playsInline = true;
-  video.onloadeddata = function () {
-    video.currentTime = 0.5;
-  };
-  video.onseeked = function () {
-    try {
-      var canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth || 320;
-      canvas.height = video.videoHeight || 240;
-      var ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      callback(canvas.toDataURL('image/jpeg', 0.8));
-    } catch(e) { callback(''); }
-  };
-  video.onerror = function () { callback(''); };
+/* ==================== IDB ==================== */
+function openFilesDB() {
+  return new Promise(function (resolve, reject) {
+    if (filesDB) return resolve(filesDB);
+    if (!window.indexedDB) return reject(new Error('No IndexedDB'));
+    var req = indexedDB.open('messenger_files_v1', 1);
+    req.onupgradeneeded = function (e) {
+      var db = e.target.result;
+      if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'key' });
+    };
+    req.onsuccess = function (e) { filesDB = e.target.result; resolve(filesDB); };
+    req.onerror = function (e) { reject(e.target.error); };
+  });
+}
+async function saveFileToIDB(key, blob, meta) {
+  try {
+    var db = await openFilesDB();
+    return new Promise(function (res, rej) {
+      var tx = db.transaction('files', 'readwrite');
+      tx.objectStore('files').put({ key: key, blob: blob, fileName: (meta && meta.fileName) || '', fileType: (meta && meta.fileType) || '', fileSize: (meta && meta.fileSize) || blob.size, savedAt: Date.now() });
+      tx.oncomplete = function () { res(true); };
+      tx.onerror = function (e) { rej(e.target.error); };
+    });
+  } catch (e) { return false; }
+}
+async function getFileFromIDB(key) {
+  try {
+    var db = await openFilesDB();
+    return new Promise(function (res, rej) {
+      var tx = db.transaction('files', 'readonly');
+      var r = tx.objectStore('files').get(key);
+      r.onsuccess = function () { res(r.result || null); };
+      r.onerror = function (e) { rej(e.target.error); };
+    });
+  } catch (e) { return null; }
+}
+async function deleteFileFromIDB(key) {
+  try {
+    var db = await openFilesDB();
+    return new Promise(function (res) {
+      var tx = db.transaction('files', 'readwrite');
+      tx.objectStore('files').delete(key);
+      tx.oncomplete = function () { res(true); };
+      tx.onerror = function () { res(false); };
+    });
+  } catch (e) { return false; }
+}
+async function blobFromDataUrl(dataUrl) {
+  try { var res = await fetch(dataUrl); return await res.blob(); } catch (e) { return null; }
 }
 
+/* Получение URL для вложения (с расшифровкой) */
+async function getFileUrl(msg) {
+  if (!msg) return null;
+  if (deletedIds[msg.id]) return null;
+  if (fileUrlCache.has(msg.id)) return fileUrlCache.get(msg.id);
+
+  var encBlob = null;
+  var entry = await getFileFromIDB(msg.id);
+  if (entry && entry.blob) encBlob = entry.blob;
+
+  if (!encBlob) {
+    if (msg.encFileData) {
+      try { encBlob = await blobFromDataUrl('data:application/octet-stream;base64,' + msg.encFileData); } catch (e) {}
+    } else if (msg.fileData && msg.fileData.indexOf('data:') === 0) {
+      try { encBlob = await blobFromDataUrl(msg.fileData); } catch (e) {}
+    } else if (msg.fileUrl) {
+      try {
+        var res = await fetch(msg.fileUrl);
+        if (res.ok) encBlob = await res.blob();
+      } catch (e) {}
+    }
+    if (encBlob) {
+      try { await saveFileToIDB(msg.id, encBlob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: encBlob.size }); } catch (e) {}
+    }
+  }
+
+  if (!encBlob) return null;
+
+  if (msg.fileKeyEncByUser && msg.fileIv) {
+    try {
+      var wrapped = msg.fileKeyEncByUser[currentUser.id];
+      if (!wrapped) return null;
+      var fileKeyB64 = await unwrapFileKeyForMe(wrapped, currentUser.id);
+      if (!fileKeyB64) return null;
+      var dec = await decryptBlob(encBlob, fileKeyB64, msg.fileIv, msg.fileType);
+      var url = URL.createObjectURL(dec);
+      fileUrlCache.set(msg.id, url);
+      return url;
+    } catch (e) { console.warn('Decrypt failed:', e); return null; }
+  }
+
+  var url2 = URL.createObjectURL(encBlob);
+  fileUrlCache.set(msg.id, url2);
+  return url2;
+}
+
+/* ==================== UI ==================== */
 function toggleChatDropdown() { var m = document.getElementById('chat-dropdown-menu'); if (m) m.classList.toggle('active'); }
 function closeChatDropdown() { var m = document.getElementById('chat-dropdown-menu'); if (m) m.classList.remove('active'); }
 document.addEventListener('click', function (e) {
@@ -1503,7 +1605,7 @@ function updateMyProfileUI() {
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
-/* ==================== ВХОД И РЕГИСТРАЦИЯ ==================== */
+/* ==================== ВХОД ==================== */
 function switchAuthTab(type) {
   var errBox = document.getElementById('auth-error');
   errBox.style.display = 'none';
@@ -1625,7 +1727,7 @@ async function sendPing() {
       var changed = false;
       if (serverUser.name && serverUser.name !== currentUser.name) { currentUser.name = serverUser.name; changed = true; }
       if (serverUser.avatar !== undefined && serverUser.avatar !== currentUser.avatar) { currentUser.avatar = serverUser.avatar; changed = true; }
-      if (serverUser.sessionUID) { currentUser.sessionUID = serverUser.sessionUID; }
+      if (serverUser.sessionUID) currentUser.sessionUID = serverUser.sessionUID;
       if (serverUser.contacts) {
         if (!currentUser.contacts) currentUser.contacts = [];
         serverUser.contacts.forEach(function (c) { if (currentUser.contacts.indexOf(c) === -1) currentUser.contacts.push(c); });
@@ -1660,6 +1762,7 @@ async function refreshActivePeerStatus() {
   } catch (e) {}
 }
 
+/* ==================== ОТЛОЖЕННАЯ ОТПРАВКА ==================== */
 async function retryPendingMessages() {
   if (!currentUser) return;
   if (isRetrying) return;
@@ -1670,22 +1773,32 @@ async function retryPendingMessages() {
   for (var i = 0; i < pending.length; i++) {
     var pm = pending[i];
     try {
+      var body = {
+        senderId: pm.senderId, receiverId: pm.receiverId || '', groupId: pm.groupId || '',
+        text: pm.textEnc || (pm.text ? '__PLAIN__' : ''),
+        fileData: pm.fileData || '',
+        fileName: pm.fileName || '', fileType: pm.fileType || '',
+        clientId: pm.clientId,
+        fileUrl: pm.fileUrl || '',
+        fileSize: pm.fileSize || 0,
+        thumbUrl: pm.thumbUrl || '',
+        encFileData: pm.encFileData || '',
+        fileIv: pm.fileIv || '',
+        fileKeyEncByUser: pm.fileKeyEncByUser || null,
+        textKeyEncByUser: pm.textKeyEncByUser || null,
+        encryptionVersion: pm.encryptionVersion || 2
+      };
       var res = await fetch('/api/messages/send', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          senderId: pm.senderId, receiverId: pm.receiverId || '', groupId: pm.groupId || '',
-          text: customEncrypt(pm.text || ''), fileData: pm.fileData || '',
-          fileName: pm.fileName || '', fileType: pm.fileType || '',
-          clientId: pm.clientId, fileUrl: pm.fileUrl || '', fileSize: pm.fileSize || 0, thumbUrl: pm.thumbUrl || ''
-        })
+        body: JSON.stringify(body)
       });
       if (res.ok) {
         var data = await res.json();
         if (data && data.message) {
-          var rm = Object.assign({}, data.message); rm.isPending = false;
-          rm.text = customDecrypt(data.message.text);
-          if (pm.fileUrl) rm.fileUrl = pm.fileUrl;
-          if (pm.fileSize) rm.fileSize = pm.fileSize;
+          var rm = Object.assign({}, data.message);
+          rm.isPending = false;
+          // Локально сохраняем открытый текст
+          rm.text = pm.text || '';
           try {
             var entry = await getFileFromIDB(pm.clientId);
             if (entry && entry.blob) {
@@ -1710,17 +1823,13 @@ async function retryPendingMessages() {
   isRetrying = false;
 }
 
-/* ==================== МОЙ ПРОФИЛЬ ==================== */
+/* ==================== ПРОФИЛЬ ==================== */
 function toggleSessionUIDVisibility() {
   isUidVisible = !isUidVisible;
   var el = document.getElementById('my-session-uid-view');
-  if (isUidVisible && currentUser) {
-    el.innerText = currentUser.sessionUID || '--------';
-  } else {
-    el.innerText = '########';
-  }
+  if (isUidVisible && currentUser) el.innerText = currentUser.sessionUID || '--------';
+  else el.innerText = '########';
 }
-
 function openMyProfile() {
   if (isModalOpen('my-profile-modal')) return;
   draftAvatar = null;
@@ -1732,14 +1841,7 @@ function openMyProfile() {
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
   document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
-  
-  var warnBox = document.getElementById('password-warning-box');
-  if (!hasUserPassword) {
-    warnBox.style.display = 'block';
-  } else {
-    warnBox.style.display = 'none';
-  }
-
+  document.getElementById('password-warning-box').style.display = hasUserPassword ? 'none' : 'block';
   safeOpenModal('my-profile-modal');
 }
 function closeMyProfile() { draftAvatar = null; safeCloseModal('my-profile-modal'); }
@@ -1773,7 +1875,7 @@ async function saveMyProfileChanges() {
       });
       var dP = await resP.json();
       if (dP.success) hasUserPassword = true;
-    } catch(e) {}
+    } catch (e) {}
   }
 
   if (newName) currentUser.name = newName;
@@ -1877,6 +1979,13 @@ async function clearChatHistory() {
   lastMessagesHash = '';
   loadMessages();
 }
+function markDeleted(msgId) {
+  deletedIds[msgId] = true;
+  try { localStorage.setItem('messenger_deleted_ids', JSON.stringify(deletedIds)); } catch (e) {}
+}
+function loadDeletedIds() {
+  try { deletedIds = JSON.parse(localStorage.getItem('messenger_deleted_ids') || '{}'); } catch (e) { deletedIds = {}; }
+}
 async function deleteCurrentChat() {
   closeChatDropdown();
   if (!activePeer || !confirm('Удалить чат?')) return;
@@ -1893,6 +2002,7 @@ function resetActiveChat() {
   document.getElementById('messages-container').innerHTML = '<div class="empty-state">Выберите диалог</div>';
 }
 
+/* ==================== ДИАЛОГИ ==================== */
 async function loadDialogs() {
   if (document.getElementById('search-input').value.trim()) return;
   if (!currentUser) return;
@@ -1989,15 +2099,48 @@ function closeMobileChat() { document.getElementById('app-screen').classList.rem
 function msgFetchUrl() {
   return activePeer.type === 'group' ? '/api/messages/group/' + activePeer.id + '?userId=' + encodeURIComponent(currentUser.id) : '/api/messages/' + currentUser.id + '/' + activePeer.id;
 }
+
+/* ==================== РАСШИФРОВКА ВХОДЯЩИХ ==================== */
+async function processIncomingMessage(m) {
+  // 1) Спец-сообщение с chat-secret (обратная совместимость, не показываем)
+  if (m.text && m.text.indexOf('__CHAT_SECRET') === 0) {
+    m.isDeleted = true;
+    markDeleted(m.id);
+    return;
+  }
+  // 2) AESV2-текст
+  if (m.text && m.text.indexOf('__AESV2__:') === 0) {
+    var rest = m.text.substring('__AESV2__:'.length);
+    var colon = rest.indexOf(':');
+    if (colon > 0) {
+      var ivB64 = rest.substring(0, colon);
+      var dataB64 = rest.substring(colon + 1);
+      var wrapped = m.textKeyEncByUser && m.textKeyEncByUser[currentUser.id];
+      if (wrapped) {
+        try {
+          var fileKeyB64 = await unwrapFileKeyForMe(wrapped, currentUser.id);
+          if (fileKeyB64) {
+            var fileKey = await importFileKeyB64(fileKeyB64);
+            var dec = await aesDecrypt(fileKey, ivB64, dataB64);
+            m.text = u8ToStr(dec);
+          } else m.text = '';
+        } catch (e) { m.text = ''; }
+      } else m.text = '';
+    }
+  } else {
+    m.text = customDecrypt(m.text);
+  }
+}
+
 async function loadMessages() {
   if (!activePeer) return;
   try {
     var res = await fetch(msgFetchUrl());
     var messages = await res.json();
-    messages.forEach(function(m) {
-      m.text = customDecrypt(m.text);
-      mergeMessage(m);
-    });
+    for (var i = 0; i < messages.length; i++) {
+      await processIncomingMessage(messages[i]);
+      if (!messages[i].isDeleted) mergeMessage(messages[i]);
+    }
     saveCache();
     renderMessagesContainer(getChatMessages(activePeer));
     checkVisibleMessages();
@@ -2009,13 +2152,15 @@ async function loadMessagesQuiet() {
     var res = await fetch(msgFetchUrl());
     var messages = await res.json();
     var hasNewMsg = false;
-    messages.forEach(function (msg) {
-      if (deletedIds[msg.id]) return;
-      msg.text = customDecrypt(msg.text);
+    for (var i = 0; i < messages.length; i++) {
+      var msg = messages[i];
+      if (deletedIds[msg.id]) continue;
       var known = localMessagesCache.some(function (m) { return m.id === msg.id || (msg.clientId && m.clientId === msg.clientId); });
+      await processIncomingMessage(msg);
+      if (msg.isDeleted) { markDeleted(msg.id); continue; }
       if (!known && msg.senderId !== currentUser.id) hasNewMsg = true;
       mergeMessage(msg);
-    });
+    }
     saveCache();
     var peerMsgs = getChatMessages(activePeer);
     var currentHash = JSON.stringify(peerMsgs.map(function (m) { return m.id + '_' + m.isRead + '_' + (m.readBy ? m.readBy.length : 0) + '_' + m.isDeleted; }));
@@ -2026,6 +2171,26 @@ async function loadMessagesQuiet() {
       checkVisibleMessages();
     }
   } catch (e) {}
+}
+
+/* customEncrypt/Decrypt оставим для обратной совместимости старых сообщений */
+function customEncrypt(text) {
+  if (!text) return '';
+  try {
+    var encoded = encodeURIComponent(text);
+    var result = '';
+    for (var i = 0; i < encoded.length; i++) result += String.fromCharCode(encoded.charCodeAt(i) + 5);
+    return btoa(result);
+  } catch (e) { return text; }
+}
+function customDecrypt(cipher) {
+  if (!cipher) return '';
+  try {
+    var raw = atob(cipher);
+    var result = '';
+    for (var i = 0; i < raw.length; i++) result += String.fromCharCode(raw.charCodeAt(i) - 5);
+    return decodeURIComponent(result);
+  } catch (e) { return cipher; }
 }
 
 function openVideoViewer(src) {
@@ -2041,7 +2206,6 @@ function closeVideoViewer() {
   video.src = '';
   modal.classList.remove('active');
 }
-
 function openImageViewer(src) { if (document.getElementById('image-viewer-modal').classList.contains('active')) return; document.getElementById('full-screen-img').src = src; document.getElementById('image-viewer-modal').classList.add('active'); }
 function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
 
@@ -2076,11 +2240,12 @@ async function renderMessagesContainer(messages) {
     }; })(m, div);
     div.ontouchend = function () { clearTimeout(longTouchTimer); };
     div.ontouchmove = function () { clearTimeout(longTouchTimer); };
+
     var html = '';
     if (isGroup && m.senderId !== currentUser.id) html += '<div class="msg-sender">' + escapeHtml(getUserName(m.senderId)) + '</div>';
     if (m.text) html += '<div>' + escapeHtml(m.text) + '</div>';
     var ft = m.fileType || '';
-    if (m.fileData || m.fileUrl) {
+    if (m.encFileData || m.fileData || m.fileUrl) {
       var mid = m.id;
       if (ft.indexOf('image/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">📷 Загрузка...</div>';
       else if (ft.indexOf('video/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">🎬 Загрузка видео...</div>';
@@ -2122,28 +2287,15 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
     newEl.src = url;
     newEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(url); });
   } else if (ft.indexOf('video/') === 0) {
-    // TELEGRAM-LIKE ВЕРСТКА ДЛЯ ВИДЕО
     var wrapper = document.createElement('div');
-    wrapper.className = 'tg-video-wrapper';
-
+    wrapper.className = 'vid-wrapper';
     var video = document.createElement('video');
     video.src = url;
-    video.preload = 'metadata';
     video.controls = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
     if (msg.thumbUrl) video.poster = msg.thumbUrl;
-
-    var overlay = document.createElement('div');
-    overlay.className = 'tg-video-overlay';
-    overlay.innerHTML = '<div class="tg-video-play-btn">▶</div>';
-
     wrapper.appendChild(video);
-    wrapper.appendChild(overlay);
-
-    overlay.onclick = function (e) {
-      e.stopPropagation();
-      openVideoViewer(url);
-    };
-
     newEl = wrapper;
   } else if (ft.indexOf('audio/') === 0) {
     newEl = document.createElement('audio');
@@ -2198,8 +2350,8 @@ function openMsgActions(msg, el) {
   selectedMsgId = msg.id; selectedMsgObj = msg;
   document.querySelectorAll('.msg').forEach(function (x) { x.classList.remove('selected-msg'); });
   el.classList.add('selected-msg');
-  document.getElementById('action-btn-copy').style.display = (msg.text && !msg.fileData && !msg.fileUrl) ? 'block' : 'none';
-  document.getElementById('action-btn-download').style.display = (msg.fileData || msg.fileUrl) ? 'block' : 'none';
+  document.getElementById('action-btn-copy').style.display = (msg.text && !msg.encFileData && !msg.fileData && !msg.fileUrl) ? 'block' : 'none';
+  document.getElementById('action-btn-download').style.display = (msg.encFileData || msg.fileData || msg.fileUrl) ? 'block' : 'none';
   document.getElementById('msg-actions-sheet').classList.add('active');
 }
 function closeMsgActions() {
@@ -2221,77 +2373,63 @@ async function deleteSelectedMessage() {
   var id = selectedMsgId;
   closeMsgActions();
   if (!id) return;
-  
   markDeleted(id);
   for (var i = 0; i < localMessagesCache.length; i++) {
-    if (localMessagesCache[i].id === id) {
-      localMessagesCache[i].isDeleted = true;
-      break;
-    }
+    if (localMessagesCache[i].id === id) { localMessagesCache[i].isDeleted = true; break; }
   }
   saveCache();
   lastMessagesHash = '';
-  
   await deleteFileFromIDB(id);
-  if (fileUrlCache.has(id)) {
-    try { URL.revokeObjectURL(fileUrlCache.get(id)); } catch (e) {}
-    fileUrlCache.delete(id);
-  }
-  
+  if (fileUrlCache.has(id)) { try { URL.revokeObjectURL(fileUrlCache.get(id)); } catch (e) {} fileUrlCache.delete(id); }
   if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
-  
-  try {
-    await fetch('/api/messages/' + id + '?userId=' + encodeURIComponent(currentUser.id), { method: 'DELETE' });
-  } catch (e) {
-    setTimeout(function () { retryPendingDeletes(); }, 2000);
-  }
+  try { await fetch('/api/messages/' + id + '?userId=' + encodeURIComponent(currentUser.id), { method: 'DELETE' }); } catch (e) {}
 }
 
-async function retryPendingDeletes() {
-  if (!currentUser) return;
-  var deletedList = Object.keys(deletedIds);
-  for (var i = 0; i < deletedList.length; i++) {
-    var id = deletedList[i];
-    try {
-      await fetch('/api/messages/' + id + '?userId=' + encodeURIComponent(currentUser.id), { method: 'DELETE' });
-    } catch (e) {}
-  }
-}
-
+/* ==================== ФАЙЛЫ И ВЛОЖЕНИЯ ==================== */
 function triggerFileInput() { document.getElementById('file-input').click(); }
+function generateVideoThumbnail(file, callback) {
+  var video = document.createElement('video');
+  video.preload = 'metadata';
+  video.src = URL.createObjectURL(file);
+  video.muted = true;
+  video.playsInline = true;
+  video.onloadeddata = function () { video.currentTime = 0.5; };
+  video.onseeked = function () {
+    try {
+      var canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 320;
+      canvas.height = video.videoHeight || 240;
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      callback(canvas.toDataURL('image/jpeg', 0.8));
+    } catch (e) { callback(''); }
+  };
+  video.onerror = function () { callback(''); };
+}
 function handleFileSelect(e) {
   var file = e.target.files[0]; if (!file) return;
   if (file.size > MAX_FILE_SIZE) { alert('Максимум 200 МБ'); e.target.value = ''; return; }
-  selectedFile = { file: file, name: file.name, type: file.type, data: null, isLarge: file.size > 1024 * 1024, blob: file, thumbUrl: '' };
-  
+  selectedFile = { file: file, name: file.name, type: file.type, isLarge: file.size > 1024 * 1024, thumbUrl: '' };
   var thumbImg = document.getElementById('attachment-thumb-img');
   document.getElementById('attachment-name-label').innerText = file.name;
   document.getElementById('attachment-type-label').innerText = formatBytes(file.size);
-
   if (file.type.indexOf('image/') === 0) {
     var r = new FileReader();
     r.onload = function (ev) { thumbImg.src = ev.target.result; thumbImg.style.display = 'block'; };
     r.readAsDataURL(file);
   } else if (file.type.indexOf('video/') === 0) {
-    generateVideoThumbnail(file, function(thumb) {
+    generateVideoThumbnail(file, function (thumb) {
       selectedFile.thumbUrl = thumb;
-      if (thumb) {
-        thumbImg.src = thumb;
-        thumbImg.style.display = 'block';
-      } else {
-        thumbImg.src = ''; thumbImg.style.display = 'none';
-      }
+      if (thumb) { thumbImg.src = thumb; thumbImg.style.display = 'block'; } else { thumbImg.src = ''; thumbImg.style.display = 'none'; }
     });
   } else { thumbImg.src = ''; thumbImg.style.display = 'none'; }
   document.getElementById('attachment-preview-container').classList.add('active');
 }
-
 function cancelAttachment() {
   selectedFile = null;
   document.getElementById('file-input').value = '';
   document.getElementById('attachment-preview-container').classList.remove('active');
 }
-
 function cancelVoiceAttachment() {
   if (pendingVoice && pendingVoice.url && pendingVoice.url.indexOf('blob:') === 0) { try { URL.revokeObjectURL(pendingVoice.url); } catch (e) {} }
   pendingVoice = null;
@@ -2300,6 +2438,7 @@ function cancelVoiceAttachment() {
   if (player) { player.pause(); player.removeAttribute('src'); try { player.load(); } catch (e) {} }
 }
 
+/* ==================== ГОЛОС ==================== */
 function floatTo16BitPCM(output, offset, input) {
   for (var i = 0; i < input.length; i++, offset += 2) {
     var s = Math.max(-1, Math.min(1, input[i]));
@@ -2362,17 +2501,11 @@ async function toggleVoiceRecord() {
       final = down; fr = targetRate;
     }
     var wavBlob = encodeWAV(final, fr);
-    var reader = new FileReader();
-    reader.onload = function (evt) {
-      cancelVoiceAttachment();
-      var dataUrl = evt.target.result;
-      var url = '';
-      try { url = URL.createObjectURL(wavBlob); } catch (e) { url = dataUrl; }
-      pendingVoice = { data: dataUrl, name: 'voice_' + Date.now() + '.wav', type: 'audio/wav', url: url, blob: wavBlob };
-      document.getElementById('audio-preview-player').src = url;
-      document.getElementById('audio-attachment-preview').classList.add('active');
-    };
-    reader.readAsDataURL(wavBlob);
+    var url = '';
+    try { url = URL.createObjectURL(wavBlob); } catch (e) {}
+    pendingVoice = { name: 'voice_' + Date.now() + '.wav', type: 'audio/wav', url: url, blob: wavBlob };
+    document.getElementById('audio-preview-player').src = url;
+    document.getElementById('audio-attachment-preview').classList.add('active');
     return;
   }
   if (!activePeer) { alert('Выберите чат'); return; }
@@ -2397,6 +2530,7 @@ async function toggleVoiceRecord() {
   }
 }
 
+/* ==================== ОТПРАВКА ==================== */
 async function sendMsg() {
   if (!activePeer) return;
   if (!lockButton('send-btn', 1000)) return;
@@ -2408,7 +2542,7 @@ async function sendMsg() {
   input.value = '';
   var isGroup = activePeer.type === 'group';
   var clientId = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
-  
+
   var optMsg = {
     id: clientId, clientId: clientId,
     senderId: currentUser.id,
@@ -2419,48 +2553,74 @@ async function sendMsg() {
     fileType: fileToSend ? fileToSend.type : (voiceToSend ? voiceToSend.type : ''),
     thumbUrl: fileToSend ? fileToSend.thumbUrl : '',
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true
+    ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true,
+    encryptionVersion: 2
   };
 
+  // Голосовое
   if (voiceToSend) {
-    optMsg.fileData = voiceToSend.data;
-    optMsg.fileSize = voiceToSend.blob ? voiceToSend.blob.size : 0;
-    try { await saveFileToIDB(clientId, voiceToSend.blob, { fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: voiceToSend.blob.size }); } catch (e) {}
-    cancelVoiceAttachment();
-    mergeMessage(optMsg);
-    renderMessagesContainer(getChatMessages(activePeer));
-    await sendPayload({ clientId: clientId, text: '', fileData: voiceToSend.data, fileName: voiceToSend.name, fileType: voiceToSend.type });
+    try {
+      var encV = await encryptBlob(voiceToSend.blob);
+      var encB64V = await blobToBase64(encV.blob);
+      var wrapV = await wrapKeyForRecipients(encV.keyB64);
+      optMsg.encFileData = encB64V;
+      optMsg.fileIv = encV.ivB64;
+      optMsg.fileKeyEncByUser = wrapV;
+      optMsg.fileSize = encV.originalSize;
+      try { await saveFileToIDB(clientId, encV.blob, { fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: encV.blob.size }); } catch (e) {}
+      cancelVoiceAttachment();
+      mergeMessage(optMsg);
+      renderMessagesContainer(getChatMessages(activePeer));
+      var pV = await buildEncryptedPayload({ clientId: clientId, plainText: text, encFileData: encB64V, fileIv: encV.ivB64, fileKeyEncByUser: wrapV, fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: encV.originalSize });
+      await sendPayload(pV);
+    } catch (e) { alert('Ошибка отправки голосового'); }
     return;
   }
+
+  // Маленький файл
   if (fileToSend && !fileToSend.isLarge) {
     try {
-      var dataUrl = await fileToDataUrl(fileToSend.file);
-      optMsg.fileData = dataUrl;
-      optMsg.fileSize = fileToSend.file.size;
-      try { var b = await blobFromDataUrl(dataUrl); if (b) await saveFileToIDB(clientId, b, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: b.size }); } catch (e) {}
+      var enc = await encryptBlob(fileToSend.file);
+      var encB64 = await blobToBase64(enc.blob);
+      var wrap = await wrapKeyForRecipients(enc.keyB64);
+      optMsg.encFileData = encB64;
+      optMsg.fileIv = enc.ivB64;
+      optMsg.fileKeyEncByUser = wrap;
+      optMsg.fileSize = enc.originalSize;
+      try { await saveFileToIDB(clientId, enc.blob, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: enc.blob.size }); } catch (e) {}
       cancelAttachment();
       mergeMessage(optMsg);
       renderMessagesContainer(getChatMessages(activePeer));
-      await sendPayload({ clientId: clientId, text: text, fileData: dataUrl, fileName: fileToSend.name, fileType: fileToSend.type, thumbUrl: fileToSend.thumbUrl });
+      var p = await buildEncryptedPayload({
+        clientId: clientId, plainText: text,
+        encFileData: encB64, fileIv: enc.ivB64, fileKeyEncByUser: wrap,
+        fileName: fileToSend.name, fileType: fileToSend.type,
+        fileSize: enc.originalSize, thumbUrl: fileToSend.thumbUrl
+      });
+      await sendPayload(p);
     } catch (e) { alert('Ошибка чтения'); }
     return;
   }
+
+  // Большой файл
   if (fileToSend && fileToSend.isLarge) {
     optMsg.fileSize = fileToSend.file.size;
-    try { await saveFileToIDB(clientId, fileToSend.file, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: fileToSend.file.size }); } catch (e) {}
+    optMsg.fileType = fileToSend.type;
+    // Не сохраняем в IDB — uploadLarge сам шифрует и сохранит
     cancelAttachment();
     mergeMessage(optMsg);
     renderMessagesContainer(getChatMessages(activePeer));
     uploadLargeFileInBackground(clientId, fileToSend.file, fileToSend.name, fileToSend.type, text, fileToSend.thumbUrl);
     return;
   }
+
+  // Только текст
+  var pT = await buildEncryptedPayload({ clientId: clientId, plainText: text });
+  optMsg.textEnc = pT.text;
+  optMsg.textKeyEncByUser = pT.textKeyEncByUser;
   mergeMessage(optMsg);
   renderMessagesContainer(getChatMessages(activePeer));
-  await sendPayload({ clientId: clientId, text: text });
-}
-
-function fileToDataUrl(file) {
-  return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = rej; r.readAsDataURL(file); });
+  await sendPayload(pT);
 }
 
 async function sendPayload(payload) {
@@ -2469,19 +2629,42 @@ async function sendPayload(payload) {
     var res = await fetch('/api/messages/send', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        senderId: currentUser.id, receiverId: isGroup ? '' : activePeer.id, groupId: isGroup ? activePeer.id : '',
-        text: customEncrypt(payload.text || ''), fileData: payload.fileData || '', fileName: payload.fileName || '', fileType: payload.fileType || '',
-        fileUrl: payload.fileUrl || '', fileSize: payload.fileSize || 0, thumbUrl: payload.thumbUrl || '', clientId: payload.clientId
+        senderId: currentUser.id,
+        receiverId: isGroup ? '' : activePeer.id,
+        groupId: isGroup ? activePeer.id : '',
+        text: payload.text || '',
+        fileData: '',
+        encFileData: payload.encFileData || '',
+        fileIv: payload.fileIv || '',
+        fileKeyEncByUser: payload.fileKeyEncByUser || null,
+        textKeyEncByUser: payload.textKeyEncByUser || null,
+        fileName: payload.fileName || '',
+        fileType: payload.fileType || '',
+        fileUrl: payload.fileUrl || '',
+        fileSize: payload.fileSize || 0,
+        thumbUrl: payload.thumbUrl || '',
+        clientId: payload.clientId,
+        encryptionVersion: 2
       })
     });
-    if (res.status === 403) { localMessagesCache = localMessagesCache.filter(function (m) { return m.clientId !== payload.clientId; }); saveCache(); renderMessagesContainer(getChatMessages(activePeer)); alert('Чат заблокирован'); return; }
+    if (res.status === 403) {
+      localMessagesCache = localMessagesCache.filter(function (m) { return m.clientId !== payload.clientId; });
+      saveCache(); renderMessagesContainer(getChatMessages(activePeer));
+      alert('Чат заблокирован'); return;
+    }
     if (!res.ok) throw new Error('Server error');
     var data = await res.json();
     if (data && data.message) {
       var rm = Object.assign({}, data.message); rm.isPending = false;
-      rm.text = customDecrypt(data.message.text);
+      // Локально отображаем открытый текст
+      var plain = localMessagesCache.find(function (m) { return m.clientId === payload.clientId; });
+      rm.text = plain ? plain.text : '';
       if (payload.fileUrl) rm.fileUrl = payload.fileUrl;
       if (payload.fileSize) rm.fileSize = payload.fileSize;
+      if (payload.encFileData) rm.encFileData = payload.encFileData;
+      if (payload.fileIv) rm.fileIv = payload.fileIv;
+      if (payload.fileKeyEncByUser) rm.fileKeyEncByUser = payload.fileKeyEncByUser;
+      if (payload.textKeyEncByUser) rm.textKeyEncByUser = payload.textKeyEncByUser;
       try {
         var entry = await getFileFromIDB(payload.clientId);
         if (entry && entry.blob) {
@@ -2504,29 +2687,62 @@ async function sendPayload(payload) {
 
 async function uploadLargeFileInBackground(clientId, file, fileName, fileType, text, thumbUrl) {
   try {
-    var initRes = await fetch('/api/upload/init', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ senderId: currentUser.id, fileName: fileName, fileSize: file.size, fileType: fileType }) });
+    var enc = await encryptBlob(file);
+    var encFile = new File([enc.blob], 'enc.bin', { type: 'application/octet-stream' });
+    var wrap = await wrapKeyForRecipients(enc.keyB64);
+
+    try { await saveFileToIDB(clientId, enc.blob, { fileName: fileName, fileType: fileType, fileSize: enc.blob.size }); } catch (e) {}
+
+    var initRes = await fetch('/api/upload/init', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ senderId: currentUser.id, fileName: fileName, fileSize: encFile.size, fileType: 'application/octet-stream' })
+    });
     if (!initRes.ok) throw new Error('init failed');
     var initData = await initRes.json();
     var fileId = initData.fileId;
     var totalChunks = initData.totalChunks;
     for (var i = 0; i < totalChunks; i++) {
       var start = i * CHUNK_SIZE;
-      var end = Math.min(start + CHUNK_SIZE, file.size);
-      var chunk = file.slice(start, end);
-      var res = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk });
+      var end = Math.min(start + CHUNK_SIZE, encFile.size);
+      var chunk = encFile.slice(start, end);
+      var res = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, {
+        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk
+      });
       if (!res.ok) throw new Error('chunk ' + i);
     }
     var finRes = await fetch('/api/upload/finish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fileId: fileId }) });
     if (!finRes.ok) throw new Error('finish');
     var fdata = await finRes.json();
+
     for (var j = 0; j < localMessagesCache.length; j++) {
-      if (localMessagesCache[j].clientId === clientId) { localMessagesCache[j].fileUrl = fdata.url; break; }
+      if (localMessagesCache[j].clientId === clientId) {
+        localMessagesCache[j].fileUrl = fdata.url;
+        localMessagesCache[j].fileKeyEncByUser = wrap;
+        localMessagesCache[j].fileIv = enc.ivB64;
+        localMessagesCache[j].fileSize = enc.originalSize;
+        localMessagesCache[j].fileType = fileType;
+        break;
+      }
     }
     saveCache();
-    await sendPayload({ clientId: clientId, text: text || '', fileName: fileName, fileType: fileType, fileUrl: fdata.url, fileSize: file.size, thumbUrl: thumbUrl });
+
+    var p = await buildEncryptedPayload({
+      clientId: clientId, plainText: text,
+      fileUrl: fdata.url, fileName: fileName, fileType: fileType,
+      fileSize: enc.originalSize, thumbUrl: thumbUrl,
+      fileIv: enc.ivB64, fileKeyEncByUser: wrap
+    });
+    await sendPayload(p);
+
+    lastMessagesHash = '';
+    if (activePeer) {
+      if (fileUrlCache.has(clientId)) { try { URL.revokeObjectURL(fileUrlCache.get(clientId)); } catch (e) {} fileUrlCache.delete(clientId); }
+      renderMessagesContainer(getChatMessages(activePeer));
+    }
   } catch (e) { console.warn('Upload failed:', e); }
 }
 
+/* ==================== ГРУППЫ / КОНТАКТЫ ==================== */
 async function getContactUsers() {
   var arr = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
@@ -2541,7 +2757,6 @@ async function getContactUsers() {
     return su;
   } catch (e) { return arr; }
 }
-
 function renderCheckList(containerId, users, excludeSet) {
   var c = document.getElementById(containerId); c.innerHTML = '';
   var list = users.filter(function (u) { return !excludeSet.has(u.id); });
@@ -2595,7 +2810,6 @@ async function submitCreateGroup() {
     } else alert(data.error || 'Ошибка');
   } catch (e) { alert('Не удалось'); }
 }
-
 async function refreshGroupInfo() {
   if (!activePeer || activePeer.type !== 'group') return;
   try {
@@ -2610,7 +2824,6 @@ async function refreshGroupInfo() {
     renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { id: g.id, name: g.name, avatar: g.avatar }, false);
   } catch (e) {}
 }
-
 async function openGroupProfile() {
   closeChatDropdown();
   if (!activePeer || activePeer.type !== 'group') return;
@@ -2629,7 +2842,6 @@ async function openGroupProfile() {
   safeOpenModal('group-profile-modal');
 }
 function closeGroupProfile() { editGroupDraftAvatar = ''; safeCloseModal('group-profile-modal'); closeMemberDropdown(); }
-
 function renderMembersList(containerId, memberDetails, ownerId) {
   var c = document.getElementById(containerId); c.innerHTML = '';
   var amOwner = ownerId === currentUser.id;
@@ -2652,7 +2864,6 @@ function renderMembersList(containerId, memberDetails, ownerId) {
     c.appendChild(row);
   });
 }
-
 function openMemberDropdown(rowEl, member) {
   closeMemberDropdown();
   var dd = document.createElement('div');
@@ -2670,7 +2881,6 @@ function openMemberDropdown(rowEl, member) {
   setTimeout(function () { document.addEventListener('click', function h(ev) { if (activeMemberDropdown && !activeMemberDropdown.contains(ev.target)) { closeMemberDropdown(); document.removeEventListener('click', h); } }); }, 0);
 }
 function closeMemberDropdown() { if (activeMemberDropdown && activeMemberDropdown.parentNode) activeMemberDropdown.parentNode.removeChild(activeMemberDropdown); activeMemberDropdown = null; }
-
 async function kickMember(member) {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!confirm('Выгнать ' + member.name + '?')) return;
@@ -2747,33 +2957,34 @@ async function leaveGroup() {
   } catch (e) {}
 }
 
+/* ==================== ИНИЦИАЛИЗАЦИЯ ==================== */
 window.addEventListener('DOMContentLoaded', async function () {
   updateThemeIcon(savedTheme);
   document.querySelectorAll('.modal-overlay').forEach(function (ov) {
     ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); });
   });
   loadDeletedIds();
+  loadClientSalt();
+  loadChatSecrets();
   try { currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) { currentUser = null; }
   try { localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}'); } catch (e) { localKnownUsers = {}; }
   try { localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]'); } catch (e) { localMessagesCache = []; }
   try { mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]'); } catch (e) { mutedPeers = []; }
-  
+
   localMessagesCache = localMessagesCache.filter(function (m) { return !deletedIds[m.id] && !m.isDeleted; });
   saveCache();
   updateVersionInfo();
   await checkServerHealth();
-  
+
   if (!currentUser) {
     setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000);
   }
-  
+
   if (currentUser) {
     startApp();
   } else {
     updateLoadingScreen();
   }
-  
-  setInterval(retryPendingDeletes, 10000);
 });
 `;
 
