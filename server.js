@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — единый файл (сервер + клиент + шифрование)
+   server.js — единый файл (сервер + клиент + шифрование + звонки)
    ============================================================ */
 const express = require('express');
 const fs = require('fs');
@@ -9,7 +9,7 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const SERVER_VERSION = '3.6.0';
+const SERVER_VERSION = '3.7.0';
 const MIN_CLIENT_VERSION = '1.0.0';
 
 app.use(express.json({ limit: '200mb' }));
@@ -92,11 +92,56 @@ app.get('/api/health', function (req, res) {
   res.json({ ok: true, serverTime: Date.now(), serverVersion: SERVER_VERSION, minClientVersion: MIN_CLIENT_VERSION });
 });
 
-/* ==================== АККАУНТЫ ==================== */
+/* ==================== ВХОД ПО ИМЕНИ (новая схема) ==================== */
+/* Клиент передаёт имя + локальный userId (если уже был). Если userId с таким именем
+   уже есть — возвращаем его. Иначе создаём нового. Старые аккаунты не трогаем. */
+app.post('/api/enter', function (req, res) {
+  const name = (req.body.name || '').trim();
+  const clientId = (req.body.clientId || '').trim();
+  if (!name) return res.status(400).json({ error: 'Введите имя' });
+  if (name.length > 60) return res.status(400).json({ error: 'Слишком длинное имя' });
+
+  const accounts = readAccounts();
+  let user = null;
+
+  if (clientId) {
+    user = accounts.find(function (u) { return u.id === clientId; });
+  }
+  if (!user) {
+    user = accounts.find(function (u) { return u.name === name; });
+  }
+  if (!user) {
+    let sessionUID = genSessionUID();
+    while (accounts.some(u => u.sessionUID === sessionUID)) sessionUID = genSessionUID();
+    user = {
+      id: 'id_' + Math.random().toString(36).substr(2, 9),
+      sessionUID: sessionUID,
+      name: name,
+      avatar: '',
+      contacts: [],
+      blockedContacts: [],
+      hiddenDialogs: [],
+      updatedAt: Date.now()
+    };
+    accounts.push(user);
+    writeAccounts(accounts);
+  } else {
+    user.name = name;
+    user.updatedAt = Date.now();
+    writeAccounts(accounts);
+  }
+
+  const safeUser = Object.assign({}, user);
+  delete safeUser.passwordHash;
+  res.json({ success: true, user: safeUser });
+});
+
+/* ==================== АККАУНТЫ (LEGACY, не используется новым клиентом) ==================== */
+/* Эти роуты оставлены для совместимости со старыми клиентами и данными. */
 app.post('/api/register', function (req, res) {
   let { name, password, avatar } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите имя' });
-  if (!password || password.length < 6) return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
+  if (password && password.length < 6) return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
 
   const accounts = readAccounts();
   let sessionUID = genSessionUID();
@@ -105,7 +150,7 @@ app.post('/api/register', function (req, res) {
   const user = {
     id: 'id_' + Math.random().toString(36).substr(2, 9),
     sessionUID: sessionUID,
-    passwordHash: hashPassword(password),
+    passwordHash: hashPassword(password || ''),
     name: name.trim(),
     avatar: avatar || '',
     contacts: [],
@@ -125,12 +170,11 @@ app.post('/api/login', function (req, res) {
   const sessionUID = (req.body.sessionUID || '').toUpperCase().trim();
   const password = req.body.password || '';
   if (!sessionUID || sessionUID.length !== 8) return res.status(400).json({ error: 'Идентификатор сессии должен состоять из 8 символов' });
-  if (!password) return res.status(400).json({ error: 'Введите пароль' });
 
   const accounts = readAccounts();
   const user = accounts.find(u => u.sessionUID === sessionUID);
-  if (!user) return res.status(404).json({ error: 'Аккаунт с таким Идентификатором сессии не найден' });
-  if (user.passwordHash && user.passwordHash !== hashPassword(password)) return res.status(400).json({ error: 'Неверный пароль' });
+  if (!user) return res.status(404).json({ error: 'Аккаунт не найден' });
+  if (user.passwordHash && password && user.passwordHash !== hashPassword(password)) return res.status(400).json({ error: 'Неверный пароль' });
 
   user.updatedAt = Date.now();
   writeAccounts(accounts);
@@ -141,11 +185,10 @@ app.post('/api/login', function (req, res) {
 
 app.post('/api/profile/set-password', function (req, res) {
   const { userId, password } = req.body;
-  if (!password || password.length < 6) return res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
   const accounts = readAccounts();
   const user = accounts.find(u => u.id === userId);
   if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-  user.passwordHash = hashPassword(password);
+  if (password) user.passwordHash = hashPassword(password);
   user.updatedAt = Date.now();
   writeAccounts(accounts);
   const safeUser = Object.assign({}, user);
@@ -429,7 +472,6 @@ app.post('/api/messages/send', function (req, res) {
     fileName: fileName || '',
     fileType: fileType || '',
     fileSize: fileSize || 0,
-    // Шифрованные поля (сервер их не читает)
     encFileData: encFileData || '',
     fileIv: fileIv || '',
     fileKeyEncByUser: fileKeyEncByUser || null,
@@ -558,6 +600,104 @@ app.get('/api/dialogs/:userId', function (req, res) {
   res.json(all);
 });
 
+/* ==================== ЗВОНКИ (SIGNALING) ==================== */
+/* Простая схема: клиент регистрируется для приёма сигналов, поллит /api/calls/poll,
+   отдаёт ICE/offer/answer через /api/calls/signal. */
+const callSignals = new Map(); // targetUserId -> [ {id, from, type, payload, ts} ]
+const activeCalls = new Map();  // callId -> { from, to, status, startedAt }
+
+function ensureSignalQueue(uid) {
+  if (!callSignals.has(uid)) callSignals.set(uid, []);
+  return callSignals.get(uid);
+}
+function pushSignal(targetUid, fromUid, callId, type, payload) {
+  const q = ensureSignalQueue(targetUid);
+  q.push({ id: genId('sig_'), from: fromUid, callId: callId, type: type, payload: payload || null, ts: Date.now() });
+}
+
+/* Начать звонок. Возвращает callId. */
+app.post('/api/calls/start', function (req, res) {
+  const { fromId, toId, video } = req.body;
+  if (!fromId || !toId) return res.status(400).json({ error: 'No ids' });
+  if (fromId === toId) return res.status(400).json({ error: 'Нельзя звонить себе' });
+  const accounts = readAccounts();
+  const from = accounts.find(u => u.id === fromId);
+  const to = accounts.find(u => u.id === toId);
+  if (!from) return res.status(404).json({ error: 'Отправитель не найден' });
+  if (!to) return res.status(404).json({ error: 'Получатель не найден' });
+  if (to.blockedContacts && to.blockedContacts.indexOf(fromId) !== -1) {
+    return res.status(403).json({ error: 'Пользователь заблокировал вас' });
+  }
+  const callId = genId('call_');
+  activeCalls.set(callId, {
+    id: callId, fromId: fromId, toId: toId,
+    fromName: from.name, fromAvatar: from.avatar || '',
+    toName: to.name, video: !!video,
+    status: 'ringing', startedAt: Date.now(), answeredAt: 0
+  });
+  pushSignal(toId, fromId, callId, 'offer-start', { fromName: from.name, fromAvatar: from.avatar || '', video: !!video });
+  res.json({ success: true, callId: callId });
+});
+
+/* Ответ на звонок (принять/отклонить) */
+app.post('/api/calls/answer', function (req, res) {
+  const { callId, userId, accept } = req.body;
+  const call = activeCalls.get(callId);
+  if (!call) return res.status(404).json({ error: 'Звонок не найден' });
+  if (call.toId !== userId) return res.status(403).json({ error: 'Не тот пользователь' });
+  if (accept) {
+    call.status = 'active';
+    call.answeredAt = Date.now();
+    pushSignal(call.fromId, call.toId, callId, 'accepted', {});
+  } else {
+    call.status = 'rejected';
+    pushSignal(call.fromId, call.toId, callId, 'rejected', {});
+    activeCalls.delete(callId);
+  }
+  res.json({ success: true });
+});
+
+/* Завершение звонка */
+app.post('/api/calls/end', function (req, res) {
+  const { callId, userId } = req.body;
+  const call = activeCalls.get(callId);
+  if (call) {
+    const peer = userId === call.fromId ? call.toId : call.fromId;
+    call.status = 'ended';
+    pushSignal(peer, userId, callId, 'ended', { by: userId });
+    activeCalls.delete(callId);
+  }
+  res.json({ success: true });
+});
+
+/* Отправка WebRTC-сигнала (offer/answer/ice) */
+app.post('/api/calls/signal', function (req, res) {
+  const { callId, fromId, toId, type, payload } = req.body;
+  if (!callId || !fromId || !toId || !type) return res.status(400).json({ error: 'Bad' });
+  const call = activeCalls.get(callId);
+  if (!call) return res.status(404).json({ error: 'Звонок не найден' });
+  pushSignal(toId, fromId, callId, type, payload);
+  res.json({ success: true });
+});
+
+/* Поллинг сигналов */
+app.get('/api/calls/poll', function (req, res) {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ error: 'No user' });
+  const q = ensureSignalQueue(userId);
+  const now = Date.now();
+  const fresh = q.filter(s => now - s.ts < 120000);
+  callSignals.set(userId, []);
+  res.json({ success: true, signals: fresh });
+});
+
+/* Состояние звонка (для восстановления) */
+app.get('/api/calls/state/:callId', function (req, res) {
+  const call = activeCalls.get(req.params.callId);
+  if (!call) return res.json({ exists: false });
+  res.json({ exists: true, call: call });
+});
+
 /* ==================== ФАЙЛЫ ==================== */
 app.post('/api/upload/init', function (req, res) {
   const { senderId, fileName, fileSize, fileType } = req.body;
@@ -652,9 +792,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .screen.active { display: flex; }
   .auth-container { margin: auto; width: 90%; max-width: 360px; background: var(--bg-sidebar); padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); text-align: center; }
   .auth-container h2 { margin-bottom: 15px; color: var(--accent); }
-  .auth-tabs { display: flex; gap: 10px; margin-bottom: 15px; }
-  .auth-tab { flex: 1; padding: 8px; font-size: 13px; font-weight: bold; background: var(--bg-input); border: none; color: var(--text-muted); border-radius: 6px; cursor: pointer; }
-  .auth-tab.active { background: var(--accent); color: #fff; }
+  .auth-container p { font-size: 13px; color: var(--text-muted); margin-bottom: 15px; }
   .input-group { margin-bottom: 12px; text-align: left; }
   .input-group input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--bg-input); background: var(--bg-input); color: var(--text-main); outline: none; }
   .btn { width: 100%; padding: 12px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top: 10px; transition: opacity 0.15s; }
@@ -662,7 +800,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
   .btn-danger { background: #e53935; color: #fff; }
   .error-msg { color: #e53935; font-size: 12px; margin-bottom: 10px; display: none; }
-  .warning-box { background: rgba(229, 57, 53, 0.15); border: 1px solid #e53935; color: #e53935; padding: 10px; border-radius: 8px; font-size: 12px; margin-bottom: 12px; text-align: center; }
   #status-bar { position: fixed; top: 0; left: 0; right: 0; padding: 8px; text-align: center; font-size: 13px; font-weight: 600; z-index: 9999; transition: transform 0.3s; transform: translateY(-100%); }
   #status-bar.visible { transform: translateY(0); }
   #status-bar.internet-off { background: #e53935; color: #fff; }
@@ -696,8 +833,10 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .main-chat { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); position: relative; min-width: 0; }
   .chat-header { background: var(--bg-sidebar); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); height: 60px; }
   .chat-header-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; overflow: hidden; }
-  .chat-menu-container { position: relative; }
+  .chat-menu-container { position: relative; display: flex; gap: 4px; align-items: center; }
   .menu-dots-btn { background: transparent; border: none; color: var(--text-main); font-size: 20px; cursor: pointer; padding: 8px; border-radius: 50%; display: none; }
+  .call-btn { background: transparent; border: none; color: var(--text-main); font-size: 22px; cursor: pointer; padding: 8px; border-radius: 50%; }
+  .call-btn:hover { background: var(--bg-hover); }
   .chat-dropdown-menu { position: absolute; right: 0; top: 45px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 220px; display: none; flex-direction: column; z-index: 1000; overflow: hidden; }
   .chat-dropdown-menu.active { display: flex; }
   .menu-item { padding: 12px 16px; font-size: 14px; cursor: pointer; border-bottom: 1px solid var(--border); text-align: left; background: none; border-top: none; border-left: none; border-right: none; color: var(--text-main); width: 100%; }
@@ -707,13 +846,11 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; background: var(--bg-msg-peer); align-self: flex-start; word-break: break-word; user-select: none; }
   .msg.my { background: var(--bg-msg-my); align-self: flex-end; }
   .msg.pending { opacity: 0.6; }
+  .msg.waiting { opacity: 0.7; border: 1px dashed var(--accent); }
   .msg.selected-msg { background: var(--msg-selected) !important; outline: 2px solid var(--accent); }
   .msg-sender { font-size: 12px; font-weight: bold; color: var(--accent); margin-bottom: 2px; }
-
-  /* ==== ВИДЕО ==== */
   .vid-wrapper { position: relative; width: 280px; max-width: 100%; border-radius: 10px; overflow: hidden; margin-top: 6px; background: #000; }
   .vid-wrapper video { width: 100%; height: auto; display: block; max-height: 320px; }
-
   .media-preview { width: 280px; height: 180px; max-width: 100%; border-radius: 8px; margin-top: 6px; object-fit: cover; display: block; background: #000; cursor: pointer; }
   .file-link { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg-input); border-radius: 6px; color: var(--accent); text-decoration: none; margin-top: 5px; font-size: 13px; }
   .file-placeholder { padding: 8px 12px; background: var(--bg-input); border-radius: 6px; margin-top: 5px; font-size: 12px; color: var(--text-muted); }
@@ -762,17 +899,38 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .member-dropdown { position: absolute; right: 8px; top: 90%; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 180px; z-index: 1500; display: none; }
   .member-dropdown.active { display: block; }
   .member-dropdown .menu-item { padding: 10px 14px; font-size: 13px; }
-
-  #video-viewer-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.95); z-index: 3050; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: 0.15s; pointer-events: none; }
-  #video-viewer-modal.active { visibility: visible; opacity: 1; pointer-events: auto; }
-  #video-viewer-modal video { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
-
   #image-viewer-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 3000; display: flex; align-items: center; justify-content: center; visibility: hidden; opacity: 0; transition: 0.15s; pointer-events: none; }
   #image-viewer-modal.active { visibility: visible; opacity: 1; pointer-events: auto; }
   #image-viewer-modal img { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
   .viewer-close { position: absolute; top: 20px; right: 20px; color: #fff; font-size: 30px; cursor: pointer; background: none; border: none; z-index: 3100; }
   .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: flex; flex-direction: column; gap: 10px; visibility: hidden; opacity: 0; transform: translateY(20px); transition: 0.15s; pointer-events: none; }
   .msg-actions-sheet.active { visibility: visible; opacity: 1; transform: translateY(0); pointer-events: auto; }
+
+  /* === ЗВОНКИ === */
+  .call-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.92); z-index: 5000; display: none; flex-direction: column; align-items: center; justify-content: center; color: #fff; }
+  .call-overlay.active { display: flex; }
+  .call-topbar { position: absolute; top: 0; left: 0; right: 0; padding: 16px; display: flex; justify-content: space-between; align-items: center; z-index: 10; }
+  .call-close-x { background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 22px; width: 40px; height: 40px; border-radius: 50%; cursor: pointer; }
+  .call-title { font-size: 18px; font-weight: bold; }
+  .call-subtitle { font-size: 13px; opacity: 0.7; margin-top: 4px; }
+  .call-videos { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+  .call-remote-video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .call-local-video { position: absolute; top: 70px; right: 16px; width: 110px; height: 160px; object-fit: cover; border-radius: 12px; background: #111; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+  .call-audio-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; }
+  .call-big-avatar { width: 120px; height: 120px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 48px; font-weight: bold; color: #fff; overflow: hidden; }
+  .call-big-avatar img { width: 100%; height: 100%; object-fit: cover; }
+  .call-name { font-size: 24px; font-weight: bold; }
+  .call-status-text { font-size: 14px; opacity: 0.7; }
+  .call-controls { position: absolute; bottom: 30px; left: 0; right: 0; display: flex; justify-content: center; gap: 16px; padding: 0 16px; flex-wrap: wrap; }
+  .call-ctrl-btn { width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 24px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.15s; }
+  .call-ctrl-btn.off { background: rgba(255,255,255,0.4); }
+  .call-ctrl-btn.danger { background: #e53935; }
+  .call-ctrl-btn.active { background: var(--accent); }
+  .call-incoming-actions { display: flex; gap: 30px; margin-top: 30px; }
+  .call-incoming-btn { width: 70px; height: 70px; border-radius: 50%; border: none; color: #fff; font-size: 28px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+  .call-incoming-btn.accept { background: #4cd964; }
+  .call-incoming-btn.reject { background: #e53935; }
+
   @media (min-width: 601px) { .menu-dots-btn { display: flex !important; } }
   @media (max-width: 600px) {
     .sidebar { width: 100%; display: flex; }
@@ -792,34 +950,16 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <div class="loading-text" id="loading-text">Подключаемся к серверу</div>
   </div>
 
+  <!-- ВХОД: только имя -->
   <div id="auth-screen" class="screen active">
     <div class="auth-container">
       <h2>Мессенджер</h2>
-      <div class="auth-tabs">
-        <button class="auth-tab active" id="tab-reg" onclick="switchAuthTab('reg')">Регистрация</button>
-        <button class="auth-tab" id="tab-login" onclick="switchAuthTab('login')">Вход по Session UID</button>
-      </div>
+      <p>Введите ваше имя, чтобы войти</p>
       <div id="auth-error" class="error-msg"></div>
-
-      <div id="form-reg">
-        <div class="input-group">
-          <input type="text" id="auth-name" placeholder="Ваше имя...">
-        </div>
-        <div class="input-group">
-          <input type="password" id="auth-password" placeholder="Пароль (мин. 6 символов)...">
-        </div>
-        <button class="btn" id="register-btn" onclick="registerUser()">Создать аккаунт</button>
+      <div class="input-group">
+        <input type="text" id="auth-name" placeholder="Ваше имя..." maxlength="60" onkeydown="if(event.key==='Enter') enterByName()">
       </div>
-
-      <div id="form-login" style="display:none;">
-        <div class="input-group">
-          <input type="text" id="login-uid-input" maxlength="8" style="text-transform:uppercase; text-align:center; font-family:monospace; letter-spacing:2px; font-size:16px;" placeholder="Session UID (8 символов)">
-        </div>
-        <div class="input-group">
-          <input type="password" id="login-pwd-input" placeholder="Пароль..." onkeydown="if(event.key==='Enter') loginUser()">
-        </div>
-        <button class="btn" id="login-btn" onclick="loginUser()">Войти</button>
-      </div>
+      <button class="btn" id="enter-btn" onclick="enterByName()">Войти</button>
     </div>
   </div>
 
@@ -860,6 +1000,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             </div>
           </div>
           <div class="chat-menu-container">
+            <button class="call-btn" id="call-btn" onclick="startCall()" title="Позвонить" style="display:none;">📞</button>
             <button class="menu-dots-btn" id="chat-menu-dots-btn" onclick="toggleChatDropdown()">⋮</button>
             <div class="chat-dropdown-menu" id="chat-dropdown-menu"></div>
           </div>
@@ -908,30 +1049,15 @@ const CLIENT_HTML = `<!DOCTYPE html>
       </div>
       <div class="profile-name" id="my-profile-name-view">Имя</div>
       <div class="profile-id" id="my-profile-id-view">ID</div>
-
-      <div class="session-uid-box" onclick="toggleSessionUIDVisibility()">
-        Session UID (нажмите для показа):<br>
-        <b id="my-session-uid-view">########</b>
-      </div>
-
-      <div id="password-warning-box" class="warning-box" style="display:none;">
-        ⚠️ Создайте пароль для возможности входа в аккаунт с других устройств
-      </div>
-
       <div class="input-group" style="width:100%;">
         <input type="text" id="edit-my-name-input" placeholder="Ваше имя...">
       </div>
-
-      <div class="input-group" style="width:100%;">
-        <input type="password" id="set-my-pwd-input" placeholder="Новый пароль (мин. 6 симв.)...">
-      </div>
-
       <div class="profile-actions" style="align-items: center;">
         <button class="profile-link-btn" onclick="triggerAvatarInput()">Загрузить фото</button>
         <input type="file" id="avatar-file-input" style="display:none;" accept="image/*" onchange="handleAvatarSelect(event)">
         <button class="profile-link-btn" id="remove-avatar-link-btn" style="color:#e53935; display:none;" onclick="removeMyAvatar()">Удалить фото</button>
-        <button class="btn" id="save-my-profile-btn" onclick="saveMyProfileChanges()">Сохранить настройки</button>
-        <button class="btn btn-danger" onclick="logoutUser()">Выйти из аккаунта</button>
+        <button class="btn" id="save-my-profile-btn" onclick="saveMyProfileChanges()">Сохранить</button>
+        <button class="btn btn-danger" onclick="logoutUser()">Выйти</button>
         <button class="btn btn-secondary" onclick="closeMyProfile()">Закрыть</button>
       </div>
     </div>
@@ -1005,11 +1131,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div id="video-viewer-modal" onclick="closeVideoViewer()">
-    <button class="viewer-close">✕</button>
-    <video id="full-screen-video" controls autoplay></video>
-  </div>
-
   <div id="image-viewer-modal" onclick="closeImageViewer()">
     <button class="viewer-close">✕</button>
     <img id="full-screen-img" src="">
@@ -1022,13 +1143,56 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
 
+  <!-- ЗВОНОК: ИСХОДЯЩИЙ / АКТИВНЫЙ -->
+  <div class="call-overlay" id="call-overlay">
+    <div class="call-topbar">
+      <div>
+        <div class="call-title" id="call-title">Звонок</div>
+        <div class="call-subtitle" id="call-subtitle"></div>
+      </div>
+      <button class="call-close-x" id="call-close-btn" onclick="minimizeCallOverlay()" title="Свернуть">✕</button>
+    </div>
+    <div class="call-videos" id="call-videos">
+      <div class="call-audio-screen" id="call-audio-screen">
+        <div class="call-big-avatar" id="call-peer-avatar">?</div>
+        <div class="call-name" id="call-peer-name">Собеседник</div>
+        <div class="call-status-text" id="call-status-text">Соединение…</div>
+      </div>
+      <video class="call-remote-video" id="call-remote-video" autoplay playsinline style="display:none;"></video>
+      <video class="call-local-video" id="call-local-video" autoplay playsinline muted style="display:none;"></video>
+    </div>
+    <div class="call-controls" id="call-controls">
+      <button class="call-ctrl-btn" id="ctrl-mic" onclick="toggleCallMic()" title="Микрофон">🎤</button>
+      <button class="call-ctrl-btn" id="ctrl-cam" onclick="toggleCallCam()" title="Камера">📷</button>
+      <button class="call-ctrl-btn" id="ctrl-flip" onclick="flipCallCamera()" title="Сменить камеру">🔄</button>
+      <button class="call-ctrl-btn danger" id="ctrl-end" onclick="endCurrentCall()" title="Завершить">📵</button>
+    </div>
+  </div>
+
+  <!-- ЗВОНОК: ВХОДЯЩИЙ (полный экран, крестик сверху) -->
+  <div class="call-overlay" id="incoming-call-overlay">
+    <div class="call-topbar">
+      <div></div>
+      <button class="call-close-x" onclick="rejectIncomingCall()" title="Отклонить">✕</button>
+    </div>
+    <div class="call-audio-screen">
+      <div class="call-big-avatar" id="incoming-avatar">?</div>
+      <div class="call-name" id="incoming-name">Собеседник</div>
+      <div class="call-status-text" id="incoming-status-text">Входящий звонок…</div>
+      <div class="call-incoming-actions">
+        <button class="call-incoming-btn reject" onclick="rejectIncomingCall()">✕</button>
+        <button class="call-incoming-btn accept" onclick="acceptIncomingCall()">📞</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/client.js"></script>
 </body>
 </html>`;
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '3.6.0';
+var CLIENT_VERSION = '3.7.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -1053,7 +1217,6 @@ var savedTheme = localStorage.getItem('app_theme') || 'dark';
 document.documentElement.setAttribute('data-theme', savedTheme);
 var busyButtons = {};
 var dialogsPollingTimer = null;
-var draftAvatar = null;
 var activeMemberDropdown = null;
 var profileTargetId = null;
 var connectionState = 'checking';
@@ -1067,18 +1230,9 @@ var isRetrying = false;
 var filesDB = null;
 var fileUrlCache = new Map();
 var deletedIds = {};
-var isUidVisible = false;
 var hasUserPassword = true;
 
-/* ==================== КЛИЕНТСКОЕ ШИФРОВАНИЕ ==================== */
-/* Схема:
-   - clientSalt — 32 случайных байта, только в localStorage клиента.
-   - userKey(userId) = HKDF(clientSalt, "msg-user-key-v1:" + userId)
-   - Каждый файл/текст шифруется своим одноразовым fileKey (AES-GCM 256).
-   - fileKey заворачивается под каждого получателя: wrap(fileKey, userKey(receiverId)).
-   - Сервер видит только зашифрованные данные и обёртки.
-*/
-
+/* ==================== КЛИЕНТСКОЕ ШИФРОВАНИЕ (без изменений) ==================== */
 function bufToBase64(buf) {
   var bytes = new Uint8Array(buf);
   var binary = '';
@@ -1109,9 +1263,7 @@ loadClientSalt();
 var userKeyCache = {};
 async function getUserKey(userId) {
   if (userKeyCache[userId]) return userKeyCache[userId];
-  var baseKey = await crypto.subtle.importKey(
-    'raw', base64ToBuf(clientSalt), { name: 'HKDF' }, false, ['deriveKey']
-  );
+  var baseKey = await crypto.subtle.importKey('raw', base64ToBuf(clientSalt), { name: 'HKDF' }, false, ['deriveKey']);
   var key = await crypto.subtle.deriveKey(
     { name: 'HKDF', hash: 'SHA-256', salt: strToU8('msg-user-key-v1:' + userId), info: strToU8('aes-gcm-256') },
     baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
@@ -1119,7 +1271,6 @@ async function getUserKey(userId) {
   userKeyCache[userId] = key;
   return key;
 }
-
 async function aesEncrypt(key, dataU8) {
   var iv = crypto.getRandomValues(new Uint8Array(12));
   var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, dataU8);
@@ -1131,26 +1282,16 @@ async function aesDecrypt(key, ivB64, dataB64) {
   var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, data);
   return new Uint8Array(dec);
 }
-
-async function generateFileKey() {
-  return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
-}
+async function generateFileKey() { return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']); }
 async function exportFileKeyB64(k) { return bufToBase64(await crypto.subtle.exportKey('raw', k)); }
-async function importFileKeyB64(b64) {
-  return crypto.subtle.importKey('raw', base64ToBuf(b64), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-}
+async function importFileKeyB64(b64) { return crypto.subtle.importKey('raw', base64ToBuf(b64), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']); }
 
 async function encryptBlob(blob) {
   var fileKey = await generateFileKey();
   var buf = await blob.arrayBuffer();
   var iv = crypto.getRandomValues(new Uint8Array(12));
   var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
-  return {
-    blob: new Blob([enc], { type: 'application/octet-stream' }),
-    ivB64: bufToBase64(iv),
-    keyB64: await exportFileKeyB64(fileKey),
-    originalSize: blob.size
-  };
+  return { blob: new Blob([enc], { type: 'application/octet-stream' }), ivB64: bufToBase64(iv), keyB64: await exportFileKeyB64(fileKey), originalSize: blob.size };
 }
 async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
   var fileKey = await importFileKeyB64(keyB64);
@@ -1159,7 +1300,6 @@ async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
   var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
   return new Blob([dec], { type: originalType || 'application/octet-stream' });
 }
-
 async function wrapFileKeyForUser(fileKeyB64, userId) {
   var uKey = await getUserKey(userId);
   var enc = await aesEncrypt(uKey, strToU8(fileKeyB64));
@@ -1173,34 +1313,21 @@ async function unwrapFileKeyForMe(wrapped, myId) {
   var dec = await aesDecrypt(uKey, parts[0], parts[1]);
   return u8ToStr(dec);
 }
-
-/* Chat secret (не обязателен для новой схемы, но оставим для спец-сообщений) */
 var chatSecrets = {};
-function loadChatSecrets() {
-  try { chatSecrets = JSON.parse(localStorage.getItem('messenger_chat_secrets') || '{}'); } catch (e) { chatSecrets = {}; }
-}
-function saveChatSecrets() {
-  try { localStorage.setItem('messenger_chat_secrets', JSON.stringify(chatSecrets)); } catch (e) {}
-}
+function loadChatSecrets() { try { chatSecrets = JSON.parse(localStorage.getItem('messenger_chat_secrets') || '{}'); } catch (e) { chatSecrets = {}; } }
+function saveChatSecrets() { try { localStorage.setItem('messenger_chat_secrets', JSON.stringify(chatSecrets)); } catch (e) {} }
 loadChatSecrets();
 
 function blobToBase64(blob) {
   return new Promise(function (res, rej) {
     var r = new FileReader();
-    r.onload = function () {
-      var s = r.result;
-      var idx = s.indexOf(',');
-      res(idx >= 0 ? s.substring(idx + 1) : s);
-    };
-    r.onerror = rej;
-    r.readAsDataURL(blob);
+    r.onload = function () { var s = r.result; var idx = s.indexOf(','); res(idx >= 0 ? s.substring(idx + 1) : s); };
+    r.onerror = rej; r.readAsDataURL(blob);
   });
 }
 function fileToDataUrl(file) {
   return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = rej; r.readAsDataURL(file); });
 }
-
-/* Возвращает список получателей для текущего чата (включая себя) */
 function getRecipients() {
   if (!activePeer) return [];
   if (activePeer.type === 'group') {
@@ -1210,8 +1337,6 @@ function getRecipients() {
   }
   return [activePeer.id, currentUser.id];
 }
-
-/* Обёртка fileKey под каждого получателя */
 async function wrapKeyForRecipients(fileKeyB64) {
   var recipients = getRecipients();
   var map = {};
@@ -1220,27 +1345,15 @@ async function wrapKeyForRecipients(fileKeyB64) {
   }
   return map;
 }
-
-/* Универсальная отправка с шифрованием текста + файла */
 async function buildEncryptedPayload(opts) {
-  var recipients = getRecipients();
   var payload = {
-    clientId: opts.clientId,
-    text: '',
-    fileData: '',
-    encFileData: opts.encFileData || '',
-    fileIv: opts.fileIv || '',
-    fileKeyEncByUser: opts.fileKeyEncByUser || null,
-    textKeyEncByUser: null,
-    fileName: opts.fileName || '',
-    fileType: opts.fileType || '',
-    fileUrl: opts.fileUrl || '',
-    fileSize: opts.fileSize || 0,
-    thumbUrl: opts.thumbUrl || '',
-    encryptionVersion: 2
+    clientId: opts.clientId, text: '', fileData: '',
+    encFileData: opts.encFileData || '', fileIv: opts.fileIv || '',
+    fileKeyEncByUser: opts.fileKeyEncByUser || null, textKeyEncByUser: null,
+    fileName: opts.fileName || '', fileType: opts.fileType || '',
+    fileUrl: opts.fileUrl || '', fileSize: opts.fileSize || 0,
+    thumbUrl: opts.thumbUrl || '', encryptionVersion: 2
   };
-
-  // Текст
   if (opts.plainText) {
     var textKey = await generateFileKey();
     var keyB64 = await exportFileKeyB64(textKey);
@@ -1303,7 +1416,7 @@ function updateLoadingScreen() {
   if (!ls) return;
   if (currentUser) { ls.classList.remove('active'); return; }
   if (connectionState === 'online') { ls.classList.remove('active'); }
-  else if (connectionState === 'no-internet') { ls.classList.add('active'); title.innerText = 'Нет подключения к интернету'; text.innerText = 'Проверьте соединение'; }
+  else if (connectionState === 'no-internet') { ls.classList.add('active'); title.innerText = 'Нет подключения'; text.innerText = 'Проверьте соединение'; }
   else if (connectionState === 'server-offline') { ls.classList.add('active'); title.innerText = 'Соединение...'; text.innerText = 'Подключаемся к серверу'; }
   else { ls.classList.add('active'); title.innerText = 'Подключение'; text.innerText = 'Проверяем соединение'; }
 }
@@ -1339,7 +1452,7 @@ function updateVersionInfo() {
 window.addEventListener('online', async function () {
   healthFailCount = 0; pingFailCount = 0;
   var ok = await checkServerHealth();
-  if (ok && currentUser) { loadDialogs(); if (activePeer) loadMessages(); retryPendingMessages(); }
+  if (ok && currentUser) { loadDialogs(); if (activePeer) loadMessages(); retryPendingMessages(); startCallPolling(); }
 });
 window.addEventListener('offline', function () { setConnectionState('no-internet'); });
 
@@ -1354,9 +1467,7 @@ function formatBytes(bytes) {
   if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' МБ';
   return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' ГБ';
 }
-function saveCache() {
-  try { localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache)); } catch (e) {}
-}
+function saveCache() { try { localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache)); } catch (e) {} }
 function mergeMessage(msg) {
   if (!msg || !msg.id) return;
   if (deletedIds[msg.id]) return;
@@ -1378,8 +1489,7 @@ function mergeMessage(msg) {
 }
 function quickHash(str) {
   if (!str) return '0';
-  var len = str.length;
-  var h = 0;
+  var len = str.length; var h = 0;
   var sample = str.substring(0, 64) + '|' + str.substring(Math.max(0, len - 64)) + '|' + len;
   for (var i = 0; i < sample.length; i++) h = ((h << 5) - h + sample.charCodeAt(i)) | 0;
   return len + '_' + (h >>> 0).toString(36);
@@ -1387,8 +1497,7 @@ function quickHash(str) {
 function playNotificationSound() {
   try {
     var ctx = new (window.AudioContext || window.webkitAudioContext)();
-    var osc = ctx.createOscillator();
-    var g = ctx.createGain();
+    var osc = ctx.createOscillator(); var g = ctx.createGain();
     osc.type = 'sine';
     osc.frequency.setValueAtTime(587, ctx.currentTime);
     osc.frequency.setValueAtTime(880, ctx.currentTime + 0.08);
@@ -1398,10 +1507,7 @@ function playNotificationSound() {
     osc.start(); osc.stop(ctx.currentTime + 0.3);
   } catch (e) {}
 }
-function updateThemeIcon(theme) {
-  var btn = document.getElementById('theme-toggle-btn');
-  if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️';
-}
+function updateThemeIcon(theme) { var btn = document.getElementById('theme-toggle-btn'); if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️'; }
 function toggleTheme() {
   var current = document.documentElement.getAttribute('data-theme');
   var next = current === 'dark' ? 'light' : 'dark';
@@ -1482,8 +1588,6 @@ async function deleteFileFromIDB(key) {
 async function blobFromDataUrl(dataUrl) {
   try { var res = await fetch(dataUrl); return await res.blob(); } catch (e) { return null; }
 }
-
-/* Получение URL для вложения (с расшифровкой) */
 async function getFileUrl(msg) {
   if (!msg) return null;
   if (deletedIds[msg.id]) return null;
@@ -1499,16 +1603,10 @@ async function getFileUrl(msg) {
     } else if (msg.fileData && msg.fileData.indexOf('data:') === 0) {
       try { encBlob = await blobFromDataUrl(msg.fileData); } catch (e) {}
     } else if (msg.fileUrl) {
-      try {
-        var res = await fetch(msg.fileUrl);
-        if (res.ok) encBlob = await res.blob();
-      } catch (e) {}
+      try { var res = await fetch(msg.fileUrl); if (res.ok) encBlob = await res.blob(); } catch (e) {}
     }
-    if (encBlob) {
-      try { await saveFileToIDB(msg.id, encBlob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: encBlob.size }); } catch (e) {}
-    }
+    if (encBlob) { try { await saveFileToIDB(msg.id, encBlob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: encBlob.size }); } catch (e) {} }
   }
-
   if (!encBlob) return null;
 
   if (msg.fileKeyEncByUser && msg.fileIv) {
@@ -1521,9 +1619,8 @@ async function getFileUrl(msg) {
       var url = URL.createObjectURL(dec);
       fileUrlCache.set(msg.id, url);
       return url;
-    } catch (e) { console.warn('Decrypt failed:', e); return null; }
+    } catch (e) { return null; }
   }
-
   var url2 = URL.createObjectURL(encBlob);
   fileUrlCache.set(msg.id, url2);
   return url2;
@@ -1605,37 +1702,19 @@ function updateMyProfileUI() {
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
-/* ==================== ВХОД ==================== */
-function switchAuthTab(type) {
-  var errBox = document.getElementById('auth-error');
-  errBox.style.display = 'none';
-  if (type === 'reg') {
-    document.getElementById('tab-reg').classList.add('active');
-    document.getElementById('tab-login').classList.remove('active');
-    document.getElementById('form-reg').style.display = 'block';
-    document.getElementById('form-login').style.display = 'none';
-  } else {
-    document.getElementById('tab-login').classList.add('active');
-    document.getElementById('tab-reg').classList.remove('active');
-    document.getElementById('form-login').style.display = 'block';
-    document.getElementById('form-reg').style.display = 'none';
-  }
-}
-
-async function registerUser() {
-  if (busyButtons['register-btn']) return;
+/* ==================== ВХОД ПО ИМЕНИ ==================== */
+async function enterByName() {
+  if (busyButtons['enter-btn']) return;
   var name = document.getElementById('auth-name').value.trim();
-  var password = document.getElementById('auth-password').value;
   var errBox = document.getElementById('auth-error');
-
   if (!name) { errBox.innerText = 'Введите имя'; errBox.style.display = 'block'; return; }
-  if (!password || password.length < 6) { errBox.innerText = 'Пароль должен быть минимум 6 символов'; errBox.style.display = 'block'; return; }
-
-  if (!lockButton('register-btn', 3000)) return;
+  if (!lockButton('enter-btn', 3000)) return;
   try {
-    var res = await fetch('/api/register', {
+    var prev = null;
+    try { prev = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) {}
+    var res = await fetch('/api/enter', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, password: password })
+      body: JSON.stringify({ name: name, clientId: prev ? prev.id : '' })
     });
     var data = await res.json();
     if (!data.success) { errBox.innerText = data.error || 'Ошибка'; errBox.style.display = 'block'; return; }
@@ -1643,39 +1722,12 @@ async function registerUser() {
     try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
     startApp();
   } catch (e) {
-    errBox.innerText = 'Сервер недоступен';
-    errBox.style.display = 'block';
-  }
-}
-
-async function loginUser() {
-  if (busyButtons['login-btn']) return;
-  var sessionUID = document.getElementById('login-uid-input').value.toUpperCase().trim();
-  var password = document.getElementById('login-pwd-input').value;
-  var errBox = document.getElementById('auth-error');
-
-  if (!sessionUID || sessionUID.length !== 8) { errBox.innerText = 'Session UID должен быть из 8 символов'; errBox.style.display = 'block'; return; }
-  if (!password) { errBox.innerText = 'Введите пароль'; errBox.style.display = 'block'; return; }
-
-  if (!lockButton('login-btn', 3000)) return;
-  try {
-    var res = await fetch('/api/login', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionUID: sessionUID, password: password })
-    });
-    var data = await res.json();
-    if (!data.success) { errBox.innerText = data.error || 'Ошибка входа'; errBox.style.display = 'block'; return; }
-    currentUser = data.user;
-    try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
-    startApp();
-  } catch (e) {
-    errBox.innerText = 'Ошибка соединения';
-    errBox.style.display = 'block';
+    errBox.innerText = 'Сервер недоступен'; errBox.style.display = 'block';
   }
 }
 
 function logoutUser() {
-  if (!confirm('Вы уверены, что хотите выйти из аккаунта?')) return;
+  if (!confirm('Выйти из аккаунта? (данные сообщений останутся)')) return;
   currentUser = null;
   localStorage.removeItem('messenger_user');
   location.reload();
@@ -1687,6 +1739,7 @@ function startApp() {
   updateMyProfileUI();
   sendPing();
   loadDialogs();
+  startCallPolling();
   if (dialogsPollingTimer) clearInterval(dialogsPollingTimer);
   dialogsPollingTimer = setInterval(function () {
     if (currentUser && !isRecording) {
@@ -1762,11 +1815,11 @@ async function refreshActivePeerStatus() {
   } catch (e) {}
 }
 
-/* ==================== ОТЛОЖЕННАЯ ОТПРАВКА ==================== */
+/* ==================== ОТЛОЖЕННАЯ ОТПРАВКА (с «ожиданием соединения») ==================== */
 async function retryPendingMessages() {
   if (!currentUser) return;
   if (isRetrying) return;
-  var pending = localMessagesCache.filter(function (m) { return m.isPending && m.senderId === currentUser.id && m.clientId; });
+  var pending = localMessagesCache.filter(function (m) { return (m.isPending || m.isWaiting) && m.senderId === currentUser.id && m.clientId; });
   if (pending.length === 0) return;
   isRetrying = true;
   var anySuccess = false;
@@ -1797,7 +1850,7 @@ async function retryPendingMessages() {
         if (data && data.message) {
           var rm = Object.assign({}, data.message);
           rm.isPending = false;
-          // Локально сохраняем открытый текст
+          rm.isWaiting = false;
           rm.text = pm.text || '';
           try {
             var entry = await getFileFromIDB(pm.clientId);
@@ -1824,65 +1877,38 @@ async function retryPendingMessages() {
 }
 
 /* ==================== ПРОФИЛЬ ==================== */
-function toggleSessionUIDVisibility() {
-  isUidVisible = !isUidVisible;
-  var el = document.getElementById('my-session-uid-view');
-  if (isUidVisible && currentUser) el.innerText = currentUser.sessionUID || '--------';
-  else el.innerText = '########';
-}
 function openMyProfile() {
   if (isModalOpen('my-profile-modal')) return;
-  draftAvatar = null;
-  isUidVisible = false;
-  document.getElementById('my-session-uid-view').innerText = '########';
   document.getElementById('edit-my-name-input').value = currentUser.name;
-  document.getElementById('set-my-pwd-input').value = '';
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
   document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
-  document.getElementById('password-warning-box').style.display = hasUserPassword ? 'none' : 'block';
   safeOpenModal('my-profile-modal');
 }
-function closeMyProfile() { draftAvatar = null; safeCloseModal('my-profile-modal'); }
+function closeMyProfile() { safeCloseModal('my-profile-modal'); }
 function triggerAvatarInput() { var i = document.getElementById('avatar-file-input'); i.value = ''; i.click(); }
 function handleAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
   if (file.size > 10 * 1024 * 1024) { alert('Максимум 10 МБ'); return; }
   compressImage(file, 200, 0.85, function (c) {
     if (!c) return;
-    draftAvatar = c;
+    currentUser.avatar = c;
     renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: c, name: currentUser.name }, true);
     document.getElementById('remove-avatar-link-btn').style.display = 'block';
   });
 }
 function removeMyAvatar() {
-  draftAvatar = '';
+  currentUser.avatar = '';
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: '', name: currentUser.name }, true);
   document.getElementById('remove-avatar-link-btn').style.display = 'none';
 }
 async function saveMyProfileChanges() {
   if (!lockButton('save-my-profile-btn', 3000)) return;
   var newName = document.getElementById('edit-my-name-input').value.trim();
-  var newPwd = document.getElementById('set-my-pwd-input').value;
-
-  if (newPwd) {
-    if (newPwd.length < 6) { alert('Пароль должен быть минимум 6 символов'); return; }
-    try {
-      var resP = await fetch('/api/profile/set-password', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: currentUser.id, password: newPwd })
-      });
-      var dP = await resP.json();
-      if (dP.success) hasUserPassword = true;
-    } catch (e) {}
-  }
-
   if (newName) currentUser.name = newName;
-  if (draftAvatar !== null) { currentUser.avatar = draftAvatar; draftAvatar = null; }
   try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
   updateMyProfileUI();
-
   try {
     var res = await fetch('/api/profile/update', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1997,6 +2023,7 @@ async function deleteCurrentChat() {
 function resetActiveChat() {
   cancelVoiceAttachment(); cancelAttachment(); closeMobileChat(); activePeer = null;
   document.getElementById('input-bar').style.display = 'none';
+  document.getElementById('call-btn').style.display = 'none';
   document.getElementById('active-peer-name').innerText = 'Выберите чат';
   document.getElementById('active-peer-status').innerText = 'нажмите для профиля';
   document.getElementById('messages-container').innerHTML = '<div class="empty-state">Выберите диалог</div>';
@@ -2080,10 +2107,11 @@ function openChat(peer) {
   lastMessagesHash = '';
   document.getElementById('active-peer-name').innerText = peer.name;
   var statusEl = document.getElementById('active-peer-status');
-  if (peer.type === 'group') { statusEl.innerText = (peer.memberCount || 0) + ' участников'; statusEl.style.color = 'var(--text-muted)'; }
+  if (peer.type === 'group') { statusEl.innerText = (peer.memberCount || 0) + ' участников'; statusEl.style.color = 'var(--text-muted)'; document.getElementById('call-btn').style.display = 'none'; }
   else {
     if (peer.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
     else { statusEl.innerText = 'не в сети'; statusEl.style.color = 'var(--text-muted)'; }
+    document.getElementById('call-btn').style.display = 'flex';
     if (!currentUser.contacts) currentUser.contacts = [];
     if (currentUser.contacts.indexOf(peer.id) === -1) { currentUser.contacts.push(peer.id); try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {} }
   }
@@ -2100,15 +2128,9 @@ function msgFetchUrl() {
   return activePeer.type === 'group' ? '/api/messages/group/' + activePeer.id + '?userId=' + encodeURIComponent(currentUser.id) : '/api/messages/' + currentUser.id + '/' + activePeer.id;
 }
 
-/* ==================== РАСШИФРОВКА ВХОДЯЩИХ ==================== */
+/* ==================== РАСШИФРОВКА ==================== */
 async function processIncomingMessage(m) {
-  // 1) Спец-сообщение с chat-secret (обратная совместимость, не показываем)
-  if (m.text && m.text.indexOf('__CHAT_SECRET') === 0) {
-    m.isDeleted = true;
-    markDeleted(m.id);
-    return;
-  }
-  // 2) AESV2-текст
+  if (m.text && m.text.indexOf('__CHAT_SECRET') === 0) { m.isDeleted = true; markDeleted(m.id); return; }
   if (m.text && m.text.indexOf('__AESV2__:') === 0) {
     var rest = m.text.substring('__AESV2__:'.length);
     var colon = rest.indexOf(':');
@@ -2173,7 +2195,6 @@ async function loadMessagesQuiet() {
   } catch (e) {}
 }
 
-/* customEncrypt/Decrypt оставим для обратной совместимости старых сообщений */
 function customEncrypt(text) {
   if (!text) return '';
   try {
@@ -2193,19 +2214,6 @@ function customDecrypt(cipher) {
   } catch (e) { return cipher; }
 }
 
-function openVideoViewer(src) {
-  var modal = document.getElementById('video-viewer-modal');
-  var video = document.getElementById('full-screen-video');
-  video.src = src;
-  modal.classList.add('active');
-}
-function closeVideoViewer() {
-  var modal = document.getElementById('video-viewer-modal');
-  var video = document.getElementById('full-screen-video');
-  video.pause();
-  video.src = '';
-  modal.classList.remove('active');
-}
 function openImageViewer(src) { if (document.getElementById('image-viewer-modal').classList.contains('active')) return; document.getElementById('full-screen-img').src = src; document.getElementById('image-viewer-modal').classList.add('active'); }
 function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
 
@@ -2227,7 +2235,8 @@ async function renderMessagesContainer(messages) {
     var m = messages[idx];
     if (deletedIds[m.id] || m.isDeleted) continue;
     var div = document.createElement('div');
-    div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '') + (m.isPending ? ' pending' : '');
+    var pendingCls = m.isPending ? ' pending' : (m.isWaiting ? ' waiting' : '');
+    div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '') + pendingCls;
     div.setAttribute('data-msg-id', m.id);
     div.setAttribute('data-sender-id', m.senderId);
     div.oncontextmenu = (function (msg, el) { return function (e) {
@@ -2256,9 +2265,15 @@ async function renderMessagesContainer(messages) {
     if (m.senderId === currentUser.id) {
       var read = isGroupMsgRead(m);
       var isReadClass = read ? 'ticks read' : 'ticks';
-      var ticksSymbol = m.isPending ? '🕐' : (read ? '✓✓' : '✓');
+      var ticksSymbol = m.isPending ? '🕐' : (m.isWaiting ? '⏳' : (read ? '✓✓' : '✓'));
       ticksHtml = '<span class="' + isReadClass + '">' + ticksSymbol + '</span>';
     }
+    var waitLabel = '';
+    if (m.isWaiting && m.senderId === currentUser.id) {
+      var peerName = isGroup ? 'группы' : getUserName(m.receiverId);
+      waitLabel = '<div style="font-size:10px; color:var(--accent); margin-top:2px;">⏳ Ожидание соединения с ' + escapeHtml(peerName) + '…</div>';
+    }
+    html += waitLabel;
     html += '<div class="msg-footer"><span>' + escapeHtml(m.timestamp || '') + '</span>' + ticksHtml + '</div>';
     div.innerHTML = html;
     container.appendChild(div);
@@ -2271,47 +2286,32 @@ async function renderMessagesContainer(messages) {
 
 async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!placeholder || !placeholder.parentNode) return;
-  if (deletedIds[msg.id] || msg.isDeleted) {
-    if (placeholder.parentNode) placeholder.remove();
-    return;
-  }
+  if (deletedIds[msg.id] || msg.isDeleted) { if (placeholder.parentNode) placeholder.remove(); return; }
   var url = await getFileUrl(msg);
   if (!placeholder.parentNode) return;
   if (!url) { placeholder.outerHTML = '<div class="file-placeholder">⚠️ Файл недоступен</div>'; return; }
   var ft = msg.fileType || '';
   var newEl = null;
-
   if (ft.indexOf('image/') === 0) {
     newEl = document.createElement('img');
-    newEl.className = 'media-preview';
-    newEl.src = url;
+    newEl.className = 'media-preview'; newEl.src = url;
     newEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(url); });
   } else if (ft.indexOf('video/') === 0) {
     var wrapper = document.createElement('div');
     wrapper.className = 'vid-wrapper';
     var video = document.createElement('video');
-    video.src = url;
-    video.controls = true;
-    video.playsInline = true;
-    video.preload = 'metadata';
+    video.src = url; video.controls = true; video.playsInline = true; video.preload = 'metadata';
     if (msg.thumbUrl) video.poster = msg.thumbUrl;
-    wrapper.appendChild(video);
-    newEl = wrapper;
+    wrapper.appendChild(video); newEl = wrapper;
   } else if (ft.indexOf('audio/') === 0) {
     newEl = document.createElement('audio');
-    newEl.className = 'audio-preview';
-    newEl.controls = true;
-    newEl.preload = 'metadata';
-    newEl.src = url;
+    newEl.className = 'audio-preview'; newEl.controls = true; newEl.preload = 'metadata'; newEl.src = url;
   } else {
     newEl = document.createElement('a');
-    newEl.className = 'file-link';
-    newEl.href = url;
-    newEl.download = msg.fileName || 'file';
+    newEl.className = 'file-link'; newEl.href = url; newEl.download = msg.fileName || 'file';
     newEl.target = '_blank';
     newEl.textContent = '📁 ' + (msg.fileName || 'Файл') + (msg.fileSize ? ' (' + formatBytes(msg.fileSize) + ')' : '');
   }
-
   if (!newEl) { placeholder.outerHTML = '<div class="file-placeholder">⚠️ Файл недоступен</div>'; return; }
   placeholder.parentNode.replaceChild(newEl, placeholder);
 }
@@ -2332,7 +2332,7 @@ function doCheckVisibleMessages() {
     var r = el.getBoundingClientRect();
     if (r.top >= cr.top && r.bottom <= cr.bottom) {
       var mo = localMessagesCache.find(function (m) { return m.id === mid; });
-      if (!mo || mo.isPending) return;
+      if (!mo || mo.isPending || mo.isWaiting) return;
       if (isGroup) {
         if (!mo.readBy) mo.readBy = [];
         if (mo.readBy.indexOf(currentUser.id) === -1) { mo.readBy.push(currentUser.id); unread.push(mid); }
@@ -2361,8 +2361,7 @@ function closeMsgActions() {
 }
 function actionCopyText() { var t = selectedMsgObj && selectedMsgObj.text; closeMsgActions(); if (t) navigator.clipboard.writeText(t).catch(function () {}); }
 async function actionDownloadFile() {
-  var obj = selectedMsgObj;
-  closeMsgActions();
+  var obj = selectedMsgObj; closeMsgActions();
   if (!obj) return;
   var url = await getFileUrl(obj);
   if (!url) { alert('Файл недоступен'); return; }
@@ -2370,8 +2369,7 @@ async function actionDownloadFile() {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 async function deleteSelectedMessage() {
-  var id = selectedMsgId;
-  closeMsgActions();
+  var id = selectedMsgId; closeMsgActions();
   if (!id) return;
   markDeleted(id);
   for (var i = 0; i < localMessagesCache.length; i++) {
@@ -2385,14 +2383,13 @@ async function deleteSelectedMessage() {
   try { await fetch('/api/messages/' + id + '?userId=' + encodeURIComponent(currentUser.id), { method: 'DELETE' }); } catch (e) {}
 }
 
-/* ==================== ФАЙЛЫ И ВЛОЖЕНИЯ ==================== */
+/* ==================== ФАЙЛЫ ==================== */
 function triggerFileInput() { document.getElementById('file-input').click(); }
 function generateVideoThumbnail(file, callback) {
   var video = document.createElement('video');
   video.preload = 'metadata';
   video.src = URL.createObjectURL(file);
-  video.muted = true;
-  video.playsInline = true;
+  video.muted = true; video.playsInline = true;
   video.onloadeddata = function () { video.currentTime = 0.5; };
   video.onseeked = function () {
     try {
@@ -2530,7 +2527,7 @@ async function toggleVoiceRecord() {
   }
 }
 
-/* ==================== ОТПРАВКА ==================== */
+/* ==================== ОТПРАВКА (не менялась, добавлен isWaiting) ==================== */
 async function sendMsg() {
   if (!activePeer) return;
   if (!lockButton('send-btn', 1000)) return;
@@ -2543,6 +2540,10 @@ async function sendMsg() {
   var isGroup = activePeer.type === 'group';
   var clientId = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
 
+  // Проверка: если получатель офлайн → isWaiting
+  var peerOnline = true;
+  if (!isGroup && activePeer.isOnline === false) peerOnline = false;
+
   var optMsg = {
     id: clientId, clientId: clientId,
     senderId: currentUser.id,
@@ -2553,11 +2554,12 @@ async function sendMsg() {
     fileType: fileToSend ? fileToSend.type : (voiceToSend ? voiceToSend.type : ''),
     thumbUrl: fileToSend ? fileToSend.thumbUrl : '',
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: true,
+    ts: Date.now(), isRead: false, readBy: [], isDeleted: false,
+    isPending: peerOnline,
+    isWaiting: !peerOnline,
     encryptionVersion: 2
   };
 
-  // Голосовое
   if (voiceToSend) {
     try {
       var encV = await encryptBlob(voiceToSend.blob);
@@ -2577,7 +2579,6 @@ async function sendMsg() {
     return;
   }
 
-  // Маленький файл
   if (fileToSend && !fileToSend.isLarge) {
     try {
       var enc = await encryptBlob(fileToSend.file);
@@ -2602,11 +2603,9 @@ async function sendMsg() {
     return;
   }
 
-  // Большой файл
   if (fileToSend && fileToSend.isLarge) {
     optMsg.fileSize = fileToSend.file.size;
     optMsg.fileType = fileToSend.type;
-    // Не сохраняем в IDB — uploadLarge сам шифрует и сохранит
     cancelAttachment();
     mergeMessage(optMsg);
     renderMessagesContainer(getChatMessages(activePeer));
@@ -2614,7 +2613,6 @@ async function sendMsg() {
     return;
   }
 
-  // Только текст
   var pT = await buildEncryptedPayload({ clientId: clientId, plainText: text });
   optMsg.textEnc = pT.text;
   optMsg.textKeyEncByUser = pT.textKeyEncByUser;
@@ -2655,8 +2653,7 @@ async function sendPayload(payload) {
     if (!res.ok) throw new Error('Server error');
     var data = await res.json();
     if (data && data.message) {
-      var rm = Object.assign({}, data.message); rm.isPending = false;
-      // Локально отображаем открытый текст
+      var rm = Object.assign({}, data.message); rm.isPending = false; rm.isWaiting = false;
       var plain = localMessagesCache.find(function (m) { return m.clientId === payload.clientId; });
       rm.text = plain ? plain.text : '';
       if (payload.fileUrl) rm.fileUrl = payload.fileUrl;
@@ -2690,7 +2687,6 @@ async function uploadLargeFileInBackground(clientId, file, fileName, fileType, t
     var enc = await encryptBlob(file);
     var encFile = new File([enc.blob], 'enc.bin', { type: 'application/octet-stream' });
     var wrap = await wrapKeyForRecipients(enc.keyB64);
-
     try { await saveFileToIDB(clientId, enc.blob, { fileName: fileName, fileType: fileType, fileSize: enc.blob.size }); } catch (e) {}
 
     var initRes = await fetch('/api/upload/init', {
@@ -2740,6 +2736,287 @@ async function uploadLargeFileInBackground(clientId, file, fileName, fileType, t
       renderMessagesContainer(getChatMessages(activePeer));
     }
   } catch (e) { console.warn('Upload failed:', e); }
+}
+
+/* ==================== ЗВОНКИ (WebRTC) ==================== */
+var callPollingTimer = null;
+var currentCall = null; // { callId, role: 'caller'|'callee', peerId, peerName, peerAvatar, video, pc, localStream, remoteStream, startedAt, micOn, camOn, facing, status }
+var incomingCall = null;
+
+function startCallPolling() {
+  if (callPollingTimer) clearInterval(callPollingTimer);
+  callPollingTimer = setInterval(pollCallSignals, 1000);
+  pollCallSignals();
+}
+async function pollCallSignals() {
+  if (!currentUser) return;
+  try {
+    var res = await fetch('/api/calls/poll?userId=' + encodeURIComponent(currentUser.id));
+    var data = await res.json();
+    if (!data.success) return;
+    (data.signals || []).forEach(handleCallSignal);
+  } catch (e) {}
+}
+
+function showCallOverlay() {
+  document.getElementById('call-overlay').classList.add('active');
+  document.getElementById('incoming-call-overlay').classList.remove('active');
+}
+function hideCallOverlay() {
+  document.getElementById('call-overlay').classList.remove('active');
+}
+function minimizeCallOverlay() {
+  hideCallOverlay();
+  if (currentCall) {
+    // сворачиваем в фоновый режим — звонок продолжается
+  }
+}
+function updateCallOverlayUI() {
+  if (!currentCall) return;
+  var avatarEl = document.getElementById('call-peer-avatar');
+  if (currentCall.peerAvatar) avatarEl.innerHTML = '<img src="' + currentCall.peerAvatar + '">';
+  else avatarEl.innerText = (currentCall.peerName || '?').charAt(0).toUpperCase();
+  document.getElementById('call-peer-name').innerText = currentCall.peerName || 'Собеседник';
+  var statusEl = document.getElementById('call-status-text');
+  if (currentCall.status === 'ringing') statusEl.innerText = 'Вызов…';
+  else if (currentCall.status === 'connecting') statusEl.innerText = 'Соединение…';
+  else if (currentCall.status === 'active') statusEl.innerText = 'В звонке';
+  else statusEl.innerText = '';
+  document.getElementById('call-title').innerText = currentCall.video ? 'Видеозвонок' : 'Аудиозвонок';
+  document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
+  document.getElementById('ctrl-cam').classList.toggle('active', currentCall.camOn);
+}
+
+async function startCall() {
+  if (!activePeer || activePeer.type === 'group') { alert('Групповые звонки не поддерживаются'); return; }
+  if (currentCall || incomingCall) { alert('Уже есть активный звонок'); return; }
+  var video = confirm('Видеозвонок?\\nOK — с камерой, Отмена — только аудио');
+  try {
+    var res = await fetch('/api/calls/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromId: currentUser.id, toId: activePeer.id, video: video })
+    });
+    var data = await res.json();
+    if (!data.success) { alert(data.error || 'Не удалось'); return; }
+    currentCall = {
+      callId: data.callId, role: 'caller', peerId: activePeer.id,
+      peerName: activePeer.name, peerAvatar: activePeer.avatar || '',
+      video: video, pc: null, localStream: null, remoteStream: null,
+      startedAt: Date.now(), micOn: true, camOn: video, facing: 'user', status: 'ringing'
+    };
+    showCallOverlay();
+    updateCallOverlayUI();
+    await setupLocalMedia(video);
+    await createPeerConnection();
+    updateCallOverlayUI();
+  } catch (e) { console.warn('startCall', e); alert('Ошибка звонка'); }
+}
+
+async function acceptIncomingCall() {
+  if (!incomingCall) return;
+  var c = incomingCall;
+  incomingCall = null;
+  document.getElementById('incoming-call-overlay').classList.remove('active');
+  currentCall = {
+    callId: c.callId, role: 'callee', peerId: c.fromId,
+    peerName: c.fromName, peerAvatar: c.fromAvatar,
+    video: !!c.video, pc: null, localStream: null, remoteStream: null,
+    startedAt: Date.now(), micOn: true, camOn: !!c.video, facing: 'user', status: 'connecting'
+  };
+  showCallOverlay();
+  updateCallOverlayUI();
+  try {
+    await fetch('/api/calls/answer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: currentCall.callId, userId: currentUser.id, accept: true })
+    });
+  } catch (e) {}
+  await setupLocalMedia(currentCall.video);
+  await createPeerConnection();
+  updateCallOverlayUI();
+}
+async function rejectIncomingCall() {
+  if (!incomingCall) return;
+  var c = incomingCall;
+  incomingCall = null;
+  document.getElementById('incoming-call-overlay').classList.remove('active');
+  try {
+    await fetch('/api/calls/answer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: c.callId, userId: currentUser.id, accept: false })
+    });
+  } catch (e) {}
+}
+
+async function setupLocalMedia(wantVideo) {
+  var constraints = { audio: true, video: wantVideo ? { facingMode: currentCall.facing || 'user' } : false };
+  try {
+    var stream = await navigator.mediaDevices.getUserMedia(constraints);
+    currentCall.localStream = stream;
+    var localVideo = document.getElementById('call-local-video');
+    localVideo.srcObject = stream;
+    localVideo.style.display = wantVideo ? 'block' : 'none';
+    var audioScreen = document.getElementById('call-audio-screen');
+    audioScreen.style.display = wantVideo ? 'none' : 'flex';
+  } catch (e) {
+    if (wantVideo) {
+      // попробуем только аудио
+      try {
+        var s2 = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        currentCall.localStream = s2;
+        currentCall.video = false;
+        currentCall.camOn = false;
+        document.getElementById('call-local-video').style.display = 'none';
+        document.getElementById('call-audio-screen').style.display = 'flex';
+      } catch (e2) { alert('Нет доступа к камере/микрофону'); endCurrentCall(); }
+    } else { alert('Нет доступа к микрофону'); endCurrentCall(); }
+  }
+}
+
+async function createPeerConnection() {
+  var pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  currentCall.pc = pc;
+  if (currentCall.localStream) {
+    currentCall.localStream.getTracks().forEach(function (t) { pc.addTrack(t, currentCall.localStream); });
+  }
+  pc.ontrack = function (e) {
+    if (e.streams && e.streams[0]) {
+      currentCall.remoteStream = e.streams[0];
+      var rv = document.getElementById('call-remote-video');
+      rv.srcObject = e.streams[0];
+      if (currentCall.video) {
+        rv.style.display = 'block';
+        document.getElementById('call-audio-screen').style.display = 'none';
+      } else {
+        rv.style.display = 'none';
+        document.getElementById('call-audio-screen').style.display = 'flex';
+      }
+    }
+  };
+  pc.onicecandidate = function (e) {
+    if (e.candidate) {
+      sendCallSignal('ice', { candidate: e.candidate });
+    }
+  };
+  pc.onconnectionstatechange = function () {
+    if (pc.connectionState === 'connected') {
+      currentCall.status = 'active';
+      updateCallOverlayUI();
+    }
+  };
+  if (currentCall.role === 'caller') {
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendCallSignal('offer', { sdp: offer });
+  } else {
+    // callee ждёт offer от caller
+  }
+}
+
+async function sendCallSignal(type, payload) {
+  if (!currentCall) return;
+  try {
+    await fetch('/api/calls/signal', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId: currentCall.callId, fromId: currentUser.id, toId: currentCall.peerId, type: type, payload: payload })
+    });
+  } catch (e) {}
+}
+
+async function handleCallSignal(sig) {
+  if (sig.type === 'offer-start') {
+    if (currentCall || incomingCall) { return; }
+    incomingCall = { callId: sig.callId, fromId: sig.from, fromName: sig.payload.fromName || 'Пользователь', fromAvatar: sig.payload.fromAvatar || '', video: !!sig.payload.video };
+    document.getElementById('incoming-avatar').innerHTML = incomingCall.fromAvatar ? '<img src="' + incomingCall.fromAvatar + '">' : (incomingCall.fromName.charAt(0).toUpperCase());
+    document.getElementById('incoming-name').innerText = incomingCall.fromName;
+    document.getElementById('incoming-status-text').innerText = incomingCall.video ? 'Входящий видеозвонок…' : 'Входящий звонок…';
+    document.getElementById('incoming-call-overlay').classList.add('active');
+    playNotificationSound();
+    return;
+  }
+  if (!currentCall || sig.callId !== currentCall.callId) return;
+  if (sig.type === 'accepted') {
+    currentCall.status = 'connecting';
+    updateCallOverlayUI();
+  } else if (sig.type === 'rejected' || sig.type === 'ended') {
+    endCurrentCall(true);
+  } else if (sig.type === 'offer') {
+    try {
+      await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp));
+      var answer = await currentCall.pc.createAnswer();
+      await currentCall.pc.setLocalDescription(answer);
+      sendCallSignal('answer', { sdp: answer });
+    } catch (e) {}
+  } else if (sig.type === 'answer') {
+    try { await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp)); } catch (e) {}
+  } else if (sig.type === 'ice') {
+    try { await currentCall.pc.addIceCandidate(new RTCIceCandidate(sig.payload.candidate)); } catch (e) {}
+  }
+}
+
+function toggleCallMic() {
+  if (!currentCall || !currentCall.localStream) return;
+  var audioTracks = currentCall.localStream.getAudioTracks();
+  currentCall.micOn = !currentCall.micOn;
+  audioTracks.forEach(function (t) { t.enabled = currentCall.micOn; });
+  document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
+}
+async function toggleCallCam() {
+  if (!currentCall) return;
+  if (!currentCall.camOn) {
+    try {
+      var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing || 'user' } });
+      currentCall.localStream = currentCall.localStream || new MediaStream();
+      vs.getVideoTracks().forEach(function (t) {
+        currentCall.localStream.addTrack(t);
+        if (currentCall.pc) {
+          var sender = currentCall.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
+          if (sender) sender.replaceTrack(t); else currentCall.pc.addTrack(t, currentCall.localStream);
+        }
+      });
+      currentCall.camOn = true;
+      document.getElementById('call-local-video').srcObject = currentCall.localStream;
+      document.getElementById('call-local-video').style.display = 'block';
+      document.getElementById('call-audio-screen').style.display = currentCall.remoteStream ? 'none' : 'flex';
+      document.getElementById('ctrl-cam').classList.add('active');
+    } catch (e) { alert('Камера недоступна'); }
+  } else {
+    currentCall.localStream.getVideoTracks().forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
+    currentCall.camOn = false;
+    document.getElementById('call-local-video').style.display = 'none';
+    document.getElementById('ctrl-cam').classList.remove('active');
+  }
+}
+async function flipCallCamera() {
+  if (!currentCall || !currentCall.camOn) return;
+  currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user';
+  try {
+    var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing } });
+    var newTrack = vs.getVideoTracks()[0];
+    var oldTracks = currentCall.localStream.getVideoTracks();
+    oldTracks.forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
+    currentCall.localStream.addTrack(newTrack);
+    var sender = currentCall.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
+    if (sender) await sender.replaceTrack(newTrack);
+    document.getElementById('call-local-video').srcObject = currentCall.localStream;
+  } catch (e) { currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user'; }
+}
+
+async function endCurrentCall(silent) {
+  if (!currentCall) { hideCallOverlay(); return; }
+  var c = currentCall;
+  currentCall = null;
+  hideCallOverlay();
+  try { await fetch('/api/calls/end', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: c.callId, userId: currentUser.id }) }); } catch (e) {}
+  try { if (c.pc) c.pc.close(); } catch (e) {}
+  try { if (c.localStream) c.localStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+  var rv = document.getElementById('call-remote-video');
+  rv.srcObject = null; rv.style.display = 'none';
+  var lv = document.getElementById('call-local-video');
+  lv.srcObject = null; lv.style.display = 'none';
+  document.getElementById('call-audio-screen').style.display = 'flex';
+  document.getElementById('ctrl-mic').classList.add('active');
+  document.getElementById('ctrl-cam').classList.remove('active');
 }
 
 /* ==================== ГРУППЫ / КОНТАКТЫ ==================== */
