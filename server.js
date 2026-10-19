@@ -1,14 +1,14 @@
 /* ============================================================
-   server.js — v4.1.0 (stateless & fixed E2EE / WebRTC)
+   server.js — v4.1.1 (stateless, E2EE, UI fix)
    - Хранение: RAM (сервер) + localStorage/IndexedDB (клиент)
-   - Поддержка GitHub / Render (бесплатный тариф)
+   - Исправлены баги: индикатор сети и создание групп
    ============================================================ */
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.1.0';
+const SERVER_VERSION = '4.1.1';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -33,7 +33,6 @@ function isOnline(u) { return !!(u && u.updatedAt && (Date.now() - u.updatedAt <
 /* Автоочистка неактивных данных в RAM каждые 10 минут */
 setInterval(function() {
   const now = Date.now();
-  // Удаляем аккаунты неактивные более 24 часов
   MEM.accounts = MEM.accounts.filter(u => (now - (u.updatedAt || 0)) < 86400000);
 }, 600000);
 
@@ -231,8 +230,8 @@ app.get('/api/users/online', function (req, res) {
   const userId = req.query.userId || '';
   const now = Date.now();
   const list = MEM.accounts
-    .filter(function (u) { return u.id !== userId && u.name && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS); })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: true }; })
+    .filter(function (u) { return u.id !== userId && u.name; }) // Убрали жесткую привязку к строгой разнице таймингов онлайн, чтобы список контактов для групп был всегда заполнен
+    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) }; })
     .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(list);
 });
@@ -389,7 +388,6 @@ app.get('/api/messages/receive', function (req, res) {
 app.get('/api/messages/:userId/:peerId', function (req, res) {
   const { userId, peerId } = req.params;
   const pending = MEM.inbox.get(userId) || [];
-  // фильтруем и одновременно не ломаем очередь для других получателей
   const match = pending.filter(function (m) {
     return (m.senderId === peerId && m.receiverId === userId) ||
            (m.senderId === userId && m.receiverId === peerId);
@@ -520,11 +518,14 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .sidebar-header{padding:12px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:10px;}
   .user-profile-bar{display:flex;align-items:center;justify-content:space-between;padding:4px;cursor:pointer;}
   .user-info-brief{display:flex;flex-direction:column;overflow:hidden;margin-left:10px;flex:1;}
-  .avatar-circle{width:40px;height:40px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:hidden;}
+  
+  /* ИСПРАВЛЕНИЕ АВАТАРКИ И ЗЕЛЕНОГО ИНДИКАТОРА */
+  .avatar-circle{width:40px;height:40px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:visible;}
   .avatar-circle img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block;position:relative;z-index:1;}
   .avatar-circle > span{position:relative;z-index:1;}
-  .online-indicator{position:absolute;bottom:-2px;right:-2px;width:12px;height:12px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;display:none;z-index:999;box-sizing:content-box;}
+  .online-indicator{position:absolute;bottom:0;right:0;width:12px;height:12px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;display:none;z-index:10;box-sizing:content-box;}
   .online-indicator.visible{display:block;}
+
   .header-actions{display:flex;gap:6px;}
   .theme-toggle-btn{background:var(--bg-input);border:none;color:var(--text-main);width:34px;height:34px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;}
   .search-box{position:relative;}
@@ -854,7 +855,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.1.0';
+var CLIENT_VERSION = '4.1.1';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -894,7 +895,7 @@ var fileUrlCache = new Map();
 var deletedIds = {};
 var myKeyPair = null;
 
-/* ==================== ШИФРОВАНИЕ E2EE (ECDH P-256 + AES-GCM) ==================== */
+/* ==================== ШИФРОВАНИЕ E2EE ==================== */
 function bufToBase64(buf) {
   var bytes = new Uint8Array(buf);
   var binary = '';
@@ -984,7 +985,7 @@ async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
 async function wrapFileKeyForUser(fileKeyB64, peerId) {
   var targetUser = (peerId === currentUser.id) ? currentUser : (localKnownUsers[peerId] || {});
   var pubKeyJwkStr = targetUser.pubKey || (peerId === currentUser.id ? myKeyPair.pubKeyB64 : '');
-  if (!pubKeyJwkStr) return fileKeyB64; // fallback если нет публичного ключа
+  if (!pubKeyJwkStr) return fileKeyB64;
   var sharedKey = await getDerivedSharedKey(pubKeyJwkStr);
   if (!sharedKey) return fileKeyB64;
   var enc = await aesEncrypt(sharedKey, strToU8(fileKeyB64));
@@ -993,7 +994,7 @@ async function wrapFileKeyForUser(fileKeyB64, peerId) {
 
 async function unwrapFileKeyForMe(wrapped, senderId) {
   if (!wrapped) return null;
-  if (wrapped.indexOf('.') === -1) return wrapped; // plain fallback
+  if (wrapped.indexOf('.') === -1) return wrapped;
   var parts = wrapped.split('.');
   if (parts.length !== 2) return null;
   var senderUser = (senderId === currentUser.id) ? currentUser : (localKnownUsers[senderId] || {});
@@ -1321,6 +1322,7 @@ document.addEventListener('click', function (e) {
     if (!menu.contains(e.target) && e.target !== b && !b.contains(e.target)) menu.classList.remove('active');
   }
 });
+
 function renderAvatarIntoElement(el, userObj, isOnline) {
   if (!el) return;
   var rk = (userObj && userObj.id ? userObj.id : '') + '|' + (userObj && userObj.avatar ? String(userObj.avatar).substring(0, 30) : '') + '|' + (userObj && userObj.name ? userObj.name : '');
@@ -2418,26 +2420,31 @@ async function getContactUsers() {
     return list;
   } catch (e) { return []; }
 }
+
 function renderCheckList(containerId, users, excludeSet) {
   var c = document.getElementById(containerId); c.innerHTML = '';
   var list = users.filter(function (u) { return !excludeSet.has(u.id); });
-  if (list.length === 0) { c.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:8px;">Нет контактов</div>'; return; }
+  if (list.length === 0) { c.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:8px;">Нет доступных контактов</div>'; return; }
   list.forEach(function (u) {
     var row = document.createElement('label');
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px;cursor:pointer;border-bottom:1px solid var(--border);';
-    var avatarId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    var avatarId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     row.innerHTML = '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;"><div class="avatar-circle" id="' + avatarId + '" style="width:32px;height:32px;font-size:13px;"></div><span style="flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">' + escapeHtml(u.name) + '</span>';
     c.appendChild(row);
     renderAvatarIntoElement(document.getElementById(avatarId), u, false);
   });
 }
-function getChecked(containerId) { return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; }); }
+
+function getChecked(containerId) { 
+  return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; }); 
+}
 
 async function openCreateGroup() {
   if (isModalOpen('create-group-modal')) return;
   groupDraftAvatar = '';
   document.getElementById('create-group-name').value = '';
   fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥');
+  
   var cached = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
@@ -2445,8 +2452,13 @@ async function openCreateGroup() {
   }
   renderCheckList('create-group-contacts', cached, new Set());
   safeOpenModal('create-group-modal');
-  getContactUsers().then(function (c) { if (c.length !== cached.length) renderCheckList('create-group-contacts', c, new Set()); });
+
+  // Подгружаем актуальные контакты с сервера
+  var contacts = await getContactUsers();
+  contacts.forEach(function(c) { cacheUser(c); });
+  renderCheckList('create-group-contacts', contacts, new Set());
 }
+
 function closeCreateGroup() { safeCloseModal('create-group-modal'); }
 function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
 function handleGroupAvatarSelect(e) {
@@ -2603,7 +2615,9 @@ async function openAddMembers() {
   }
   renderCheckList('add-members-contacts', cached, exclude);
   safeOpenModal('add-members-modal');
-  getContactUsers().then(function (c) { renderCheckList('add-members-contacts', c, exclude); });
+  var contacts = await getContactUsers();
+  contacts.forEach(function(c) { cacheUser(c); });
+  renderCheckList('add-members-contacts', contacts, exclude);
 }
 function closeAddMembers() { safeCloseModal('add-members-modal'); }
 
