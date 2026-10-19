@@ -1,5 +1,6 @@
 /* ============================================================
-   server.js — единый файл (сервер + клиент + шифрование + звонки)
+   server.js — v3.7.0 (вход по имени, список онлайн, звонки)
+   База: рабочий v3.6.0. Изменения точечные.
    ============================================================ */
 const express = require('express');
 const fs = require('fs');
@@ -9,7 +10,7 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const SERVER_VERSION = '3.7.1';
+const SERVER_VERSION = '3.7.0';
 const MIN_CLIENT_VERSION = '1.0.0';
 
 app.use(express.json({ limit: '200mb' }));
@@ -92,7 +93,7 @@ app.get('/api/health', function (req, res) {
   res.json({ ok: true, serverTime: Date.now(), serverVersion: SERVER_VERSION, minClientVersion: MIN_CLIENT_VERSION });
 });
 
-/* ==================== ВХОД ПО ИМЕНИ ==================== */
+/* ==================== ВХОД ПО ИМЕНИ (НОВОЕ) ==================== */
 app.post('/api/enter', function (req, res) {
   const name = (req.body.name || '').trim();
   const clientId = (req.body.clientId || '').trim();
@@ -101,13 +102,8 @@ app.post('/api/enter', function (req, res) {
 
   const accounts = readAccounts();
   let user = null;
-
-  if (clientId) {
-    user = accounts.find(function (u) { return u.id === clientId; });
-  }
-  if (!user) {
-    user = accounts.find(function (u) { return u.name === name; });
-  }
+  if (clientId) user = accounts.find(function (u) { return u.id === clientId; });
+  if (!user) user = accounts.find(function (u) { return u.name === name; });
   if (!user) {
     let sessionUID = genSessionUID();
     while (accounts.some(u => u.sessionUID === sessionUID)) sessionUID = genSessionUID();
@@ -128,13 +124,12 @@ app.post('/api/enter', function (req, res) {
     user.updatedAt = Date.now();
     writeAccounts(accounts);
   }
-
   const safeUser = Object.assign({}, user);
   delete safeUser.passwordHash;
   res.json({ success: true, user: safeUser });
 });
 
-/* ==================== LEGACY (совместимость) ==================== */
+/* ==================== АККАУНТЫ (legacy, для старых аккаунтов) ==================== */
 app.post('/api/register', function (req, res) {
   let { name, password, avatar } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите имя' });
@@ -167,10 +162,9 @@ app.post('/api/login', function (req, res) {
   const sessionUID = (req.body.sessionUID || '').toUpperCase().trim();
   const password = req.body.password || '';
   if (!sessionUID || sessionUID.length !== 8) return res.status(400).json({ error: 'Идентификатор сессии должен состоять из 8 символов' });
-
   const accounts = readAccounts();
   const user = accounts.find(u => u.sessionUID === sessionUID);
-  if (!user) return res.status(404).json({ error: 'Аккаунт не найден' });
+  if (!user) return res.status(404).json({ error: 'Аккаунт с таким Идентификатором сессии не найден' });
   if (user.passwordHash && password && user.passwordHash !== hashPassword(password)) return res.status(400).json({ error: 'Неверный пароль' });
 
   user.updatedAt = Date.now();
@@ -193,7 +187,6 @@ app.post('/api/profile/set-password', function (req, res) {
   res.json({ success: true, user: safeUser });
 });
 
-/* ==================== PING ==================== */
 app.post('/api/ping', function (req, res) {
   const { id, name, avatar, contacts, knownUsers } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
@@ -312,7 +305,7 @@ app.get('/api/users/search', function (req, res) {
   res.json(results);
 });
 
-/* ==================== ВСЕ ОНЛАЙН + КОНТАКТЫ ==================== */
+/* ==================== СПИСОК ОНЛАЙН (НОВОЕ) ==================== */
 app.get('/api/users/online', function (req, res) {
   const userId = req.query.userId || '';
   const accounts = readAccounts();
@@ -327,13 +320,10 @@ app.get('/api/users/online', function (req, res) {
       return isOnline || contactSet.has(u.id);
     })
     .map(u => ({
-      id: u.id,
-      type: 'user',
-      name: u.name,
-      avatar: u.avatar || '',
+      id: u.id, type: 'user', name: u.name, avatar: u.avatar || '',
       isOnline: !!(u.updatedAt && (now - u.updatedAt < 8000))
     }))
-    .sort(function (a, b) {
+    .sort((a, b) => {
       const ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0;
       if (ao !== bo) return bo - ao;
       return a.name.localeCompare(b.name);
@@ -627,19 +617,11 @@ app.get('/api/dialogs/:userId', function (req, res) {
   res.json(all);
 });
 
-/* ==================== ЗВОНКИ (SIGNALING) ==================== */
+/* ==================== ЗВОНКИ (НОВОЕ) ==================== */
 const callSignals = new Map();
 const activeCalls = new Map();
-
-function ensureSignalQueue(uid) {
-  if (!callSignals.has(uid)) callSignals.set(uid, []);
-  return callSignals.get(uid);
-}
-function pushSignal(targetUid, fromUid, callId, type, payload) {
-  const q = ensureSignalQueue(targetUid);
-  q.push({ id: genId('sig_'), from: fromUid, callId: callId, type: type, payload: payload || null, ts: Date.now() });
-}
-
+function ensureQ(uid) { if (!callSignals.has(uid)) callSignals.set(uid, []); return callSignals.get(uid); }
+function pushSig(t, f, c, ty, p) { ensureQ(t).push({ id: genId('sig_'), from: f, callId: c, type: ty, payload: p || null, ts: Date.now() }); }
 app.post('/api/calls/start', function (req, res) {
   const { fromId, toId, video } = req.body;
   if (!fromId || !toId) return res.status(400).json({ error: 'No ids' });
@@ -649,72 +631,47 @@ app.post('/api/calls/start', function (req, res) {
   const to = accounts.find(u => u.id === toId);
   if (!from) return res.status(404).json({ error: 'Отправитель не найден' });
   if (!to) return res.status(404).json({ error: 'Получатель не найден' });
-  if (to.blockedContacts && to.blockedContacts.indexOf(fromId) !== -1) {
-    return res.status(403).json({ error: 'Пользователь заблокировал вас' });
-  }
+  if (to.blockedContacts && to.blockedContacts.indexOf(fromId) !== -1) return res.status(403).json({ error: 'Заблокирован' });
   const callId = genId('call_');
-  activeCalls.set(callId, {
-    id: callId, fromId: fromId, toId: toId,
-    fromName: from.name, fromAvatar: from.avatar || '',
-    toName: to.name, video: !!video,
-    status: 'ringing', startedAt: Date.now(), answeredAt: 0
-  });
-  pushSignal(toId, fromId, callId, 'offer-start', { fromName: from.name, fromAvatar: from.avatar || '', video: !!video });
-  res.json({ success: true, callId: callId });
+  activeCalls.set(callId, { id: callId, fromId, toId, fromName: from.name, fromAvatar: from.avatar || '', toName: to.name, video: !!video, status: 'ringing', startedAt: Date.now(), answeredAt: 0 });
+  pushSig(toId, fromId, callId, 'offer-start', { fromName: from.name, fromAvatar: from.avatar || '', video: !!video });
+  res.json({ success: true, callId });
 });
-
 app.post('/api/calls/answer', function (req, res) {
   const { callId, userId, accept } = req.body;
   const call = activeCalls.get(callId);
-  if (!call) return res.status(404).json({ error: 'Звонок не найден' });
-  if (call.toId !== userId) return res.status(403).json({ error: 'Не тот пользователь' });
-  if (accept) {
-    call.status = 'active';
-    call.answeredAt = Date.now();
-    pushSignal(call.fromId, call.toId, callId, 'accepted', {});
-  } else {
-    call.status = 'rejected';
-    pushSignal(call.fromId, call.toId, callId, 'rejected', {});
-    activeCalls.delete(callId);
-  }
+  if (!call) return res.status(404).json({ error: 'Нет' });
+  if (call.toId !== userId) return res.status(403).json({ error: 'Не тот' });
+  if (accept) { call.status = 'active'; call.answeredAt = Date.now(); pushSig(call.fromId, call.toId, callId, 'accepted', {}); }
+  else { call.status = 'rejected'; pushSig(call.fromId, call.toId, callId, 'rejected', {}); activeCalls.delete(callId); }
   res.json({ success: true });
 });
-
 app.post('/api/calls/end', function (req, res) {
   const { callId, userId } = req.body;
   const call = activeCalls.get(callId);
   if (call) {
     const peer = userId === call.fromId ? call.toId : call.fromId;
     call.status = 'ended';
-    pushSignal(peer, userId, callId, 'ended', { by: userId });
+    pushSig(peer, userId, callId, 'ended', { by: userId });
     activeCalls.delete(callId);
   }
   res.json({ success: true });
 });
-
 app.post('/api/calls/signal', function (req, res) {
   const { callId, fromId, toId, type, payload } = req.body;
   if (!callId || !fromId || !toId || !type) return res.status(400).json({ error: 'Bad' });
-  const call = activeCalls.get(callId);
-  if (!call) return res.status(404).json({ error: 'Звонок не найден' });
-  pushSignal(toId, fromId, callId, type, payload);
+  if (!activeCalls.has(callId)) return res.status(404).json({ error: 'Нет' });
+  pushSig(toId, fromId, callId, type, payload);
   res.json({ success: true });
 });
-
 app.get('/api/calls/poll', function (req, res) {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ error: 'No user' });
-  const q = ensureSignalQueue(userId);
+  const q = ensureQ(userId);
   const now = Date.now();
   const fresh = q.filter(s => now - s.ts < 120000);
   callSignals.set(userId, []);
   res.json({ success: true, signals: fresh });
-});
-
-app.get('/api/calls/state/:callId', function (req, res) {
-  const call = activeCalls.get(req.params.callId);
-  if (!call) return res.json({ exists: false });
-  res.json({ exists: true, call: call });
 });
 
 /* ==================== ФАЙЛЫ ==================== */
@@ -819,6 +776,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
   .btn-danger { background: #e53935; color: #fff; }
   .error-msg { color: #e53935; font-size: 12px; margin-bottom: 10px; display: none; }
+  .warning-box { background: rgba(229, 57, 53, 0.15); border: 1px solid #e53935; color: #e53935; padding: 10px; border-radius: 8px; font-size: 12px; margin-bottom: 12px; text-align: center; }
   #status-bar { position: fixed; top: 0; left: 0; right: 0; padding: 8px; text-align: center; font-size: 13px; font-weight: 600; z-index: 9999; transition: transform 0.3s; transform: translateY(-100%); }
   #status-bar.visible { transform: translateY(0); }
   #status-bar.internet-off { background: #e53935; color: #fff; }
@@ -856,7 +814,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .chat-menu-container { position: relative; display: flex; gap: 4px; align-items: center; }
   .menu-dots-btn { background: transparent; border: none; color: var(--text-main); font-size: 20px; cursor: pointer; padding: 8px; border-radius: 50%; display: none; }
   .call-btn { background: transparent; border: none; color: var(--text-main); font-size: 22px; cursor: pointer; padding: 8px; border-radius: 50%; }
-  .call-btn:hover { background: var(--bg-hover); }
   .chat-dropdown-menu { position: absolute; right: 0; top: 45px; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 220px; display: none; flex-direction: column; z-index: 1000; overflow: hidden; }
   .chat-dropdown-menu.active { display: flex; }
   .menu-item { padding: 12px 16px; font-size: 14px; cursor: pointer; border-bottom: 1px solid var(--border); text-align: left; background: none; border-top: none; border-left: none; border-right: none; color: var(--text-main); width: 100%; }
@@ -923,15 +880,11 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .viewer-close { position: absolute; top: 20px; right: 20px; color: #fff; font-size: 30px; cursor: pointer; background: none; border: none; z-index: 3100; }
   .msg-actions-sheet { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg-sidebar); border-top-left-radius: 16px; border-top-right-radius: 16px; padding: 20px; z-index: 1001; display: flex; flex-direction: column; gap: 10px; visibility: hidden; opacity: 0; transform: translateY(20px); transition: 0.15s; pointer-events: none; }
   .msg-actions-sheet.active { visibility: visible; opacity: 1; transform: translateY(0); pointer-events: auto; }
-
-  /* === ЗВОНКИ === */
   .call-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.94); z-index: 5000; display: none; flex-direction: column; align-items: center; justify-content: center; color: #fff; }
   .call-overlay.active { display: flex; }
   .call-topbar { position: absolute; top: 0; left: 0; right: 0; padding: 16px; display: flex; justify-content: space-between; align-items: center; z-index: 10; }
   .call-close-x { background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 22px; width: 40px; height: 40px; border-radius: 50%; cursor: pointer; }
-  .call-close-x:hover { background: rgba(255,255,255,0.25); }
   .call-title { font-size: 18px; font-weight: bold; }
-  .call-subtitle { font-size: 13px; opacity: 0.7; margin-top: 4px; }
   .call-videos { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
   .call-remote-video { width: 100%; height: 100%; object-fit: contain; background: #000; }
   .call-local-video { position: absolute; top: 70px; right: 16px; width: 110px; height: 160px; object-fit: cover; border-radius: 12px; background: #111; box-shadow: 0 4px 12px rgba(0,0,0,0.5); z-index: 5; }
@@ -941,23 +894,15 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .call-name { font-size: 24px; font-weight: bold; }
   .call-status-text { font-size: 14px; opacity: 0.7; }
   .call-controls { position: absolute; bottom: 30px; left: 0; right: 0; display: flex; justify-content: center; gap: 16px; padding: 0 16px; flex-wrap: wrap; z-index: 10; }
-  .call-ctrl-btn { width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 24px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.15s; }
-  .call-ctrl-btn:hover { background: rgba(255,255,255,0.25); }
-  .call-ctrl-btn.off { background: rgba(255,255,255,0.45); }
+  .call-ctrl-btn { width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 24px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
   .call-ctrl-btn.danger { background: #e53935; }
-  .call-ctrl-btn.danger:hover { background: #ff4f4b; }
   .call-ctrl-btn.active { background: var(--accent); }
   .call-incoming-actions { display: flex; gap: 30px; margin-top: 30px; }
   .call-incoming-btn { width: 70px; height: 70px; border-radius: 50%; border: none; color: #fff; font-size: 28px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
   .call-incoming-btn.accept { background: #4cd964; }
   .call-incoming-btn.reject { background: #e53935; }
-  #call-return-btn { display: none; position: fixed; bottom: 20px; right: 20px; z-index: 4999;
-     background: #4cd964; color: #fff; border: none; border-radius: 50%;
-     width: 60px; height: 60px; font-size: 26px; cursor: pointer;
-     box-shadow: 0 6px 20px rgba(0,0,0,0.4); align-items: center; justify-content: center; }
-  #call-in-progress-bar { display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 4998;
-     background: #2b5278; color: #fff; padding: 8px; text-align: center;
-     font-size: 13px; cursor: pointer; }
+  #call-return-btn { display: none; position: fixed; bottom: 20px; right: 20px; z-index: 4999; background: #4cd964; color: #fff; border: none; border-radius: 50%; width: 60px; height: 60px; font-size: 26px; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,0.4); align-items: center; justify-content: center; }
+  #call-in-progress-bar { display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 4998; background: #2b5278; color: #fff; padding: 8px; text-align: center; font-size: 13px; cursor: pointer; }
   @media (min-width: 601px) { .menu-dots-btn { display: flex !important; } }
   @media (max-width: 600px) {
     .sidebar { width: 100%; display: flex; }
@@ -1169,33 +1114,30 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <button class="btn btn-secondary" onclick="closeMsgActions()">Отмена</button>
   </div>
 
-  <!-- ЗВОНОК: АКТИВНЫЙ -->
   <div class="call-overlay" id="call-overlay">
     <div class="call-topbar">
       <div>
         <div class="call-title" id="call-title">Звонок</div>
-        <div class="call-subtitle" id="call-subtitle"></div>
       </div>
-      <button class="call-close-x" id="call-close-btn" onclick="minimizeCallOverlay()" title="Свернуть">✕</button>
+      <button class="call-close-x" onclick="minimizeCallOverlay()" title="Свернуть">✕</button>
     </div>
-    <div class="call-videos" id="call-videos">
+    <div class="call-videos">
       <div class="call-audio-screen" id="call-audio-screen">
         <div class="call-big-avatar" id="call-peer-avatar">?</div>
         <div class="call-name" id="call-peer-name">Собеседник</div>
-        <div class="call-status-text" id="call-status-text">Соединение…</div>
+        <div class="call-status-text" id="call-status-text">Соединение...</div>
       </div>
       <video class="call-remote-video" id="call-remote-video" autoplay playsinline style="display:none;"></video>
       <video class="call-local-video" id="call-local-video" autoplay playsinline muted style="display:none;"></video>
     </div>
-    <div class="call-controls" id="call-controls">
+    <div class="call-controls">
       <button class="call-ctrl-btn active" id="ctrl-mic" onclick="toggleCallMic()" title="Микрофон">🎤</button>
       <button class="call-ctrl-btn" id="ctrl-cam" onclick="toggleCallCam()" title="Камера">📷</button>
       <button class="call-ctrl-btn" id="ctrl-flip" onclick="flipCallCamera()" title="Сменить камеру">🔄</button>
-      <button class="call-ctrl-btn danger" id="ctrl-end" onclick="endCurrentCall()" title="Завершить">📵</button>
+      <button class="call-ctrl-btn danger" onclick="endCurrentCall()" title="Завершить">📵</button>
     </div>
   </div>
 
-  <!-- ЗВОНОК: ВХОДЯЩИЙ -->
   <div class="call-overlay" id="incoming-call-overlay">
     <div class="call-topbar">
       <div></div>
@@ -1204,7 +1146,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <div class="call-audio-screen">
       <div class="call-big-avatar" id="incoming-avatar">?</div>
       <div class="call-name" id="incoming-name">Собеседник</div>
-      <div class="call-status-text" id="incoming-status-text">Входящий звонок…</div>
+      <div class="call-status-text" id="incoming-status-text">Входящий звонок...</div>
       <div class="call-incoming-actions">
         <button class="call-incoming-btn reject" onclick="rejectIncomingCall()">✕</button>
         <button class="call-incoming-btn accept" onclick="acceptIncomingCall()">📞</button>
@@ -1212,13 +1154,8 @@ const CLIENT_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Плавающая кнопка «Вернуться в звонок» -->
   <div id="call-return-btn" onclick="restoreCallOverlay()" title="Вернуться в звонок">📞</div>
-
-  <!-- Полоса «Вы в звонке» -->
-  <div id="call-in-progress-bar" onclick="restoreCallOverlay()">
-    📞 Вы в звонке с <b id="call-in-progress-name">собеседником</b> — нажмите, чтобы вернуться
-  </div>
+  <div id="call-in-progress-bar" onclick="restoreCallOverlay()">📞 Вы в звонке с <b id="call-in-progress-name">собеседником</b> — нажмите, чтобы вернуться</div>
 
   <script src="/client.js"></script>
 </body>
@@ -1226,7 +1163,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '3.7.1';
+var CLIENT_VERSION = '3.7.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -1237,7 +1174,6 @@ var activeStream = null;
 var recordStartedAt = 0;
 var recordingTimerInterval = null;
 var recordAudioCtx = null, recordSourceNode = null, recordProcessor = null, recordSilentGain = null;
-var lastDialogsHash = '';
 var lastMessagesHash = '';
 var lastOnlineHash = '';
 var selectedMsgId = null;
@@ -1265,11 +1201,10 @@ var isRetrying = false;
 var filesDB = null;
 var fileUrlCache = new Map();
 var deletedIds = {};
-var hasUserPassword = true;
 var usersOnlineCache = [];
 var searchDebounceTimer = null;
 
-/* ==================== КЛИЕНТСКОЕ ШИФРОВАНИЕ ==================== */
+/* ==================== ШИФРОВАНИЕ ==================== */
 function bufToBase64(buf) {
   var bytes = new Uint8Array(buf);
   var binary = '';
@@ -1322,7 +1257,6 @@ async function aesDecrypt(key, ivB64, dataB64) {
 async function generateFileKey() { return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']); }
 async function exportFileKeyB64(k) { return bufToBase64(await crypto.subtle.exportKey('raw', k)); }
 async function importFileKeyB64(b64) { return crypto.subtle.importKey('raw', base64ToBuf(b64), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']); }
-
 async function encryptBlob(blob) {
   var fileKey = await generateFileKey();
   var buf = await blob.arrayBuffer();
@@ -1350,20 +1284,12 @@ async function unwrapFileKeyForMe(wrapped, myId) {
   var dec = await aesDecrypt(uKey, parts[0], parts[1]);
   return u8ToStr(dec);
 }
-var chatSecrets = {};
-function loadChatSecrets() { try { chatSecrets = JSON.parse(localStorage.getItem('messenger_chat_secrets') || '{}'); } catch (e) { chatSecrets = {}; } }
-function saveChatSecrets() { try { localStorage.setItem('messenger_chat_secrets', JSON.stringify(chatSecrets)); } catch (e) {} }
-loadChatSecrets();
-
 function blobToBase64(blob) {
   return new Promise(function (res, rej) {
     var r = new FileReader();
     r.onload = function () { var s = r.result; var idx = s.indexOf(','); res(idx >= 0 ? s.substring(idx + 1) : s); };
     r.onerror = rej; r.readAsDataURL(blob);
   });
-}
-function fileToDataUrl(file) {
-  return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = rej; r.readAsDataURL(file); });
 }
 function getRecipients() {
   if (!activePeer) return [];
@@ -1396,9 +1322,7 @@ async function buildEncryptedPayload(opts) {
     var keyB64 = await exportFileKeyB64(textKey);
     var iv = crypto.getRandomValues(new Uint8Array(12));
     var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, textKey, strToU8(opts.plainText));
-    var ivB64 = bufToBase64(iv);
-    var dataB64 = bufToBase64(enc);
-    payload.text = '__AESV2__:' + ivB64 + ':' + dataB64;
+    payload.text = '__AESV2__:' + bufToBase64(iv) + ':' + bufToBase64(enc);
     payload.textKeyEncByUser = await wrapKeyForRecipients(keyB64);
   }
   return payload;
@@ -1453,7 +1377,7 @@ function updateLoadingScreen() {
   if (!ls) return;
   if (currentUser) { ls.classList.remove('active'); return; }
   if (connectionState === 'online') { ls.classList.remove('active'); }
-  else if (connectionState === 'no-internet') { ls.classList.add('active'); title.innerText = 'Нет подключения'; text.innerText = 'Проверьте соединение'; }
+  else if (connectionState === 'no-internet') { ls.classList.add('active'); title.innerText = 'Нет подключения к интернету'; text.innerText = 'Проверьте соединение'; }
   else if (connectionState === 'server-offline') { ls.classList.add('active'); title.innerText = 'Соединение...'; text.innerText = 'Подключаемся к серверу'; }
   else { ls.classList.add('active'); title.innerText = 'Подключение'; text.innerText = 'Проверяем соединение'; }
 }
@@ -1629,11 +1553,9 @@ async function getFileUrl(msg) {
   if (!msg) return null;
   if (deletedIds[msg.id]) return null;
   if (fileUrlCache.has(msg.id)) return fileUrlCache.get(msg.id);
-
   var encBlob = null;
   var entry = await getFileFromIDB(msg.id);
   if (entry && entry.blob) encBlob = entry.blob;
-
   if (!encBlob) {
     if (msg.encFileData) {
       try { encBlob = await blobFromDataUrl('data:application/octet-stream;base64,' + msg.encFileData); } catch (e) {}
@@ -1645,7 +1567,6 @@ async function getFileUrl(msg) {
     if (encBlob) { try { await saveFileToIDB(msg.id, encBlob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: encBlob.size }); } catch (e) {} }
   }
   if (!encBlob) return null;
-
   if (msg.fileKeyEncByUser && msg.fileIv) {
     try {
       var wrapped = msg.fileKeyEncByUser[currentUser.id];
@@ -1673,7 +1594,6 @@ document.addEventListener('click', function (e) {
     if (!menu.contains(e.target) && e.target !== b && !b.contains(e.target)) menu.classList.remove('active');
   }
 });
-
 function renderAvatarIntoElement(el, userObj, isOnline) {
   if (!el) return;
   var rk = (userObj && userObj.id ? userObj.id : '') + '|' + (userObj && userObj.avatar ? String(userObj.avatar).substring(0, 30) : '') + '|' + (userObj && userObj.name ? userObj.name : '');
@@ -1762,14 +1682,12 @@ async function enterByName() {
     errBox.innerText = 'Сервер недоступен'; errBox.style.display = 'block';
   }
 }
-
 function logoutUser() {
-  if (!confirm('Выйти из аккаунта? (данные сообщений останутся)')) return;
+  if (!confirm('Вы уверены, что хотите выйти? Сообщения останутся.')) return;
   currentUser = null;
   localStorage.removeItem('messenger_user');
   location.reload();
 }
-
 function startApp() {
   document.getElementById('auth-screen').classList.remove('active');
   document.getElementById('app-screen').classList.add('active');
@@ -1813,7 +1731,6 @@ async function sendPing() {
     if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
     if (data.success && data.user) {
       var serverUser = data.user;
-      hasUserPassword = !!data.hasPassword;
       var changed = false;
       if (serverUser.name && serverUser.name !== currentUser.name) { currentUser.name = serverUser.name; changed = true; }
       if (serverUser.avatar !== undefined && serverUser.avatar !== currentUser.avatar) { currentUser.avatar = serverUser.avatar; changed = true; }
@@ -1832,7 +1749,6 @@ async function sendPing() {
     else if (pingFailCount >= 3) setConnectionState('server-offline');
   }
 }
-
 async function refreshActivePeerStatus() {
   if (!activePeer || activePeer.type === 'group') return;
   try {
@@ -1852,7 +1768,7 @@ async function refreshActivePeerStatus() {
   } catch (e) {}
 }
 
-/* ==================== СПИСОК ОНЛАЙН / ПОИСК ==================== */
+/* ==================== ОНЛАЙН / ПОИСК ==================== */
 async function loadOnlineUsers() {
   if (!currentUser) return;
   try {
@@ -1863,46 +1779,31 @@ async function loadOnlineUsers() {
     var hash = JSON.stringify(list.map(function (u) { return { id: u.id, name: u.name, avatar: u.avatar ? quickHash(u.avatar) : '', isOnline: u.isOnline }; }));
     if (hash !== lastOnlineHash) {
       lastOnlineHash = hash;
-      if (!document.getElementById('search-input').value.trim()) {
-        renderUsersList(list);
-      }
+      if (!document.getElementById('search-input').value.trim()) renderUsersList(list);
     }
   } catch (e) {}
 }
-
-async function onSearchInput() {
+function onSearchInput() {
   if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
   searchDebounceTimer = setTimeout(doSearch, 200);
 }
-
 async function doSearch() {
   var q = document.getElementById('search-input').value.trim();
   var clearBtn = document.getElementById('clear-search-btn');
-  if (!q) {
-    clearBtn.style.display = 'none';
-    renderUsersList(usersOnlineCache);
-    return;
-  }
+  if (!q) { clearBtn.style.display = 'none'; renderUsersList(usersOnlineCache); return; }
   clearBtn.style.display = 'block';
   var ql = q.toLowerCase();
-
   var map = {};
-  // локальные совпадения (мгновенно)
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
     if (u.id === currentUser.id) continue;
     if ((u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1))
       map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: false };
   }
-  // онлайн-кэш — точное состояние
   usersOnlineCache.forEach(function (u) {
-    if ((u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
-      map[u.id] = u;
-    }
+    if ((u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) map[u.id] = u;
   });
   renderUsersList(Object.values(map));
-
-  // серверный поиск — расширит список
   try {
     var res = await fetch('/api/users/search?q=' + encodeURIComponent(q));
     var users = await res.json();
@@ -1914,33 +1815,23 @@ async function doSearch() {
       else map[u.id] = u;
     });
     var arr = Object.values(map);
-    arr.sort(function (a, b) {
-      var ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0;
-      if (ao !== bo) return bo - ao;
-      return a.name.localeCompare(b.name);
-    });
+    arr.sort(function (a, b) { var ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0; if (ao !== bo) return bo - ao; return a.name.localeCompare(b.name); });
     renderUsersList(arr);
   } catch (e) {}
 }
-
 function clearSearch() {
   document.getElementById('search-input').value = '';
   document.getElementById('clear-search-btn').style.display = 'none';
   renderUsersList(usersOnlineCache);
 }
-
 function renderUsersList(list) {
   var container = document.getElementById('chat-list');
   var currentActiveId = activePeer ? activePeer.id : null;
   var currentActiveType = activePeer ? (activePeer.type || 'user') : null;
   container.innerHTML = '';
-  if (!list || list.length === 0) {
-    container.innerHTML = '<div style="padding:15px; color:var(--text-muted); font-size:12px; text-align:center;">Пока никого нет</div>';
-    return;
-  }
+  if (!list || list.length === 0) { container.innerHTML = '<div style="padding:15px; color:var(--text-muted); font-size:12px; text-align:center;">Пока никого нет</div>'; return; }
   var onlineList = list.filter(function (u) { return u.isOnline; });
   var offlineList = list.filter(function (u) { return !u.isOnline; });
-
   function buildItem(item) {
     var isGroup = item.type === 'group';
     var div = document.createElement('div');
@@ -1955,19 +1846,14 @@ function renderUsersList(list) {
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   }
-
   if (onlineList.length > 0) {
-    var lbl1 = document.createElement('div');
-    lbl1.className = 'list-label';
-    lbl1.innerText = 'В сети (' + onlineList.length + ')';
-    container.appendChild(lbl1);
+    var l1 = document.createElement('div'); l1.className = 'list-label'; l1.innerText = 'В сети (' + onlineList.length + ')';
+    container.appendChild(l1);
     onlineList.forEach(buildItem);
   }
   if (offlineList.length > 0) {
-    var lbl2 = document.createElement('div');
-    lbl2.className = 'list-label';
-    lbl2.innerText = 'Не в сети (' + offlineList.length + ')';
-    container.appendChild(lbl2);
+    var l2 = document.createElement('div'); l2.className = 'list-label'; l2.innerText = 'Не в сети (' + offlineList.length + ')';
+    container.appendChild(l2);
     offlineList.forEach(buildItem);
   }
 }
@@ -2025,7 +1911,6 @@ async function processIncomingMessage(m) {
     m.text = customDecrypt(m.text);
   }
 }
-
 async function loadMessages() {
   if (!activePeer) return;
   try {
@@ -2066,16 +1951,6 @@ async function loadMessagesQuiet() {
     }
   } catch (e) {}
 }
-
-function customEncrypt(text) {
-  if (!text) return '';
-  try {
-    var encoded = encodeURIComponent(text);
-    var result = '';
-    for (var i = 0; i < encoded.length; i++) result += String.fromCharCode(encoded.charCodeAt(i) + 5);
-    return btoa(result);
-  } catch (e) { return text; }
-}
 function customDecrypt(cipher) {
   if (!cipher) return '';
   try {
@@ -2085,17 +1960,14 @@ function customDecrypt(cipher) {
     return decodeURIComponent(result);
   } catch (e) { return cipher; }
 }
-
 function openImageViewer(src) { if (document.getElementById('image-viewer-modal').classList.contains('active')) return; document.getElementById('full-screen-img').src = src; document.getElementById('image-viewer-modal').classList.add('active'); }
 function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
-
 function isGroupMsgRead(m) {
   if (!activePeer || activePeer.type !== 'group') return m.isRead;
   var others = (activePeer.members || []).filter(function (x) { return x !== currentUser.id; });
   var rb = (m.readBy || []).filter(function (x) { return x !== currentUser.id; });
   return others.length > 0 && rb.length >= others.length;
 }
-
 async function renderMessagesContainer(messages) {
   var container = document.getElementById('messages-container');
   var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
@@ -2121,7 +1993,6 @@ async function renderMessagesContainer(messages) {
     }; })(m, div);
     div.ontouchend = function () { clearTimeout(longTouchTimer); };
     div.ontouchmove = function () { clearTimeout(longTouchTimer); };
-
     var html = '';
     if (isGroup && m.senderId !== currentUser.id) html += '<div class="msg-sender">' + escapeHtml(getUserName(m.senderId)) + '</div>';
     if (m.text) html += '<div>' + escapeHtml(m.text) + '</div>';
@@ -2155,7 +2026,6 @@ async function renderMessagesContainer(messages) {
   if (isScrolledToBottom) container.scrollTop = container.scrollHeight;
   mediaTasks.forEach(function (task) { loadMediaIntoPlaceholder(task.msg, task.placeholder).catch(function () {}); });
 }
-
 async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!placeholder || !placeholder.parentNode) return;
   if (deletedIds[msg.id] || msg.isDeleted) { if (placeholder.parentNode) placeholder.remove(); return; }
@@ -2187,7 +2057,6 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!newEl) { placeholder.outerHTML = '<div class="file-placeholder">⚠️ Файл недоступен</div>'; return; }
   placeholder.parentNode.replaceChild(newEl, placeholder);
 }
-
 function checkVisibleMessages() { setTimeout(doCheckVisibleMessages, 300); }
 function doCheckVisibleMessages() {
   if (!activePeer) return;
@@ -2216,7 +2085,6 @@ function doCheckVisibleMessages() {
     fetch('/api/messages/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msgIds: unread, userId: currentUser.id }) }).catch(function () {});
   }
 }
-
 function openMsgActions(msg, el) {
   if (document.getElementById('msg-actions-sheet').classList.contains('active')) return;
   selectedMsgId = msg.id; selectedMsgObj = msg;
@@ -2268,8 +2136,7 @@ function generateVideoThumbnail(file, callback) {
       var canvas = document.createElement('canvas');
       canvas.width = video.videoWidth || 320;
       canvas.height = video.videoHeight || 240;
-      var ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
       callback(canvas.toDataURL('image/jpeg', 0.8));
     } catch (e) { callback(''); }
   };
@@ -2411,10 +2278,8 @@ async function sendMsg() {
   input.value = '';
   var isGroup = activePeer.type === 'group';
   var clientId = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
-
   var peerOnline = true;
   if (!isGroup && activePeer.isOnline === false) peerOnline = false;
-
   var optMsg = {
     id: clientId, clientId: clientId,
     senderId: currentUser.id,
@@ -2430,16 +2295,12 @@ async function sendMsg() {
     isWaiting: !peerOnline,
     encryptionVersion: 2
   };
-
   if (voiceToSend) {
     try {
       var encV = await encryptBlob(voiceToSend.blob);
       var encB64V = await blobToBase64(encV.blob);
       var wrapV = await wrapKeyForRecipients(encV.keyB64);
-      optMsg.encFileData = encB64V;
-      optMsg.fileIv = encV.ivB64;
-      optMsg.fileKeyEncByUser = wrapV;
-      optMsg.fileSize = encV.originalSize;
+      optMsg.encFileData = encB64V; optMsg.fileIv = encV.ivB64; optMsg.fileKeyEncByUser = wrapV; optMsg.fileSize = encV.originalSize;
       try { await saveFileToIDB(clientId, encV.blob, { fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: encV.blob.size }); } catch (e) {}
       cancelVoiceAttachment();
       mergeMessage(optMsg);
@@ -2449,77 +2310,51 @@ async function sendMsg() {
     } catch (e) { alert('Ошибка отправки голосового'); }
     return;
   }
-
   if (fileToSend && !fileToSend.isLarge) {
     try {
       var enc = await encryptBlob(fileToSend.file);
       var encB64 = await blobToBase64(enc.blob);
       var wrap = await wrapKeyForRecipients(enc.keyB64);
-      optMsg.encFileData = encB64;
-      optMsg.fileIv = enc.ivB64;
-      optMsg.fileKeyEncByUser = wrap;
-      optMsg.fileSize = enc.originalSize;
+      optMsg.encFileData = encB64; optMsg.fileIv = enc.ivB64; optMsg.fileKeyEncByUser = wrap; optMsg.fileSize = enc.originalSize;
       try { await saveFileToIDB(clientId, enc.blob, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: enc.blob.size }); } catch (e) {}
       cancelAttachment();
       mergeMessage(optMsg);
       renderMessagesContainer(getChatMessages(activePeer));
-      var p = await buildEncryptedPayload({
-        clientId: clientId, plainText: text,
-        encFileData: encB64, fileIv: enc.ivB64, fileKeyEncByUser: wrap,
-        fileName: fileToSend.name, fileType: fileToSend.type,
-        fileSize: enc.originalSize, thumbUrl: fileToSend.thumbUrl
-      });
+      var p = await buildEncryptedPayload({ clientId: clientId, plainText: text, encFileData: encB64, fileIv: enc.ivB64, fileKeyEncByUser: wrap, fileName: fileToSend.name, fileType: fileToSend.type, fileSize: enc.originalSize, thumbUrl: fileToSend.thumbUrl });
       await sendPayload(p);
     } catch (e) { alert('Ошибка чтения'); }
     return;
   }
-
   if (fileToSend && fileToSend.isLarge) {
-    optMsg.fileSize = fileToSend.file.size;
-    optMsg.fileType = fileToSend.type;
-    cancelAttachment();
-    mergeMessage(optMsg);
-    renderMessagesContainer(getChatMessages(activePeer));
+    optMsg.fileSize = fileToSend.file.size; optMsg.fileType = fileToSend.type;
+    cancelAttachment(); mergeMessage(optMsg); renderMessagesContainer(getChatMessages(activePeer));
     uploadLargeFileInBackground(clientId, fileToSend.file, fileToSend.name, fileToSend.type, text, fileToSend.thumbUrl);
     return;
   }
-
   var pT = await buildEncryptedPayload({ clientId: clientId, plainText: text });
-  optMsg.textEnc = pT.text;
-  optMsg.textKeyEncByUser = pT.textKeyEncByUser;
+  optMsg.textEnc = pT.text; optMsg.textKeyEncByUser = pT.textKeyEncByUser;
   mergeMessage(optMsg);
   renderMessagesContainer(getChatMessages(activePeer));
   await sendPayload(pT);
 }
-
 async function sendPayload(payload) {
   var isGroup = activePeer.type === 'group';
   try {
     var res = await fetch('/api/messages/send', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        senderId: currentUser.id,
-        receiverId: isGroup ? '' : activePeer.id,
-        groupId: isGroup ? activePeer.id : '',
-        text: payload.text || '',
-        fileData: '',
-        encFileData: payload.encFileData || '',
-        fileIv: payload.fileIv || '',
-        fileKeyEncByUser: payload.fileKeyEncByUser || null,
-        textKeyEncByUser: payload.textKeyEncByUser || null,
-        fileName: payload.fileName || '',
-        fileType: payload.fileType || '',
-        fileUrl: payload.fileUrl || '',
-        fileSize: payload.fileSize || 0,
-        thumbUrl: payload.thumbUrl || '',
-        clientId: payload.clientId,
-        encryptionVersion: 2
+        senderId: currentUser.id, receiverId: isGroup ? '' : activePeer.id, groupId: isGroup ? activePeer.id : '',
+        text: payload.text || '', fileData: '',
+        encFileData: payload.encFileData || '', fileIv: payload.fileIv || '',
+        fileKeyEncByUser: payload.fileKeyEncByUser || null, textKeyEncByUser: payload.textKeyEncByUser || null,
+        fileName: payload.fileName || '', fileType: payload.fileType || '', fileUrl: payload.fileUrl || '',
+        fileSize: payload.fileSize || 0, thumbUrl: payload.thumbUrl || '',
+        clientId: payload.clientId, encryptionVersion: 2
       })
     });
     if (res.status === 403) {
       localMessagesCache = localMessagesCache.filter(function (m) { return m.clientId !== payload.clientId; });
-      saveCache(); renderMessagesContainer(getChatMessages(activePeer));
-      alert('Чат заблокирован'); return;
+      saveCache(); renderMessagesContainer(getChatMessages(activePeer)); alert('Чат заблокирован'); return;
     }
     if (!res.ok) throw new Error('Server error');
     var data = await res.json();
@@ -2551,372 +2386,215 @@ async function sendPayload(payload) {
     else setConnectionState('server-offline');
   }
 }
-
 async function uploadLargeFileInBackground(clientId, file, fileName, fileType, text, thumbUrl) {
   try {
     var enc = await encryptBlob(file);
     var encFile = new File([enc.blob], 'enc.bin', { type: 'application/octet-stream' });
     var wrap = await wrapKeyForRecipients(enc.keyB64);
     try { await saveFileToIDB(clientId, enc.blob, { fileName: fileName, fileType: fileType, fileSize: enc.blob.size }); } catch (e) {}
-
-    var initRes = await fetch('/api/upload/init', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ senderId: currentUser.id, fileName: fileName, fileSize: encFile.size, fileType: 'application/octet-stream' })
-    });
+    var initRes = await fetch('/api/upload/init', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ senderId: currentUser.id, fileName: fileName, fileSize: encFile.size, fileType: 'application/octet-stream' }) });
     if (!initRes.ok) throw new Error('init failed');
     var initData = await initRes.json();
-    var fileId = initData.fileId;
-    var totalChunks = initData.totalChunks;
+    var fileId = initData.fileId; var totalChunks = initData.totalChunks;
     for (var i = 0; i < totalChunks; i++) {
-      var start = i * CHUNK_SIZE;
-      var end = Math.min(start + CHUNK_SIZE, encFile.size);
-      var chunk = encFile.slice(start, end);
-      var res = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, {
-        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk
-      });
+      var start = i * CHUNK_SIZE; var end = Math.min(start + CHUNK_SIZE, encFile.size); var chunk = encFile.slice(start, end);
+      var res = await fetch('/api/upload/chunk?fileId=' + encodeURIComponent(fileId) + '&chunkIndex=' + i, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk });
       if (!res.ok) throw new Error('chunk ' + i);
     }
     var finRes = await fetch('/api/upload/finish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fileId: fileId }) });
     if (!finRes.ok) throw new Error('finish');
     var fdata = await finRes.json();
-
     for (var j = 0; j < localMessagesCache.length; j++) {
       if (localMessagesCache[j].clientId === clientId) {
-        localMessagesCache[j].fileUrl = fdata.url;
-        localMessagesCache[j].fileKeyEncByUser = wrap;
-        localMessagesCache[j].fileIv = enc.ivB64;
-        localMessagesCache[j].fileSize = enc.originalSize;
-        localMessagesCache[j].fileType = fileType;
-        break;
+        localMessagesCache[j].fileUrl = fdata.url; localMessagesCache[j].fileKeyEncByUser = wrap;
+        localMessagesCache[j].fileIv = enc.ivB64; localMessagesCache[j].fileSize = enc.originalSize;
+        localMessagesCache[j].fileType = fileType; break;
       }
     }
     saveCache();
-
-    var p = await buildEncryptedPayload({
-      clientId: clientId, plainText: text,
-      fileUrl: fdata.url, fileName: fileName, fileType: fileType,
-      fileSize: enc.originalSize, thumbUrl: thumbUrl,
-      fileIv: enc.ivB64, fileKeyEncByUser: wrap
-    });
+    var p = await buildEncryptedPayload({ clientId: clientId, plainText: text, fileUrl: fdata.url, fileName: fileName, fileType: fileType, fileSize: enc.originalSize, thumbUrl: thumbUrl, fileIv: enc.ivB64, fileKeyEncByUser: wrap });
     await sendPayload(p);
-
     lastMessagesHash = '';
-    if (activePeer) {
-      if (fileUrlCache.has(clientId)) { try { URL.revokeObjectURL(fileUrlCache.get(clientId)); } catch (e) {} fileUrlCache.delete(clientId); }
-      renderMessagesContainer(getChatMessages(activePeer));
-    }
+    if (activePeer) { if (fileUrlCache.has(clientId)) { try { URL.revokeObjectURL(fileUrlCache.get(clientId)); } catch (e) {} fileUrlCache.delete(clientId); } renderMessagesContainer(getChatMessages(activePeer)); }
   } catch (e) { console.warn('Upload failed:', e); }
 }
-
-/* ==================== ЗВОНКИ (WebRTC) ==================== */
-var callPollingTimer = null;
-var currentCall = null;
-var incomingCall = null;
-
-function startCallPolling() {
-  if (callPollingTimer) clearInterval(callPollingTimer);
-  callPollingTimer = setInterval(pollCallSignals, 1000);
-  pollCallSignals();
-}
-async function pollCallSignals() {
-  if (!currentUser) return;
-  try {
-    var res = await fetch('/api/calls/poll?userId=' + encodeURIComponent(currentUser.id));
-    var data = await res.json();
-    if (!data.success) return;
-    (data.signals || []).forEach(handleCallSignal);
-  } catch (e) {}
-}
-
-function showCallOverlay() {
-  document.getElementById('call-overlay').classList.add('active');
-  document.getElementById('incoming-call-overlay').classList.remove('active');
-  document.getElementById('call-return-btn').style.display = 'none';
-  document.getElementById('call-in-progress-bar').style.display = 'none';
-}
-function hideCallOverlay() {
-  document.getElementById('call-overlay').classList.remove('active');
-}
-function minimizeCallOverlay() {
-  hideCallOverlay();
-  if (currentCall) {
-    document.getElementById('call-return-btn').style.display = 'flex';
-    document.getElementById('call-in-progress-bar').style.display = 'block';
-    document.getElementById('call-in-progress-name').innerText = currentCall.peerName || 'собеседником';
-  }
-}
-function restoreCallOverlay() {
-  if (!currentCall) {
-    document.getElementById('call-return-btn').style.display = 'none';
-    document.getElementById('call-in-progress-bar').style.display = 'none';
-    return;
-  }
-  document.getElementById('call-return-btn').style.display = 'none';
-  document.getElementById('call-in-progress-bar').style.display = 'none';
-  document.getElementById('call-overlay').classList.add('active');
-  updateCallOverlayUI();
-  if (currentCall.localStream) {
-    var lv = document.getElementById('call-local-video');
-    if (!lv.srcObject) lv.srcObject = currentCall.localStream;
-    lv.style.display = currentCall.camOn ? 'block' : 'none';
-  }
-  if (currentCall.remoteStream) {
-    var rv = document.getElementById('call-remote-video');
-    if (!rv.srcObject) rv.srcObject = currentCall.remoteStream;
-    rv.style.display = currentCall.video ? 'block' : 'none';
-  }
-}
-
-function updateCallOverlayUI() {
-  if (!currentCall) return;
-  var avatarEl = document.getElementById('call-peer-avatar');
-  if (currentCall.peerAvatar) avatarEl.innerHTML = '<img src="' + currentCall.peerAvatar + '">';
-  else avatarEl.innerText = (currentCall.peerName || '?').charAt(0).toUpperCase();
-  document.getElementById('call-peer-name').innerText = currentCall.peerName || 'Собеседник';
-  var statusEl = document.getElementById('call-status-text');
-  if (currentCall.status === 'ringing') statusEl.innerText = 'Вызов…';
-  else if (currentCall.status === 'connecting') statusEl.innerText = 'Соединение…';
-  else if (currentCall.status === 'active') statusEl.innerText = 'В звонке';
-  else statusEl.innerText = '';
-  document.getElementById('call-title').innerText = currentCall.video ? 'Видеозвонок' : 'Аудиозвонок';
-  document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
-  document.getElementById('ctrl-cam').classList.toggle('active', currentCall.camOn);
-  document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
-}
-
-async function startCall() {
-  if (!activePeer || activePeer.type === 'group') { alert('Групповые звонки не поддерживаются'); return; }
-  if (currentCall || incomingCall) { alert('Уже есть активный звонок'); return; }
-  var video = confirm('Видеозвонок?\nOK — с камерой, Отмена — только аудио');
-  try {
-    var res = await fetch('/api/calls/start', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fromId: currentUser.id, toId: activePeer.id, video: video })
-    });
-    var data = await res.json();
-    if (!data.success) { alert(data.error || 'Не удалось'); return; }
-    currentCall = {
-      callId: data.callId, role: 'caller', peerId: activePeer.id,
-      peerName: activePeer.name, peerAvatar: activePeer.avatar || '',
-      video: video, pc: null, localStream: null, remoteStream: null,
-      startedAt: Date.now(), micOn: true, camOn: video, facing: 'user', status: 'ringing'
-    };
-    showCallOverlay();
-    updateCallOverlayUI();
-    await setupLocalMedia(video);
-    await createPeerConnection();
-    updateCallOverlayUI();
-  } catch (e) { console.warn('startCall', e); alert('Ошибка звонка'); }
-}
-
-async function acceptIncomingCall() {
-  if (!incomingCall) return;
-  var c = incomingCall;
-  incomingCall = null;
-  document.getElementById('incoming-call-overlay').classList.remove('active');
-  currentCall = {
-    callId: c.callId, role: 'callee', peerId: c.fromId,
-    peerName: c.fromName, peerAvatar: c.fromAvatar,
-    video: !!c.video, pc: null, localStream: null, remoteStream: null,
-    startedAt: Date.now(), micOn: true, camOn: !!c.video, facing: 'user', status: 'connecting'
-  };
-  showCallOverlay();
-  updateCallOverlayUI();
-  try {
-    await fetch('/api/calls/answer', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callId: currentCall.callId, userId: currentUser.id, accept: true })
-    });
-  } catch (e) {}
-  await setupLocalMedia(currentCall.video);
-  await createPeerConnection();
-  updateCallOverlayUI();
-}
-async function rejectIncomingCall() {
-  if (!incomingCall) return;
-  var c = incomingCall;
-  incomingCall = null;
-  document.getElementById('incoming-call-overlay').classList.remove('active');
-  try {
-    await fetch('/api/calls/answer', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callId: c.callId, userId: currentUser.id, accept: false })
-    });
-  } catch (e) {}
-}
-
-async function setupLocalMedia(wantVideo) {
-  var constraints = { audio: true, video: wantVideo ? { facingMode: currentCall.facing || 'user' } : false };
-  try {
-    var stream = await navigator.mediaDevices.getUserMedia(constraints);
-    currentCall.localStream = stream;
-    var localVideo = document.getElementById('call-local-video');
-    localVideo.srcObject = stream;
-    localVideo.style.display = wantVideo ? 'block' : 'none';
-    var audioScreen = document.getElementById('call-audio-screen');
-    audioScreen.style.display = wantVideo ? 'none' : 'flex';
-  } catch (e) {
-    if (wantVideo) {
-      try {
-        var s2 = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        currentCall.localStream = s2;
-        currentCall.video = false;
-        currentCall.camOn = false;
-        document.getElementById('call-local-video').style.display = 'none';
-        document.getElementById('call-audio-screen').style.display = 'flex';
-      } catch (e2) { alert('Нет доступа к камере/микрофону'); endCurrentCall(); }
-    } else { alert('Нет доступа к микрофону'); endCurrentCall(); }
-  }
-}
-
-async function createPeerConnection() {
-  var pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-  currentCall.pc = pc;
-  if (currentCall.localStream) {
-    currentCall.localStream.getTracks().forEach(function (t) { pc.addTrack(t, currentCall.localStream); });
-  }
-  pc.ontrack = function (e) {
-    if (e.streams && e.streams[0]) {
-      currentCall.remoteStream = e.streams[0];
-      var rv = document.getElementById('call-remote-video');
-      rv.srcObject = e.streams[0];
-      if (currentCall.video) {
-        rv.style.display = 'block';
-        document.getElementById('call-audio-screen').style.display = 'none';
-      } else {
-        rv.style.display = 'none';
-        document.getElementById('call-audio-screen').style.display = 'flex';
-      }
-    }
-  };
-  pc.onicecandidate = function (e) {
-    if (e.candidate) sendCallSignal('ice', { candidate: e.candidate });
-  };
-  pc.onconnectionstatechange = function () {
-    if (pc.connectionState === 'connected') {
-      currentCall.status = 'active';
-      updateCallOverlayUI();
-    }
-  };
-  if (currentCall.role === 'caller') {
-    var offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendCallSignal('offer', { sdp: offer });
-  }
-}
-
-async function sendCallSignal(type, payload) {
-  if (!currentCall) return;
-  try {
-    await fetch('/api/calls/signal', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callId: currentCall.callId, fromId: currentUser.id, toId: currentCall.peerId, type: type, payload: payload })
-    });
-  } catch (e) {}
-}
-
-async function handleCallSignal(sig) {
-  if (sig.type === 'offer-start') {
-    if (currentCall || incomingCall) return;
-    incomingCall = { callId: sig.callId, fromId: sig.from, fromName: sig.payload.fromName || 'Пользователь', fromAvatar: sig.payload.fromAvatar || '', video: !!sig.payload.video };
-    document.getElementById('incoming-avatar').innerHTML = incomingCall.fromAvatar ? '<img src="' + incomingCall.fromAvatar + '">' : (incomingCall.fromName.charAt(0).toUpperCase());
-    document.getElementById('incoming-name').innerText = incomingCall.fromName;
-    document.getElementById('incoming-status-text').innerText = incomingCall.video ? 'Входящий видеозвонок…' : 'Входящий звонок…';
-    document.getElementById('incoming-call-overlay').classList.add('active');
-    playNotificationSound();
-    return;
-  }
-  if (!currentCall || sig.callId !== currentCall.callId) return;
-  if (sig.type === 'accepted') {
-    currentCall.status = 'connecting';
-    updateCallOverlayUI();
-  } else if (sig.type === 'rejected' || sig.type === 'ended') {
-    endCurrentCall(true);
-  } else if (sig.type === 'offer') {
+async function retryPendingMessages() {
+  if (!currentUser || isRetrying) return;
+  var pending = localMessagesCache.filter(function (m) { return (m.isPending || m.isWaiting) && m.senderId === currentUser.id && m.clientId; });
+  if (pending.length === 0) return;
+  isRetrying = true;
+  var anySuccess = false;
+  for (var i = 0; i < pending.length; i++) {
+    var pm = pending[i];
     try {
-      await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp));
-      var answer = await currentCall.pc.createAnswer();
-      await currentCall.pc.setLocalDescription(answer);
-      sendCallSignal('answer', { sdp: answer });
-    } catch (e) {}
-  } else if (sig.type === 'answer') {
-    try { await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp)); } catch (e) {}
-  } else if (sig.type === 'ice') {
-    try { await currentCall.pc.addIceCandidate(new RTCIceCandidate(sig.payload.candidate)); } catch (e) {}
-  }
-}
-
-function toggleCallMic() {
-  if (!currentCall || !currentCall.localStream) return;
-  var audioTracks = currentCall.localStream.getAudioTracks();
-  currentCall.micOn = !currentCall.micOn;
-  audioTracks.forEach(function (t) { t.enabled = currentCall.micOn; });
-  document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
-  document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
-}
-async function toggleCallCam() {
-  if (!currentCall) return;
-  if (!currentCall.camOn) {
-    try {
-      var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing || 'user' } });
-      currentCall.localStream = currentCall.localStream || new MediaStream();
-      vs.getVideoTracks().forEach(function (t) {
-        currentCall.localStream.addTrack(t);
-        if (currentCall.pc) {
-          var sender = currentCall.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
-          if (sender) sender.replaceTrack(t); else currentCall.pc.addTrack(t, currentCall.localStream);
+      var body = {
+        senderId: pm.senderId, receiverId: pm.receiverId || '', groupId: pm.groupId || '',
+        text: pm.textEnc || (pm.text ? '__PLAIN__' : ''), fileData: '',
+        fileName: pm.fileName || '', fileType: pm.fileType || '', clientId: pm.clientId,
+        fileUrl: pm.fileUrl || '', fileSize: pm.fileSize || 0, thumbUrl: pm.thumbUrl || '',
+        encFileData: pm.encFileData || '', fileIv: pm.fileIv || '',
+        fileKeyEncByUser: pm.fileKeyEncByUser || null, textKeyEncByUser: pm.textKeyEncByUser || null,
+        encryptionVersion: pm.encryptionVersion || 2
+      };
+      var res = await fetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (res.ok) {
+        var data = await res.json();
+        if (data && data.message) {
+          var rm = Object.assign({}, data.message); rm.isPending = false; rm.isWaiting = false; rm.text = pm.text || '';
+          try {
+            var entry = await getFileFromIDB(pm.clientId);
+            if (entry && entry.blob) {
+              await saveFileToIDB(rm.id, entry.blob, { fileName: rm.fileName, fileType: rm.fileType, fileSize: entry.blob.size });
+              await deleteFileFromIDB(pm.clientId);
+              if (fileUrlCache.has(pm.clientId)) { fileUrlCache.set(rm.id, fileUrlCache.get(pm.clientId)); fileUrlCache.delete(pm.clientId); }
+            }
+          } catch (e) {}
+          for (var j = 0; j < localMessagesCache.length; j++) {
+            if (localMessagesCache[j].clientId === pm.clientId) { localMessagesCache[j] = rm; break; }
+          }
+          anySuccess = true;
         }
-      });
-      currentCall.camOn = true;
-      currentCall.video = true;
-      document.getElementById('call-local-video').srcObject = currentCall.localStream;
-      document.getElementById('call-local-video').style.display = 'block';
-      document.getElementById('call-audio-screen').style.display = currentCall.remoteStream ? 'none' : 'flex';
-      document.getElementById('ctrl-cam').classList.add('active');
-    } catch (e) { alert('Камера недоступна'); }
+      }
+    } catch (e) { break; }
+  }
+  if (anySuccess) { saveCache(); if (activePeer) renderMessagesContainer(getChatMessages(activePeer)); }
+  isRetrying = false;
+}
+
+/* ==================== ПРОФИЛЬ ==================== */
+function openMyProfile() {
+  if (isModalOpen('my-profile-modal')) return;
+  document.getElementById('edit-my-name-input').value = currentUser.name;
+  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
+  document.getElementById('my-profile-name-view').innerText = currentUser.name;
+  document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
+  document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
+  safeOpenModal('my-profile-modal');
+}
+function closeMyProfile() { safeCloseModal('my-profile-modal'); }
+function triggerAvatarInput() { var i = document.getElementById('avatar-file-input'); i.value = ''; i.click(); }
+function handleAvatarSelect(e) {
+  var file = e.target.files[0]; if (!file) return;
+  if (file.size > 10 * 1024 * 1024) { alert('Максимум 10 МБ'); return; }
+  compressImage(file, 200, 0.85, function (c) {
+    if (!c) return;
+    currentUser.avatar = c;
+    renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: c, name: currentUser.name }, true);
+    document.getElementById('remove-avatar-link-btn').style.display = 'block';
+  });
+}
+function removeMyAvatar() {
+  currentUser.avatar = '';
+  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: '', name: currentUser.name }, true);
+  document.getElementById('remove-avatar-link-btn').style.display = 'none';
+}
+async function saveMyProfileChanges() {
+  if (!lockButton('save-my-profile-btn', 3000)) return;
+  var newName = document.getElementById('edit-my-name-input').value.trim();
+  if (newName) currentUser.name = newName;
+  try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+  updateMyProfileUI();
+  try {
+    var res = await fetch('/api/profile/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar }) });
+    var data = await res.json();
+    if (data.success) {
+      currentUser = data.user;
+      try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+      updateMyProfileUI();
+      loadOnlineUsers();
+    }
+  } catch (e) {}
+  closeMyProfile();
+}
+function openPeerProfile() {
+  if (!activePeer) return;
+  if (activePeer.type === 'group') { openGroupProfile(); return; }
+  profileTargetId = activePeer.id;
+  if (isModalOpen('peer-profile-modal')) return;
+  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
+  document.getElementById('peer-profile-name-view').innerText = activePeer.name;
+  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
+  updatePeerProfileButtons(activePeer);
+  safeOpenModal('peer-profile-modal');
+}
+function updatePeerProfileButtons(user) {
+  var b = document.getElementById('block-peer-btn');
+  var blocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(user.id) !== -1;
+  b.innerText = blocked ? 'Разблокировать' : 'Заблокировать';
+  b.className = blocked ? 'btn btn-secondary' : 'btn btn-danger';
+  var m = document.getElementById('mute-peer-btn');
+  var muted = mutedPeers.indexOf(user.id) !== -1;
+  m.innerText = muted ? 'Включить звук' : 'Выключить звук';
+  m.className = muted ? 'btn' : 'btn btn-secondary';
+}
+function openMemberProfile(member) {
+  profileTargetId = member.id;
+  if (isModalOpen('peer-profile-modal')) return;
+  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, member.isOnline);
+  document.getElementById('peer-profile-name-view').innerText = member.name;
+  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + member.id;
+  updatePeerProfileButtons(member);
+  safeOpenModal('peer-profile-modal');
+}
+function closePeerProfile() { safeCloseModal('peer-profile-modal'); }
+function toggleMutePeer() {
+  if (!profileTargetId) return;
+  var i = mutedPeers.indexOf(profileTargetId);
+  if (i > -1) mutedPeers.splice(i, 1); else mutedPeers.push(profileTargetId);
+  localStorage.setItem('messenger_muted_peers', JSON.stringify(mutedPeers));
+  updatePeerProfileButtons({ id: profileTargetId });
+}
+async function toggleBlockPeer() {
+  if (!profileTargetId) return;
+  if (!lockButton('block-peer-btn', 2000)) return;
+  var blocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(profileTargetId) !== -1;
+  var nextBlock = !blocked;
+  try {
+    var res = await fetch('/api/users/block', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: currentUser.id, peerId: profileTargetId, block: nextBlock }) });
+    var data = await res.json();
+    if (data.success) {
+      currentUser.blockedContacts = data.blockedContacts;
+      try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+      closePeerProfile(); loadOnlineUsers();
+    }
+  } catch (e) {}
+}
+
+function updateChatMenu() {
+  var menu = document.getElementById('chat-dropdown-menu');
+  if (activePeer && activePeer.type === 'group') {
+    menu.innerHTML = '<button class="menu-item" onclick="openGroupProfile()">Профиль группы</button><button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="leaveGroup()">Покинуть</button>';
   } else {
-    currentCall.localStream.getVideoTracks().forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
-    currentCall.camOn = false;
-    document.getElementById('call-local-video').style.display = 'none';
-    document.getElementById('ctrl-cam').classList.remove('active');
+    menu.innerHTML = '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="deleteCurrentChat()">Удалить чат</button>';
   }
 }
-async function flipCallCamera() {
-  if (!currentCall || !currentCall.camOn) return;
-  currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user';
-  try {
-    var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing } });
-    var newTrack = vs.getVideoTracks()[0];
-    var oldTracks = currentCall.localStream.getVideoTracks();
-    oldTracks.forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
-    currentCall.localStream.addTrack(newTrack);
-    var sender = currentCall.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
-    if (sender) await sender.replaceTrack(newTrack);
-    document.getElementById('call-local-video').srcObject = currentCall.localStream;
-  } catch (e) { currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user'; }
+async function clearChatHistory() {
+  closeChatDropdown();
+  if (!activePeer || !confirm('Очистить историю?')) return;
+  var isGroup = activePeer.type === 'group';
+  try { await fetch('/api/chat/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(isGroup ? { userId: currentUser.id, groupId: activePeer.id } : { userId: currentUser.id, peerId: activePeer.id }) }); } catch (e) {}
+  var ids = [];
+  getChatMessages(activePeer).forEach(function (m) { m.isDeleted = true; markDeleted(m.id); ids.push(m.id); });
+  for (var i = 0; i < ids.length; i++) await deleteFileFromIDB(ids[i]);
+  saveCache(); lastMessagesHash = ''; loadMessages();
+}
+function markDeleted(msgId) { deletedIds[msgId] = true; try { localStorage.setItem('messenger_deleted_ids', JSON.stringify(deletedIds)); } catch (e) {} }
+function loadDeletedIds() { try { deletedIds = JSON.parse(localStorage.getItem('messenger_deleted_ids') || '{}'); } catch (e) { deletedIds = {}; } }
+async function deleteCurrentChat() {
+  closeChatDropdown();
+  if (!activePeer || !confirm('Удалить чат?')) return;
+  try { await fetch('/api/chat/hide', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id }) }); resetActiveChat(); loadOnlineUsers(); } catch (e) {}
+}
+function resetActiveChat() {
+  cancelVoiceAttachment(); cancelAttachment(); closeMobileChat(); activePeer = null;
+  document.getElementById('input-bar').style.display = 'none';
+  document.getElementById('call-btn').style.display = 'none';
+  document.getElementById('active-peer-name').innerText = 'Выберите чат';
+  document.getElementById('active-peer-status').innerText = 'нажмите для профиля';
+  document.getElementById('messages-container').innerHTML = '<div class="empty-state">Выберите диалог</div>';
 }
 
-async function endCurrentCall(silent) {
-  var c = currentCall;
-  currentCall = null;
-  hideCallOverlay();
-  document.getElementById('call-return-btn').style.display = 'none';
-  document.getElementById('call-in-progress-bar').style.display = 'none';
-  if (!c) return;
-  try { await fetch('/api/calls/end', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: c.callId, userId: currentUser.id }) }); } catch (e) {}
-  try { if (c.pc) c.pc.close(); } catch (e) {}
-  try { if (c.localStream) c.localStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-  var rv = document.getElementById('call-remote-video');
-  rv.srcObject = null; rv.style.display = 'none';
-  var lv = document.getElementById('call-local-video');
-  lv.srcObject = null; lv.style.display = 'none';
-  document.getElementById('call-audio-screen').style.display = 'flex';
-  document.getElementById('ctrl-mic').classList.add('active');
-  document.getElementById('ctrl-mic').innerText = '🎤';
-  document.getElementById('ctrl-cam').classList.remove('active');
-}
-
-/* ==================== ГРУППЫ / КОНТАКТЫ ==================== */
+/* ==================== ГРУППЫ ==================== */
 async function getContactUsers() {
   var arr = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
@@ -2936,16 +2614,14 @@ function renderCheckList(containerId, users, excludeSet) {
   if (list.length === 0) { c.innerHTML = '<div style="color:var(--text-muted); font-size:13px; padding:8px;">Нет контактов</div>'; return; }
   list.forEach(function (u) {
     var row = document.createElement('label');
-    row.className = 'check-row';
     row.style.cssText = 'display:flex; align-items:center; gap:10px; padding:8px; cursor:pointer; border-bottom:1px solid var(--border);';
     var avatarId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    row.innerHTML = '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;flex-shrink:0;"><div class="avatar-circle" id="' + avatarId + '" style="width:32px;height:32px;font-size:13px;"></div><span style="flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">' + escapeHtml(u.name) + '</span>';
+    row.innerHTML = '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;"><div class="avatar-circle" id="' + avatarId + '" style="width:32px;height:32px;font-size:13px;"></div><span style="flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">' + escapeHtml(u.name) + '</span>';
     c.appendChild(row);
     renderAvatarIntoElement(document.getElementById(avatarId), u, false);
   });
 }
 function getChecked(containerId) { return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; }); }
-
 async function openCreateGroup() {
   if (isModalOpen('create-group-modal')) return;
   groupDraftAvatar = '';
@@ -2958,13 +2634,12 @@ async function openCreateGroup() {
   }
   renderCheckList('create-group-contacts', cached, new Set());
   safeOpenModal('create-group-modal');
-  getContactUsers().then(function (contacts) { if (contacts.length !== cached.length) renderCheckList('create-group-contacts', contacts, new Set()); }).catch(function () {});
+  getContactUsers().then(function (c) { if (c.length !== cached.length) renderCheckList('create-group-contacts', c, new Set()); });
 }
 function closeCreateGroup() { safeCloseModal('create-group-modal'); }
 function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
 function handleGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
-  if (file.size > 10 * 1024 * 1024) { alert('Максимум 10 МБ'); return; }
   compressImage(file, 200, 0.85, function (c) { if (!c) return; groupDraftAvatar = c; fillAvatarBox(document.getElementById('create-group-avatar'), groupDraftAvatar, '👥'); });
 }
 async function submitCreateGroup() {
@@ -3021,8 +2696,7 @@ function renderMembersList(containerId, memberDetails, ownerId) {
   var amOwner = ownerId === currentUser.id;
   memberDetails.forEach(function (u) {
     var row = document.createElement('div'); row.className = 'member-row';
-    var isOwner = u.id === ownerId;
-    var isMe = u.id === currentUser.id;
+    var isOwner = u.id === ownerId; var isMe = u.id === currentUser.id;
     var info = document.createElement('div');
     info.style.cssText = 'display:flex; align-items:center; gap:10px; flex:1; overflow:hidden;';
     info.innerHTML = '<div class="avatar-circle" style="width:32px;height:32px;font-size:13px;"></div><div style="flex:1; text-align:left; overflow:hidden;"><div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(u.name) + (isMe ? ' (вы)' : '') + '</div>' + (isOwner ? '<div style="font-size:11px; color:var(--accent);">создатель</div>' : '') + '</div>';
@@ -3041,17 +2715,15 @@ function renderMembersList(containerId, memberDetails, ownerId) {
 function openMemberDropdown(rowEl, member) {
   closeMemberDropdown();
   var dd = document.createElement('div');
-  dd.className = 'member-dropdown active';
-  dd.dataset.memberId = member.id;
-  dd.innerHTML = '<button class="menu-item" data-action="profile">Открыть профиль</button><button class="menu-item danger" data-action="kick">Выгнать</button>';
+  dd.className = 'member-dropdown active'; dd.dataset.memberId = member.id;
+  dd.innerHTML = '<button class="menu-item" data-action="profile">Профиль</button><button class="menu-item danger" data-action="kick">Выгнать</button>';
   dd.addEventListener('click', function (e) {
     e.stopPropagation();
     var a = e.target.getAttribute('data-action');
     if (a === 'profile') { closeMemberDropdown(); openMemberProfile(member); }
     else if (a === 'kick') { closeMemberDropdown(); kickMember(member); }
   });
-  rowEl.appendChild(dd);
-  activeMemberDropdown = dd;
+  rowEl.appendChild(dd); activeMemberDropdown = dd;
   setTimeout(function () { document.addEventListener('click', function h(ev) { if (activeMemberDropdown && !activeMemberDropdown.contains(ev.target)) { closeMemberDropdown(); document.removeEventListener('click', h); } }); }, 0);
 }
 function closeMemberDropdown() { if (activeMemberDropdown && activeMemberDropdown.parentNode) activeMemberDropdown.parentNode.removeChild(activeMemberDropdown); activeMemberDropdown = null; }
@@ -3079,7 +2751,6 @@ async function deleteGroup() {
 function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
 function handleEditGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
-  if (file.size > 10 * 1024 * 1024) { alert('Максимум 10 МБ'); return; }
   compressImage(file, 200, 0.85, function (c) { if (!c) return; editGroupDraftAvatar = c; fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥'); });
 }
 async function saveGroupChanges() {
@@ -3107,7 +2778,7 @@ async function openAddMembers() {
   }
   renderCheckList('add-members-contacts', cached, exclude);
   safeOpenModal('add-members-modal');
-  getContactUsers().then(function (contacts) { renderCheckList('add-members-contacts', contacts, exclude); }).catch(function () {});
+  getContactUsers().then(function (c) { renderCheckList('add-members-contacts', c, exclude); });
 }
 function closeAddMembers() { safeCloseModal('add-members-modal'); }
 async function submitAddMembers() {
@@ -3125,162 +2796,207 @@ async function leaveGroup() {
   closeChatDropdown();
   if (!activePeer || activePeer.type !== 'group') return;
   if (!confirm('Покинуть группу?')) return;
+  try { await fetch('/api/groups/leave', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id }) }); closeGroupProfile(); resetActiveChat(); loadOnlineUsers(); } catch (e) {}
+}
+
+/* ==================== ЗВОНКИ ==================== */
+var callPollingTimer = null;
+var currentCall = null;
+var incomingCall = null;
+function startCallPolling() { if (callPollingTimer) clearInterval(callPollingTimer); callPollingTimer = setInterval(pollCalls, 1000); pollCalls(); }
+async function pollCalls() {
+  if (!currentUser) return;
   try {
-    await fetch('/api/groups/leave', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id }) });
-    closeGroupProfile(); resetActiveChat(); loadOnlineUsers();
+    var res = await fetch('/api/calls/poll?userId=' + encodeURIComponent(currentUser.id));
+    var data = await res.json();
+    if (!data.success) return;
+    (data.signals || []).forEach(handleSig);
   } catch (e) {}
 }
-function resetActiveChat() {
-  cancelVoiceAttachment(); cancelAttachment(); closeMobileChat(); activePeer = null;
-  document.getElementById('input-bar').style.display = 'none';
-  document.getElementById('call-btn').style.display = 'none';
-  document.getElementById('active-peer-name').innerText = 'Выберите чат';
-  document.getElementById('active-peer-status').innerText = 'нажмите для профиля';
-  document.getElementById('messages-container').innerHTML = '<div class="empty-state">Выберите диалог</div>';
+function showCallOverlay() {
+  document.getElementById('call-overlay').classList.add('active');
+  document.getElementById('incoming-call-overlay').classList.remove('active');
+  document.getElementById('call-return-btn').style.display = 'none';
+  document.getElementById('call-in-progress-bar').style.display = 'none';
 }
-function updateChatMenu() {
-  var menu = document.getElementById('chat-dropdown-menu');
-  if (activePeer && activePeer.type === 'group') {
-    menu.innerHTML = '<button class="menu-item" onclick="openGroupProfile()">Профиль группы</button><button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="leaveGroup()">Покинуть</button>';
-  } else {
-    menu.innerHTML = '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="deleteCurrentChat()">Удалить чат</button>';
+function hideCallOverlay() { document.getElementById('call-overlay').classList.remove('active'); }
+function minimizeCallOverlay() {
+  hideCallOverlay();
+  if (currentCall) {
+    document.getElementById('call-return-btn').style.display = 'flex';
+    document.getElementById('call-in-progress-bar').style.display = 'block';
+    document.getElementById('call-in-progress-name').innerText = currentCall.peerName || 'собеседником';
   }
 }
-async function clearChatHistory() {
-  closeChatDropdown();
-  if (!activePeer || !confirm('Очистить историю?')) return;
-  var isGroup = activePeer.type === 'group';
+function restoreCallOverlay() {
+  if (!currentCall) { document.getElementById('call-return-btn').style.display = 'none'; document.getElementById('call-in-progress-bar').style.display = 'none'; return; }
+  document.getElementById('call-return-btn').style.display = 'none';
+  document.getElementById('call-in-progress-bar').style.display = 'none';
+  document.getElementById('call-overlay').classList.add('active');
+  updateCallUI();
+  if (currentCall.localStream) { var lv = document.getElementById('call-local-video'); if (!lv.srcObject) lv.srcObject = currentCall.localStream; lv.style.display = currentCall.camOn ? 'block' : 'none'; }
+  if (currentCall.remoteStream) { var rv = document.getElementById('call-remote-video'); if (!rv.srcObject) rv.srcObject = currentCall.remoteStream; rv.style.display = currentCall.video ? 'block' : 'none'; }
+}
+function updateCallUI() {
+  if (!currentCall) return;
+  var a = document.getElementById('call-peer-avatar');
+  if (currentCall.peerAvatar) a.innerHTML = '<img src="' + currentCall.peerAvatar + '">';
+  else a.innerText = (currentCall.peerName || '?').charAt(0).toUpperCase();
+  document.getElementById('call-peer-name').innerText = currentCall.peerName || 'Собеседник';
+  var s = document.getElementById('call-status-text');
+  if (currentCall.status === 'ringing') s.innerText = 'Вызов...';
+  else if (currentCall.status === 'connecting') s.innerText = 'Соединение...';
+  else if (currentCall.status === 'active') s.innerText = 'В звонке';
+  document.getElementById('call-title').innerText = currentCall.video ? 'Видеозвонок' : 'Аудиозвонок';
+  document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
+  document.getElementById('ctrl-cam').classList.toggle('active', currentCall.camOn);
+  document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
+}
+async function startCall() {
+  if (!activePeer || activePeer.type === 'group') { alert('Групповые звонки не поддерживаются'); return; }
+  if (currentCall || incomingCall) { alert('Уже есть звонок'); return; }
+  var video = confirm('Видеозвонок? OK - с камерой, Отмена - только аудио');
   try {
-    await fetch('/api/chat/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(isGroup ? { userId: currentUser.id, groupId: activePeer.id } : { userId: currentUser.id, peerId: activePeer.id }) });
-  } catch (e) {}
-  var ids = [];
-  getChatMessages(activePeer).forEach(function (m) { m.isDeleted = true; markDeleted(m.id); ids.push(m.id); });
-  for (var i = 0; i < ids.length; i++) await deleteFileFromIDB(ids[i]);
-  saveCache();
-  lastMessagesHash = '';
-  loadMessages();
-}
-function markDeleted(msgId) {
-  deletedIds[msgId] = true;
-  try { localStorage.setItem('messenger_deleted_ids', JSON.stringify(deletedIds)); } catch (e) {}
-}
-function loadDeletedIds() {
-  try { deletedIds = JSON.parse(localStorage.getItem('messenger_deleted_ids') || '{}'); } catch (e) { deletedIds = {}; }
-}
-async function deleteCurrentChat() {
-  closeChatDropdown();
-  if (!activePeer || !confirm('Удалить чат?')) return;
-  try {
-    await fetch('/api/chat/hide', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: currentUser.id, peerId: activePeer.id }) });
-    resetActiveChat(); loadOnlineUsers();
-  } catch (e) {}
-}
-
-/* ==================== ПРОФИЛЬ ==================== */
-function openMyProfile() {
-  if (isModalOpen('my-profile-modal')) return;
-  document.getElementById('edit-my-name-input').value = currentUser.name;
-  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
-  document.getElementById('my-profile-name-view').innerText = currentUser.name;
-  document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
-  document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
-  safeOpenModal('my-profile-modal');
-}
-function closeMyProfile() { safeCloseModal('my-profile-modal'); }
-function triggerAvatarInput() { var i = document.getElementById('avatar-file-input'); i.value = ''; i.click(); }
-function handleAvatarSelect(e) {
-  var file = e.target.files[0]; if (!file) return;
-  if (file.size > 10 * 1024 * 1024) { alert('Максимум 10 МБ'); return; }
-  compressImage(file, 200, 0.85, function (c) {
-    if (!c) return;
-    currentUser.avatar = c;
-    renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: c, name: currentUser.name }, true);
-    document.getElementById('remove-avatar-link-btn').style.display = 'block';
-  });
-}
-function removeMyAvatar() {
-  currentUser.avatar = '';
-  renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), { id: currentUser.id, avatar: '', name: currentUser.name }, true);
-  document.getElementById('remove-avatar-link-btn').style.display = 'none';
-}
-async function saveMyProfileChanges() {
-  if (!lockButton('save-my-profile-btn', 3000)) return;
-  var newName = document.getElementById('edit-my-name-input').value.trim();
-  if (newName) currentUser.name = newName;
-  try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
-  updateMyProfileUI();
-  try {
-    var res = await fetch('/api/profile/update', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar })
-    });
+    var res = await fetch('/api/calls/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fromId: currentUser.id, toId: activePeer.id, video: video }) });
     var data = await res.json();
-    if (data.success) {
-      currentUser = data.user;
-      try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
-      updateMyProfileUI();
-      loadOnlineUsers();
-    }
-  } catch (e) {}
-  closeMyProfile();
+    if (!data.success) { alert(data.error || 'Ошибка'); return; }
+    currentCall = { callId: data.callId, role: 'caller', peerId: activePeer.id, peerName: activePeer.name, peerAvatar: activePeer.avatar || '', video: video, pc: null, localStream: null, remoteStream: null, startedAt: Date.now(), micOn: true, camOn: video, facing: 'user', status: 'ringing' };
+    showCallOverlay(); updateCallUI();
+    await setupLocalMedia(video);
+    await createPC();
+    updateCallUI();
+  } catch (e) { console.warn('startCall', e); alert('Ошибка звонка'); }
 }
-
-function openPeerProfile() {
-  if (!activePeer) return;
-  if (activePeer.type === 'group') { openGroupProfile(); return; }
-  profileTargetId = activePeer.id;
-  if (isModalOpen('peer-profile-modal')) return;
-  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
-  document.getElementById('peer-profile-name-view').innerText = activePeer.name;
-  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
-  updatePeerProfileButtons(activePeer);
-  safeOpenModal('peer-profile-modal');
+async function acceptIncomingCall() {
+  if (!incomingCall) return;
+  var c = incomingCall; incomingCall = null;
+  document.getElementById('incoming-call-overlay').classList.remove('active');
+  currentCall = { callId: c.callId, role: 'callee', peerId: c.fromId, peerName: c.fromName, peerAvatar: c.fromAvatar, video: !!c.video, pc: null, localStream: null, remoteStream: null, startedAt: Date.now(), micOn: true, camOn: !!c.video, facing: 'user', status: 'connecting' };
+  showCallOverlay(); updateCallUI();
+  try { await fetch('/api/calls/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: currentCall.callId, userId: currentUser.id, accept: true }) }); } catch (e) {}
+  await setupLocalMedia(currentCall.video);
+  await createPC();
+  updateCallUI();
 }
-function updatePeerProfileButtons(user) {
-  var b = document.getElementById('block-peer-btn');
-  var blocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(user.id) !== -1;
-  b.innerText = blocked ? 'Разблокировать' : 'Заблокировать';
-  b.className = blocked ? 'btn btn-secondary' : 'btn btn-danger';
-  var m = document.getElementById('mute-peer-btn');
-  var muted = mutedPeers.indexOf(user.id) !== -1;
-  m.innerText = muted ? 'Включить звук' : 'Выключить звук';
-  m.className = muted ? 'btn' : 'btn btn-secondary';
+async function rejectIncomingCall() {
+  if (!incomingCall) return;
+  var c = incomingCall; incomingCall = null;
+  document.getElementById('incoming-call-overlay').classList.remove('active');
+  try { await fetch('/api/calls/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: c.callId, userId: currentUser.id, accept: false }) }); } catch (e) {}
 }
-function openMemberProfile(member) {
-  profileTargetId = member.id;
-  if (isModalOpen('peer-profile-modal')) return;
-  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, member.isOnline);
-  document.getElementById('peer-profile-name-view').innerText = member.name;
-  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + member.id;
-  updatePeerProfileButtons(member);
-  safeOpenModal('peer-profile-modal');
-}
-function closePeerProfile() { safeCloseModal('peer-profile-modal'); }
-function toggleMutePeer() {
-  if (!profileTargetId) return;
-  var i = mutedPeers.indexOf(profileTargetId);
-  if (i > -1) mutedPeers.splice(i, 1); else mutedPeers.push(profileTargetId);
-  localStorage.setItem('messenger_muted_peers', JSON.stringify(mutedPeers));
-  updatePeerProfileButtons({ id: profileTargetId });
-}
-async function toggleBlockPeer() {
-  if (!profileTargetId) return;
-  if (!lockButton('block-peer-btn', 2000)) return;
-  var blocked = currentUser.blockedContacts && currentUser.blockedContacts.indexOf(profileTargetId) !== -1;
-  var nextBlock = !blocked;
+async function setupLocalMedia(wantVideo) {
+  var constraints = { audio: true, video: wantVideo ? { facingMode: currentCall.facing || 'user' } : false };
   try {
-    var res = await fetch('/api/users/block', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUser.id, peerId: profileTargetId, block: nextBlock })
-    });
-    var data = await res.json();
-    if (data.success) {
-      currentUser.blockedContacts = data.blockedContacts;
-      try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
-      closePeerProfile();
-      loadOnlineUsers();
+    var stream = await navigator.mediaDevices.getUserMedia(constraints);
+    currentCall.localStream = stream;
+    var lv = document.getElementById('call-local-video');
+    lv.srcObject = stream; lv.style.display = wantVideo ? 'block' : 'none';
+    document.getElementById('call-audio-screen').style.display = wantVideo ? 'none' : 'flex';
+  } catch (e) {
+    if (wantVideo) {
+      try { var s2 = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); currentCall.localStream = s2; currentCall.video = false; currentCall.camOn = false; document.getElementById('call-local-video').style.display = 'none'; document.getElementById('call-audio-screen').style.display = 'flex'; }
+      catch (e2) { alert('Нет доступа к камере/микрофону'); endCurrentCall(); }
+    } else { alert('Нет доступа к микрофону'); endCurrentCall(); }
+  }
+}
+async function createPC() {
+  var pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  currentCall.pc = pc;
+  if (currentCall.localStream) { currentCall.localStream.getTracks().forEach(function (t) { pc.addTrack(t, currentCall.localStream); }); }
+  pc.ontrack = function (e) {
+    if (e.streams && e.streams[0]) {
+      currentCall.remoteStream = e.streams[0];
+      var rv = document.getElementById('call-remote-video');
+      rv.srcObject = e.streams[0];
+      if (currentCall.video) { rv.style.display = 'block'; document.getElementById('call-audio-screen').style.display = 'none'; }
+      else { rv.style.display = 'none'; document.getElementById('call-audio-screen').style.display = 'flex'; }
     }
-  } catch (e) {}
+  };
+  pc.onicecandidate = function (e) { if (e.candidate) sendSig('ice', { candidate: e.candidate }); };
+  pc.onconnectionstatechange = function () { if (pc.connectionState === 'connected') { currentCall.status = 'active'; updateCallUI(); } };
+  if (currentCall.role === 'caller') { var offer = await pc.createOffer(); await pc.setLocalDescription(offer); sendSig('offer', { sdp: offer }); }
+}
+async function sendSig(type, payload) {
+  if (!currentCall) return;
+  try { await fetch('/api/calls/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: currentCall.callId, fromId: currentUser.id, toId: currentCall.peerId, type: type, payload: payload }) }); } catch (e) {}
+}
+async function handleSig(sig) {
+  if (sig.type === 'offer-start') {
+    if (currentCall || incomingCall) return;
+    incomingCall = { callId: sig.callId, fromId: sig.from, fromName: sig.payload.fromName || 'Пользователь', fromAvatar: sig.payload.fromAvatar || '', video: !!sig.payload.video };
+    document.getElementById('incoming-avatar').innerHTML = incomingCall.fromAvatar ? '<img src="' + incomingCall.fromAvatar + '">' : (incomingCall.fromName.charAt(0).toUpperCase());
+    document.getElementById('incoming-name').innerText = incomingCall.fromName;
+    document.getElementById('incoming-status-text').innerText = incomingCall.video ? 'Входящий видеозвонок...' : 'Входящий звонок...';
+    document.getElementById('incoming-call-overlay').classList.add('active');
+    playNotificationSound();
+    return;
+  }
+  if (!currentCall || sig.callId !== currentCall.callId) return;
+  if (sig.type === 'accepted') { currentCall.status = 'connecting'; updateCallUI(); }
+  else if (sig.type === 'rejected' || sig.type === 'ended') { endCurrentCall(true); }
+  else if (sig.type === 'offer') { try { await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp)); var answer = await currentCall.pc.createAnswer(); await currentCall.pc.setLocalDescription(answer); sendSig('answer', { sdp: answer }); } catch (e) {} }
+  else if (sig.type === 'answer') { try { await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp)); } catch (e) {} }
+  else if (sig.type === 'ice') { try { await currentCall.pc.addIceCandidate(new RTCIceCandidate(sig.payload.candidate)); } catch (e) {} }
+}
+function toggleCallMic() {
+  if (!currentCall || !currentCall.localStream) return;
+  var audioTracks = currentCall.localStream.getAudioTracks();
+  currentCall.micOn = !currentCall.micOn;
+  audioTracks.forEach(function (t) { t.enabled = currentCall.micOn; });
+  document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
+  document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
+}
+async function toggleCallCam() {
+  if (!currentCall) return;
+  if (!currentCall.camOn) {
+    try {
+      var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing || 'user' } });
+      currentCall.localStream = currentCall.localStream || new MediaStream();
+      vs.getVideoTracks().forEach(function (t) {
+        currentCall.localStream.addTrack(t);
+        if (currentCall.pc) { var sender = currentCall.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; }); if (sender) sender.replaceTrack(t); else currentCall.pc.addTrack(t, currentCall.localStream); }
+      });
+      currentCall.camOn = true; currentCall.video = true;
+      document.getElementById('call-local-video').srcObject = currentCall.localStream;
+      document.getElementById('call-local-video').style.display = 'block';
+      document.getElementById('call-audio-screen').style.display = currentCall.remoteStream ? 'none' : 'flex';
+      document.getElementById('ctrl-cam').classList.add('active');
+    } catch (e) { alert('Камера недоступна'); }
+  } else {
+    currentCall.localStream.getVideoTracks().forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
+    currentCall.camOn = false;
+    document.getElementById('call-local-video').style.display = 'none';
+    document.getElementById('ctrl-cam').classList.remove('active');
+  }
+}
+async function flipCallCamera() {
+  if (!currentCall || !currentCall.camOn) return;
+  currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user';
+  try {
+    var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing } });
+    var newTrack = vs.getVideoTracks()[0];
+    currentCall.localStream.getVideoTracks().forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
+    currentCall.localStream.addTrack(newTrack);
+    var sender = currentCall.pc.getSenders().find(function (s) { return s.track && s.track.kind === 'video'; });
+    if (sender) await sender.replaceTrack(newTrack);
+    document.getElementById('call-local-video').srcObject = currentCall.localStream;
+  } catch (e) { currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user'; }
+}
+async function endCurrentCall(silent) {
+  var c = currentCall; currentCall = null;
+  hideCallOverlay();
+  document.getElementById('call-return-btn').style.display = 'none';
+  document.getElementById('call-in-progress-bar').style.display = 'none';
+  if (!c) return;
+  try { await fetch('/api/calls/end', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: c.callId, userId: currentUser.id }) }); } catch (e) {}
+  try { if (c.pc) c.pc.close(); } catch (e) {}
+  try { if (c.localStream) c.localStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+  var rv = document.getElementById('call-remote-video'); rv.srcObject = null; rv.style.display = 'none';
+  var lv = document.getElementById('call-local-video'); lv.srcObject = null; lv.style.display = 'none';
+  document.getElementById('call-audio-screen').style.display = 'flex';
+  document.getElementById('ctrl-mic').classList.add('active');
+  document.getElementById('ctrl-mic').innerText = '🎤';
+  document.getElementById('ctrl-cam').classList.remove('active');
 }
 
 /* ==================== ИНИЦИАЛИЗАЦИЯ ==================== */
@@ -3291,26 +3007,18 @@ window.addEventListener('DOMContentLoaded', async function () {
   });
   loadDeletedIds();
   loadClientSalt();
-  loadChatSecrets();
   try { currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) { currentUser = null; }
   try { localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}'); } catch (e) { localKnownUsers = {}; }
   try { localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]'); } catch (e) { localMessagesCache = []; }
   try { mutedPeers = JSON.parse(localStorage.getItem('messenger_muted_peers') || '[]'); } catch (e) { mutedPeers = []; }
-
   localMessagesCache = localMessagesCache.filter(function (m) { return !deletedIds[m.id] && !m.isDeleted; });
   saveCache();
   updateVersionInfo();
   await checkServerHealth();
-
   if (!currentUser) {
     setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000);
   }
-
-  if (currentUser) {
-    startApp();
-  } else {
-    updateLoadingScreen();
-  }
+  if (currentUser) startApp(); else updateLoadingScreen();
 });
 `;
 
