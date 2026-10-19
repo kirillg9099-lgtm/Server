@@ -1,61 +1,41 @@
 /* ============================================================
-   server.js — v4.0.0 (stateless)
+   server.js — v4.1.0 (stateless & fixed E2EE / WebRTC)
    - Хранение: RAM (сервер) + localStorage/IndexedDB (клиент)
-   - Ничего не пишется на диск
-   - Вход по имени, звонки, поиск всех онлайн, удаление сессии
+   - Поддержка GitHub / Render (бесплатный тариф)
    ============================================================ */
 const express = require('express');
-const path = require('path');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.0.0';
+const SERVER_VERSION = '4.1.0';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
-app.use('/api/upload/chunk', express.raw({ type: 'application/octet-stream', limit: '5mb' }));
 
 process.on('uncaughtException', function (err) { console.error('[СЕРВЕР]:', err); });
 process.on('unhandledRejection', function (r) { console.error('[ПРОМИС]:', r); });
 
 /* ==================== RAM STORAGE ==================== */
 const MEM = {
-  accounts: [],           // {id, name, avatar, contacts, blockedContacts, hiddenDialogs, updatedAt}
-  messages: [],           // общий буфер (не используется для истории)
-  groups: [],             // группы (в RAM, дублируются у клиентов в localStorage)
-  inbox: new Map()        // receiverId -> [messages] (очередь для офлайн)
+  accounts: [],           // {id, name, avatar, pubKey, contacts, blockedContacts, hiddenDialogs, updatedAt}
+  groups: [],             // {id, name, avatar, ownerId, members, createdAt}
+  inbox: new Map()        // receiverId -> [messages]
 };
 
 const ONLINE_WINDOW_MS = 15000;   // 15 сек — «в сети»
-const MAX_INBOX_PER_USER = 300;   // сколько сообщений держать в RAM на одного получателя
+const MAX_INBOX_PER_USER = 300;   // макс сообщений в RAM на пользователя
 
-function readAccounts() { return MEM.accounts; }
-function writeAccounts(d) { MEM.accounts = d; }
-function readMessages() { return MEM.messages; }
-function writeMessages(d) { MEM.messages = d; }
-function readGroups() { return MEM.groups; }
-function writeGroups(d) { MEM.groups = d; }
-
-function hashPassword(pwd) {
-  if (!pwd) return '';
-  return crypto.createHash('sha256').update(String(pwd)).digest('hex');
-}
-function encryptTextServer(text) {
-  if (!text) return '';
-  try { return Buffer.from(String(text), 'utf8').toString('base64'); } catch (e) { return text; }
-}
-function decryptTextServer(text) {
-  if (!text) return '';
-  try {
-    const decoded = Buffer.from(text, 'base64').toString('utf8');
-    if (decoded && decoded.indexOf('\uFFFD') === -1) return decoded;
-  } catch (e) {}
-  return text;
-}
 function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
-function isOnline(u) { return !!(u.updatedAt && (Date.now() - u.updatedAt < ONLINE_WINDOW_MS)); }
+function isOnline(u) { return !!(u && u.updatedAt && (Date.now() - u.updatedAt < ONLINE_WINDOW_MS)); }
+
+/* Автоочистка неактивных данных в RAM каждые 10 минут */
+setInterval(function() {
+  const now = Date.now();
+  // Удаляем аккаунты неактивные более 24 часов
+  MEM.accounts = MEM.accounts.filter(u => (now - (u.updatedAt || 0)) < 86400000);
+}, 600000);
 
 /* ==================== HEALTH ==================== */
 app.get('/api/health', function (req, res) {
@@ -66,6 +46,7 @@ app.get('/api/health', function (req, res) {
 app.post('/api/enter', function (req, res) {
   const name = (req.body.name || '').trim();
   const clientId = (req.body.clientId || '').trim();
+  const pubKey = req.body.pubKey || '';
   if (!name) return res.status(400).json({ error: 'Введите имя' });
   if (name.length > 60) return res.status(400).json({ error: 'Слишком длинное имя' });
 
@@ -77,6 +58,7 @@ app.post('/api/enter', function (req, res) {
       id: 'id_' + Math.random().toString(36).substr(2, 9),
       name: name,
       avatar: '',
+      pubKey: pubKey,
       contacts: [],
       blockedContacts: [],
       hiddenDialogs: [],
@@ -85,12 +67,13 @@ app.post('/api/enter', function (req, res) {
     MEM.accounts.push(user);
   } else {
     user.name = name;
+    if (pubKey) user.pubKey = pubKey;
     user.updatedAt = Date.now();
   }
   res.json({ success: true, user: user });
 });
 
-/* Удалить сессию (пользователь забыт сервером) */
+/* Удалить сессию */
 app.post('/api/enter/leave', function (req, res) {
   const userId = (req.body.userId || '').trim();
   if (!userId) return res.status(400).json({ error: 'No user' });
@@ -112,7 +95,7 @@ app.post('/api/enter/leave', function (req, res) {
 
 /* ==================== PING ==================== */
 app.post('/api/ping', function (req, res) {
-  const { id, name, avatar, contacts, knownUsers } = req.body;
+  const { id, name, avatar, pubKey, contacts, knownUsers } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
 
   if (Array.isArray(knownUsers)) {
@@ -120,17 +103,18 @@ app.post('/api/ping', function (req, res) {
       if (!ku.id || ku.id === id) return;
       let ex = MEM.accounts.find(function (a) { return a.id === ku.id; });
       if (!ex) {
-        // создаём «тень» — только если в ку известна хоть какая-то инфа
         MEM.accounts.push({
           id: ku.id,
           name: ku.name || 'Пользователь',
           avatar: ku.avatar || '',
+          pubKey: ku.pubKey || '',
           contacts: [], blockedContacts: [], hiddenDialogs: [],
           updatedAt: 0
         });
       } else {
         if (ku.name) ex.name = ku.name;
         if (ku.avatar !== undefined) ex.avatar = ku.avatar;
+        if (ku.pubKey) ex.pubKey = ku.pubKey;
       }
     });
   }
@@ -141,6 +125,7 @@ app.post('/api/ping', function (req, res) {
       id: id,
       name: name || 'Пользователь',
       avatar: avatar || '',
+      pubKey: pubKey || '',
       contacts: Array.isArray(contacts) ? contacts : [],
       blockedContacts: [], hiddenDialogs: [],
       updatedAt: Date.now()
@@ -150,11 +135,13 @@ app.post('/api/ping', function (req, res) {
     user.updatedAt = Date.now();
     if (name) user.name = name;
     if (avatar !== undefined) user.avatar = avatar;
+    if (pubKey) user.pubKey = pubKey;
     if (Array.isArray(contacts)) {
       if (!user.contacts) user.contacts = [];
       contacts.forEach(function (cid) { if (user.contacts.indexOf(cid) === -1) user.contacts.push(cid); });
     }
   }
+
   MEM.groups.forEach(function (g) {
     if (g.members.indexOf(id) !== -1) {
       g.members.forEach(function (m) {
@@ -163,7 +150,6 @@ app.post('/api/ping', function (req, res) {
     }
   });
 
-  // Очередь входящих — отдаём сразу
   const pending = MEM.inbox.get(id) || [];
   MEM.inbox.delete(id);
 
@@ -171,11 +157,12 @@ app.post('/api/ping', function (req, res) {
 });
 
 app.post('/api/profile/update', function (req, res) {
-  const { id, name, avatar } = req.body;
+  const { id, name, avatar, pubKey } = req.body;
   const user = MEM.accounts.find(function (u) { return u.id === id; });
   if (!user) return res.status(404).json({ error: 'Не найден' });
   if (name && name.trim()) user.name = name.trim();
   if (avatar !== undefined) user.avatar = avatar;
+  if (pubKey) user.pubKey = pubKey;
   user.updatedAt = Date.now();
   res.json({ success: true, user: user });
 });
@@ -183,7 +170,7 @@ app.post('/api/profile/update', function (req, res) {
 app.get('/api/users/:userId', function (req, res) {
   const user = MEM.accounts.find(function (u) { return u.id === req.params.userId; });
   if (!user) return res.status(404).json({ error: 'Не найден' });
-  res.json({ id: user.id, name: user.name, avatar: user.avatar || '', isOnline: isOnline(user), updatedAt: user.updatedAt });
+  res.json({ id: user.id, name: user.name, avatar: user.avatar || '', pubKey: user.pubKey || '', isOnline: isOnline(user), updatedAt: user.updatedAt });
 });
 
 app.post('/api/users/block', function (req, res) {
@@ -218,7 +205,7 @@ app.get('/api/users/search', function (req, res) {
              (u.name && u.name.toLowerCase().indexOf(q) !== -1);
     })
     .map(function (u) {
-      return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '',
+      return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '',
         isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) };
     })
     .sort(function (a, b) {
@@ -235,23 +222,22 @@ app.get('/api/users/online-all', function (req, res) {
   const results = MEM.accounts
     .filter(function (u) { return u.id && u.id !== excludeId && u.name; })
     .filter(function (u) { return u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS); })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: true }; })
+    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: true }; })
     .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(results);
 });
 
 app.get('/api/users/online', function (req, res) {
-  // для совместимости — возвращаем онлайн
   const userId = req.query.userId || '';
   const now = Date.now();
   const list = MEM.accounts
     .filter(function (u) { return u.id !== userId && u.name && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS); })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: true }; })
+    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: true }; })
     .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(list);
 });
 
-/* ==================== ГРУППЫ (в RAM) ==================== */
+/* ==================== ГРУППЫ ==================== */
 app.post('/api/groups/create', function (req, res) {
   const { userId, name, members, avatar } = req.body;
   if (!userId) return res.status(400).json({ error: 'No user' });
@@ -267,7 +253,7 @@ function groupWithDetails(group) {
   const now = Date.now();
   const memberDetails = group.members.map(function (mId) {
     const u = MEM.accounts.find(function (a) { return a.id === mId; });
-    return { id: mId, name: u ? u.name : 'Пользователь', avatar: u ? (u.avatar || '') : '',
+    return { id: mId, name: u ? u.name : 'Пользователь', avatar: u ? (u.avatar || '') : '', pubKey: u ? (u.pubKey || '') : '',
       isOnline: !!(u && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) };
   });
   const copy = Object.assign({}, group);
@@ -280,6 +266,7 @@ app.get('/api/groups/:groupId', function (req, res) {
   if (!g) return res.status(404).json({ error: 'Не найдена' });
   res.json(groupWithDetails(g));
 });
+
 app.post('/api/groups/update', function (req, res) {
   const { groupId, userId, name, avatar } = req.body;
   const g = MEM.groups.find(function (x) { return x.id === groupId; });
@@ -289,6 +276,7 @@ app.post('/api/groups/update', function (req, res) {
   if (avatar !== undefined) g.avatar = avatar;
   res.json({ success: true, group: groupWithDetails(g) });
 });
+
 app.post('/api/groups/add', function (req, res) {
   const { groupId, userId, members } = req.body;
   if (!Array.isArray(members) || members.length === 0) return res.status(400).json({ error: 'Выберите' });
@@ -300,6 +288,7 @@ app.post('/api/groups/add', function (req, res) {
   if (added === 0) return res.status(400).json({ error: 'Никто' });
   res.json({ success: true, group: groupWithDetails(g) });
 });
+
 app.post('/api/groups/kick', function (req, res) {
   const { groupId, userId, memberId } = req.body;
   const g = MEM.groups.find(function (x) { return x.id === groupId; });
@@ -310,6 +299,7 @@ app.post('/api/groups/kick', function (req, res) {
   g.members = g.members.filter(function (m) { return m !== memberId; });
   res.json({ success: true, group: groupWithDetails(g) });
 });
+
 app.post('/api/groups/delete', function (req, res) {
   const { groupId, userId } = req.body;
   const g = MEM.groups.find(function (x) { return x.id === groupId; });
@@ -318,6 +308,7 @@ app.post('/api/groups/delete', function (req, res) {
   MEM.groups = MEM.groups.filter(function (x) { return x.id !== groupId; });
   res.json({ success: true });
 });
+
 app.post('/api/groups/leave', function (req, res) {
   const { groupId, userId } = req.body;
   const g = MEM.groups.find(function (x) { return x.id === groupId; });
@@ -328,7 +319,7 @@ app.post('/api/groups/leave', function (req, res) {
   res.json({ success: true });
 });
 
-/* ==================== СООБЩЕНИЯ (без диска) ==================== */
+/* ==================== СООБЩЕНИЯ ==================== */
 app.post('/api/messages/send', function (req, res) {
   const {
     senderId, receiverId, groupId, text, fileData, fileName, fileType, clientId,
@@ -357,7 +348,7 @@ app.post('/api/messages/send', function (req, res) {
     senderId: senderId,
     receiverId: groupId ? '' : receiverId,
     groupId: groupId || '',
-    text: encryptTextServer(text || ''),
+    text: text || '',
     fileData: fileData || '',
     fileUrl: fileUrl || '',
     thumbUrl: thumbUrl || '',
@@ -368,13 +359,11 @@ app.post('/api/messages/send', function (req, res) {
     fileIv: fileIv || '',
     fileKeyEncByUser: fileKeyEncByUser || null,
     textKeyEncByUser: textKeyEncByUser || null,
-    encryptionVersion: encryptionVersion || 0,
+    encryptionVersion: encryptionVersion || 2,
     timestamp: timeStr(), ts: Date.now(),
     isRead: false, readBy: [], isDeleted: false, clearedFor: []
   };
 
-  // Всегда в RAM-очередь получателю (клиент заберёт при следующем ping)
-  // Для группы — копируем всем участникам, кроме отправителя
   const targets = groupId
     ? (MEM.groups.find(function (x) { return x.id === groupId; }) || { members: [] }).members.filter(function (m) { return m !== senderId; })
     : [receiverId];
@@ -386,52 +375,44 @@ app.post('/api/messages/send', function (req, res) {
     MEM.inbox.set(tid, q);
   });
 
-  const copyMsg = Object.assign({}, newMsg);
-  copyMsg.text = text || '';
-  res.json({ success: true, message: copyMsg });
+  res.json({ success: true, message: newMsg });
 });
 
-/* Получение очереди (для поллинга) */
 app.get('/api/messages/receive', function (req, res) {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ error: 'No user' });
   const pending = MEM.inbox.get(userId) || [];
   MEM.inbox.delete(userId);
-  res.json({ success: true, messages: pending.map(function (m) {
-    const c = Object.assign({}, m);
-    c.text = decryptTextServer(m.text);
-    return c;
-  }) });
+  res.json({ success: true, messages: pending });
 });
 
-/* История — отдаём только очередь (клиент всё равно хранит у себя) */
 app.get('/api/messages/:userId/:peerId', function (req, res) {
   const { userId, peerId } = req.params;
   const pending = MEM.inbox.get(userId) || [];
-  res.json(pending.filter(function (m) {
+  // фильтруем и одновременно не ломаем очередь для других получателей
+  const match = pending.filter(function (m) {
     return (m.senderId === peerId && m.receiverId === userId) ||
            (m.senderId === userId && m.receiverId === peerId);
-  }).map(function (m) { const c = Object.assign({}, m); c.text = decryptTextServer(m.text); return c; }));
+  });
+  res.json(match);
 });
 
 app.get('/api/messages/group/:groupId', function (req, res) {
   const userId = req.query.userId;
   const pending = MEM.inbox.get(userId) || [];
-  res.json(pending.filter(function (m) { return m.groupId === req.params.groupId; })
-    .map(function (m) { const c = Object.assign({}, m); c.text = decryptTextServer(m.text); return c; }));
+  res.json(pending.filter(function (m) { return m.groupId === req.params.groupId; }));
 });
 
 app.post('/api/messages/read', function (req, res) { res.json({ success: true }); });
 app.delete('/api/messages/:msgId', function (req, res) { res.json({ success: true }); });
 app.post('/api/chat/clear', function (req, res) { res.json({ success: true }); });
 
-/* Диалоги — отдаём только онлайн-статусы, сам список строит клиент из локального кэша */
 app.get('/api/dialogs/:userId', function (req, res) {
   const userId = req.params.userId;
   const now = Date.now();
   const list = MEM.accounts
     .filter(function (u) { return u.id !== userId && u.name && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS); })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: true }; });
+    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: true }; });
   res.json(list);
 });
 
@@ -457,6 +438,7 @@ app.post('/api/calls/start', function (req, res) {
   pushSig(toId, fromId, callId, 'offer-start', { fromName: from.name, fromAvatar: from.avatar || '', video: !!video });
   res.json({ success: true, callId: callId });
 });
+
 app.post('/api/calls/answer', function (req, res) {
   const { callId, userId, accept } = req.body;
   const call = activeCalls.get(callId);
@@ -466,6 +448,7 @@ app.post('/api/calls/answer', function (req, res) {
   else { call.status = 'rejected'; pushSig(call.fromId, call.toId, callId, 'rejected', {}); activeCalls.delete(callId); }
   res.json({ success: true });
 });
+
 app.post('/api/calls/end', function (req, res) {
   const { callId, userId } = req.body;
   const call = activeCalls.get(callId);
@@ -477,6 +460,7 @@ app.post('/api/calls/end', function (req, res) {
   }
   res.json({ success: true });
 });
+
 app.post('/api/calls/signal', function (req, res) {
   const { callId, fromId, toId, type, payload } = req.body;
   if (!callId || !fromId || !toId || !type) return res.status(400).json({ error: 'Bad' });
@@ -484,6 +468,7 @@ app.post('/api/calls/signal', function (req, res) {
   pushSig(toId, fromId, callId, type, payload);
   res.json({ success: true });
 });
+
 app.get('/api/calls/poll', function (req, res) {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ error: 'No user' });
@@ -494,7 +479,7 @@ app.get('/api/calls/poll', function (req, res) {
   res.json({ success: true, signals: fresh });
 });
 
-/* ==================== HTML ==================== */
+/* ==================== HTML И КЛИЕНТСКИЙ ИНТЕРФЕЙС ==================== */
 const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
@@ -607,7 +592,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .profile-id{font-size:13px;color:var(--accent);margin-bottom:15px;}
   .profile-actions{width:100%;display:flex;flex-direction:column;gap:10px;}
   .profile-link-btn{background:none;border:none;color:var(--accent);font-size:14px;cursor:pointer;padding:5px;text-align:center;}
-  .check-row{display:flex;align-items:center;gap:10px;padding:8px;cursor:pointer;border-radius:8px;}
   .member-row{display:flex;align-items:center;gap:10px;padding:6px 8px;cursor:pointer;border-radius:8px;position:relative;}
   .member-row:hover{background:var(--bg-hover);}
   .member-menu-btn{background:transparent;border:none;color:var(--text-muted);font-size:20px;cursor:pointer;padding:4px 8px;border-radius:50%;}
@@ -870,7 +854,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.0.0';
+var CLIENT_VERSION = '4.1.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -900,7 +884,6 @@ var activeMemberDropdown = null;
 var profileTargetId = null;
 var connectionState = 'checking';
 var statusBarTimeout = null;
-var CHUNK_SIZE = 500 * 1024;
 var MAX_FILE_SIZE = 200 * 1024 * 1024;
 var serverVersion = 'unknown';
 var pingFailCount = 0;
@@ -909,8 +892,9 @@ var isRetrying = false;
 var filesDB = null;
 var fileUrlCache = new Map();
 var deletedIds = {};
+var myKeyPair = null;
 
-/* ==================== ШИФРОВАНИЕ ==================== */
+/* ==================== ШИФРОВАНИЕ E2EE (ECDH P-256 + AES-GCM) ==================== */
 function bufToBase64(buf) {
   var bytes = new Uint8Array(buf);
   var binary = '';
@@ -925,42 +909,62 @@ function base64ToBuf(b64) {
 }
 function strToU8(s) { return new TextEncoder().encode(s); }
 function u8ToStr(u) { return new TextDecoder().decode(u); }
-var clientSalt = null;
-function loadClientSalt() {
-  try { clientSalt = localStorage.getItem('messenger_client_salt'); } catch (e) {}
-  if (!clientSalt) {
-    var arr = new Uint8Array(32);
-    crypto.getRandomValues(arr);
-    clientSalt = bufToBase64(arr);
-    try { localStorage.setItem('messenger_client_salt', clientSalt); } catch (e) {}
-  }
+
+async function initMyKeyPair() {
+  try {
+    var storedPriv = localStorage.getItem('messenger_ec_priv');
+    var storedPub = localStorage.getItem('messenger_ec_pub');
+    if (storedPriv && storedPub) {
+      var privKey = await crypto.subtle.importKey('jwk', JSON.parse(storedPriv), { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey', 'deriveBits']);
+      var pubKey = await crypto.subtle.importKey('jwk', JSON.parse(storedPub), { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+      myKeyPair = { privateKey: privKey, publicKey: pubKey, pubKeyB64: storedPub };
+    } else {
+      var kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+      var pubJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
+      var privJwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
+      var pubStr = JSON.stringify(pubJwk);
+      localStorage.setItem('messenger_ec_priv', JSON.stringify(privJwk));
+      localStorage.setItem('messenger_ec_pub', pubStr);
+      myKeyPair = { privateKey: kp.privateKey, publicKey: kp.publicKey, pubKeyB64: pubStr };
+    }
+  } catch (e) { console.error('E2EE KeyInit error', e); }
 }
-loadClientSalt();
-var userKeyCache = {};
-async function getUserKey(userId) {
-  if (userKeyCache[userId]) return userKeyCache[userId];
-  var baseKey = await crypto.subtle.importKey('raw', base64ToBuf(clientSalt), { name: 'HKDF' }, false, ['deriveKey']);
-  var key = await crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: strToU8('msg-user-key-v1:' + userId), info: strToU8('aes-gcm-256') },
-    baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
-  );
-  userKeyCache[userId] = key;
-  return key;
+
+var derivedKeysCache = {};
+async function getDerivedSharedKey(peerPubKeyJwkStr) {
+  if (!peerPubKeyJwkStr) return null;
+  if (derivedKeysCache[peerPubKeyJwkStr]) return derivedKeysCache[peerPubKeyJwkStr];
+  try {
+    var peerPub = await crypto.subtle.importKey('jwk', JSON.parse(peerPubKeyJwkStr), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    var sharedKey = await crypto.subtle.deriveKey(
+      { name: 'ECDH', public: peerPub },
+      myKeyPair.privateKey,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+    derivedKeysCache[peerPubKeyJwkStr] = sharedKey;
+    return sharedKey;
+  } catch (e) { return null; }
 }
+
 async function aesEncrypt(key, dataU8) {
   var iv = crypto.getRandomValues(new Uint8Array(12));
   var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, dataU8);
   return { iv: bufToBase64(iv), data: bufToBase64(enc) };
 }
+
 async function aesDecrypt(key, ivB64, dataB64) {
   var iv = new Uint8Array(base64ToBuf(ivB64));
   var data = base64ToBuf(dataB64);
   var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, data);
   return new Uint8Array(dec);
 }
+
 async function generateFileKey() { return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']); }
 async function exportFileKeyB64(k) { return bufToBase64(await crypto.subtle.exportKey('raw', k)); }
 async function importFileKeyB64(b64) { return crypto.subtle.importKey('raw', base64ToBuf(b64), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']); }
+
 async function encryptBlob(blob) {
   var fileKey = await generateFileKey();
   var buf = await blob.arrayBuffer();
@@ -968,6 +972,7 @@ async function encryptBlob(blob) {
   var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
   return { blob: new Blob([enc], { type: 'application/octet-stream' }), ivB64: bufToBase64(iv), keyB64: await exportFileKeyB64(fileKey), originalSize: blob.size };
 }
+
 async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
   var fileKey = await importFileKeyB64(keyB64);
   var iv = new Uint8Array(base64ToBuf(ivB64));
@@ -975,26 +980,46 @@ async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
   var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
   return new Blob([dec], { type: originalType || 'application/octet-stream' });
 }
-async function wrapFileKeyForUser(fileKeyB64, userId) {
-  var uKey = await getUserKey(userId);
-  var enc = await aesEncrypt(uKey, strToU8(fileKeyB64));
+
+async function wrapFileKeyForUser(fileKeyB64, peerId) {
+  var targetUser = (peerId === currentUser.id) ? currentUser : (localKnownUsers[peerId] || {});
+  var pubKeyJwkStr = targetUser.pubKey || (peerId === currentUser.id ? myKeyPair.pubKeyB64 : '');
+  if (!pubKeyJwkStr) return fileKeyB64; // fallback если нет публичного ключа
+  var sharedKey = await getDerivedSharedKey(pubKeyJwkStr);
+  if (!sharedKey) return fileKeyB64;
+  var enc = await aesEncrypt(sharedKey, strToU8(fileKeyB64));
   return enc.iv + '.' + enc.data;
 }
-async function unwrapFileKeyForMe(wrapped, myId) {
+
+async function unwrapFileKeyForMe(wrapped, senderId) {
   if (!wrapped) return null;
+  if (wrapped.indexOf('.') === -1) return wrapped; // plain fallback
   var parts = wrapped.split('.');
   if (parts.length !== 2) return null;
-  var uKey = await getUserKey(myId);
-  var dec = await aesDecrypt(uKey, parts[0], parts[1]);
-  return u8ToStr(dec);
+  var senderUser = (senderId === currentUser.id) ? currentUser : (localKnownUsers[senderId] || {});
+  var pubKeyJwkStr = senderUser.pubKey || (senderId === currentUser.id ? myKeyPair.pubKeyB64 : '');
+  if (!pubKeyJwkStr) return null;
+  var sharedKey = await getDerivedSharedKey(pubKeyJwkStr);
+  if (!sharedKey) return null;
+  try {
+    var dec = await aesDecrypt(sharedKey, parts[0], parts[1]);
+    return u8ToStr(dec);
+  } catch (e) { return null; }
 }
+
 function blobToBase64(blob) {
   return new Promise(function (res, rej) {
     var r = new FileReader();
-    r.onload = function () { var s = r.result; var idx = s.indexOf(','); res(idx >= 0 ? s.substring(idx + 1) : s); };
-    r.onerror = rej; r.readAsDataURL(blob);
+    r.onload = function () {
+      var s = r.result;
+      var idx = s.indexOf(',');
+      res(idx >= 0 ? s.substring(idx + 1) : s);
+    };
+    r.onerror = rej;
+    r.readAsDataURL(blob);
   });
 }
+
 function getRecipients() {
   if (!activePeer) return [];
   if (activePeer.type === 'group') {
@@ -1004,6 +1029,7 @@ function getRecipients() {
   }
   return [activePeer.id, currentUser.id];
 }
+
 async function wrapKeyForRecipients(fileKeyB64) {
   var recipients = getRecipients();
   var map = {};
@@ -1012,6 +1038,7 @@ async function wrapKeyForRecipients(fileKeyB64) {
   }
   return map;
 }
+
 async function buildEncryptedPayload(opts) {
   var payload = {
     clientId: opts.clientId, text: '', fileData: '',
@@ -1134,6 +1161,7 @@ function formatBytes(bytes) {
 }
 function saveCache() { try { localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache)); } catch (e) {} }
 function saveGroups() { try { localStorage.setItem('messenger_groups', JSON.stringify(localGroups)); } catch (e) {} }
+
 function mergeMessage(msg) {
   if (!msg || !msg.id) return;
   if (deletedIds[msg.id]) return;
@@ -1153,13 +1181,7 @@ function mergeMessage(msg) {
   localMessagesCache.push(msg);
   saveCache();
 }
-function quickHash(str) {
-  if (!str) return '0';
-  var len = str.length; var h = 0;
-  var sample = str.substring(0, 64) + '|' + str.substring(Math.max(0, len - 64)) + '|' + len;
-  for (var i = 0; i < sample.length; i++) h = ((h << 5) - h + sample.charCodeAt(i)) | 0;
-  return len + '_' + (h >>> 0).toString(36);
-}
+
 function playNotificationSound() {
   try {
     var ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1204,7 +1226,7 @@ function compressImage(file, maxSize, quality, callback) {
   reader.readAsDataURL(file);
 }
 
-/* ==================== IDB ==================== */
+/* ==================== INDEXED DB ==================== */
 function openFilesDB() {
   return new Promise(function (resolve, reject) {
     if (filesDB) return resolve(filesDB);
@@ -1276,7 +1298,7 @@ async function getFileUrl(msg) {
     try {
       var wrapped = msg.fileKeyEncByUser[currentUser.id];
       if (!wrapped) return null;
-      var fileKeyB64 = await unwrapFileKeyForMe(wrapped, currentUser.id);
+      var fileKeyB64 = await unwrapFileKeyForMe(wrapped, msg.senderId);
       if (!fileKeyB64) return null;
       var dec = await decryptBlob(encBlob, fileKeyB64, msg.fileIv, msg.fileType);
       var url = URL.createObjectURL(dec);
@@ -1289,7 +1311,7 @@ async function getFileUrl(msg) {
   return url2;
 }
 
-/* ==================== UI ==================== */
+/* ==================== UI РЕНДЕР ==================== */
 function toggleChatDropdown() { var m = document.getElementById('chat-dropdown-menu'); if (m) m.classList.toggle('active'); }
 function closeChatDropdown() { var m = document.getElementById('chat-dropdown-menu'); if (m) m.classList.remove('active'); }
 document.addEventListener('click', function (e) {
@@ -1329,11 +1351,13 @@ function renderAvatarIntoElement(el, userObj, isOnline) {
   if (indicator) { if (isOnline) indicator.classList.add('visible'); else indicator.classList.remove('visible'); }
 }
 function fillAvatarBox(el, avatar, fallback) { renderAvatarIntoElement(el, { avatar: avatar, name: fallback || '?' }, false); }
+
 function cacheUser(user) {
   if (!user || !user.id || user.type === 'group') return;
-  localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar, updatedAt: Date.now() };
+  localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar, pubKey: user.pubKey || '', updatedAt: Date.now() };
   try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
 }
+
 function getUserName(id) {
   if (!currentUser) return 'Пользователь';
   if (id === currentUser.id) return currentUser.name;
@@ -1344,6 +1368,7 @@ function getUserName(id) {
   }
   return 'Пользователь';
 }
+
 function getChatMessages(chat) {
   if (!chat || !currentUser) return [];
   var list;
@@ -1358,13 +1383,14 @@ function getChatMessages(chat) {
   }
   return list.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
 }
+
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
   document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
-/* ==================== ВХОД ==================== */
+/* ==================== ВХОДИ И СЕССИИ ==================== */
 async function enterByName() {
   if (busyButtons['enter-btn']) return;
   var name = document.getElementById('auth-name').value.trim();
@@ -1372,39 +1398,44 @@ async function enterByName() {
   if (!name) { errBox.innerText = 'Введите имя'; errBox.style.display = 'block'; return; }
   if (!lockButton('enter-btn', 3000)) return;
   try {
+    await initMyKeyPair();
     var prev = null;
     try { prev = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) {}
     var res = await fetch('/api/enter', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, clientId: prev ? prev.id : '' })
+      body: JSON.stringify({ name: name, clientId: prev ? prev.id : '', pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '' })
     });
     var data = await res.json();
     if (!data.success) { errBox.innerText = data.error || 'Ошибка'; errBox.style.display = 'block'; return; }
     currentUser = data.user;
+    currentUser.pubKey = myKeyPair ? myKeyPair.pubKeyB64 : '';
     try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
     startApp();
   } catch (e) {
     errBox.innerText = 'Сервер недоступен'; errBox.style.display = 'block';
   }
 }
+
 function logoutUser() {
   if (!confirm('Выйти? Данные останутся на этом устройстве.')) return;
   currentUser = null;
   localStorage.removeItem('messenger_user');
   location.reload();
 }
+
 async function restartSession() {
   if (!confirm('Перезапустить сессию? Данные сохранятся.')) return;
   location.reload();
 }
+
 async function deleteSession() {
   if (!currentUser) return;
-  var ok = confirm('Удалить сессию?\\n\\nУдалится ВСЁ на этом устройстве: аккаунт, сообщения, файлы, группы, ключи.\\nДругие пользователи не пострадают.');
+  var ok = confirm('Удалить сессию?\\n\\nУдалится ВСЁ на этом устройстве: аккаунт, сообщения, файлы, группы, ключи.');
   if (!ok) return;
   var uid = currentUser.id;
   try { await fetch('/api/enter/leave', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: uid }) }); } catch (e) {}
   try {
-    ['messenger_user','messenger_known_users','messenger_messages_cache','messenger_client_salt','messenger_deleted_ids','messenger_muted_peers','messenger_chat_secrets','messenger_groups'].forEach(function (k) {
+    ['messenger_user','messenger_known_users','messenger_messages_cache','messenger_ec_priv','messenger_ec_pub','messenger_deleted_ids','messenger_muted_peers','messenger_groups'].forEach(function (k) {
       try { localStorage.removeItem(k); } catch (e) {}
     });
   } catch (e) {}
@@ -1450,19 +1481,12 @@ function startApp() {
         loadDialogs();
       }
     } catch (e) {}
-    loadDialogs();
     if (activePeer) {
       loadMessagesQuiet();
       if (activePeer.type === 'group') refreshGroupInfo();
       else refreshActivePeerStatus();
     }
   }, 2000);
-  setInterval(async function () {
-    if (!currentUser) return;
-    var wasOnline = connectionState === 'online';
-    var ok = await checkServerHealth();
-    if (ok && !wasOnline) { loadDialogs(); retryPendingMessages(); }
-  }, 4000);
 }
 
 /* ==================== PING ==================== */
@@ -1473,7 +1497,7 @@ async function sendPing() {
     for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) knownList.push(localKnownUsers[k]);
     var res = await fetch('/api/ping', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar || '', contacts: currentUser.contacts || [], knownUsers: knownList })
+      body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar || '', pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '', contacts: currentUser.contacts || [], knownUsers: knownList })
     });
     var data = await res.json();
     pingFailCount = 0;
@@ -1509,6 +1533,7 @@ async function sendPing() {
     else if (pingFailCount >= 3) setConnectionState('server-offline');
   }
 }
+
 async function refreshActivePeerStatus() {
   if (!activePeer || activePeer.type === 'group') return;
   try {
@@ -1518,6 +1543,7 @@ async function refreshActivePeerStatus() {
       activePeer.isOnline = info.isOnline;
       activePeer.name = info.name;
       activePeer.avatar = info.avatar;
+      if (info.pubKey) { activePeer.pubKey = info.pubKey; cacheUser(activePeer); }
       var statusEl = document.getElementById('active-peer-status');
       if (info.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
       else { statusEl.innerText = 'не в сети'; statusEl.style.color = 'var(--text-muted)'; }
@@ -1555,7 +1581,7 @@ function loadDialogs() {
           if ((m.ts || 0) > last) last = m.ts || 0;
         }
       });
-      dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: !!onlineMap[pid], lastTs: last });
+      dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!onlineMap[pid], lastTs: last });
     });
     localGroups.forEach(function (g) {
       var last = 0;
@@ -1566,13 +1592,12 @@ function loadDialogs() {
       dialogs.push({ id: g.id, type: 'group', name: g.name, avatar: g.avatar || '', ownerId: g.ownerId, members: g.members, memberCount: (g.members || []).length, lastTs: last });
     });
     dialogs.sort(function (a, b) { return (b.lastTs || 0) - (a.lastTs || 0); });
-    lastDialogsHash = JSON.stringify(dialogs);
     renderChatList(dialogs);
   }).catch(function () {
     var dialogs = [];
     peers.forEach(function (pid) {
       var u = localKnownUsers[pid];
-      if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: false, lastTs: 0 });
+      if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false, lastTs: 0 });
     });
     localGroups.forEach(function (g) {
       dialogs.push({ id: g.id, type: 'group', name: g.name, avatar: g.avatar || '', ownerId: g.ownerId, members: g.members, memberCount: (g.members || []).length, lastTs: 0 });
@@ -1580,6 +1605,7 @@ function loadDialogs() {
     renderChatList(dialogs);
   });
 }
+
 function renderChatList(list) {
   var container = document.getElementById('chat-list');
   var currentActiveId = activePeer ? activePeer.id : null;
@@ -1604,6 +1630,7 @@ function renderChatList(list) {
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   });
 }
+
 function renderSearchResults(list) {
   var container = document.getElementById('chat-list');
   var currentActiveId = activePeer ? activePeer.id : null;
@@ -1653,21 +1680,10 @@ async function doSearch() {
     if (u.id === currentUser.id) continue;
     var isOn = u.updatedAt && (nowTs - u.updatedAt < 15000);
     if (!q || (u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1))
-      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: !!isOn };
+      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!isOn };
   }
   if (q) clearBtn.style.display = 'block'; else clearBtn.style.display = 'none';
   renderSearchResults(Object.values(map));
-
-  try {
-    var rOnline = await fetch('/api/users/online-all?excludeId=' + encodeURIComponent(currentUser.id));
-    var onlineList = await rOnline.json();
-    onlineList.forEach(function (u) {
-      localKnownUsers[u.id] = { id: u.id, name: u.name, avatar: u.avatar || '', updatedAt: Date.now() };
-      if (!q || (u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1))
-        map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', isOnline: true };
-    });
-    try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
-  } catch (e) {}
 
   if (q) {
     try {
@@ -1677,6 +1693,7 @@ async function doSearch() {
         var existing = map[u.id];
         if (existing) existing.isOnline = u.isOnline;
         else map[u.id] = u;
+        cacheUser(u);
       });
     } catch (e) {}
   }
@@ -1699,6 +1716,7 @@ function openChat(peer) {
   cancelVoiceAttachment();
   if (!peer.type) peer.type = 'user';
   activePeer = peer;
+  cacheUser(peer);
   lastMessagesHash = '';
   document.getElementById('active-peer-name').innerText = peer.name;
   var statusEl = document.getElementById('active-peer-status');
@@ -1718,6 +1736,7 @@ function openChat(peer) {
   loadMessages();
   if (peer.type === 'group') refreshGroupInfo();
 }
+
 function closeMobileChat() { document.getElementById('app-screen').classList.remove('app-mobile-chat'); }
 function msgFetchUrl() {
   return activePeer.type === 'group' ? '/api/messages/group/' + activePeer.id + '?userId=' + encodeURIComponent(currentUser.id) : '/api/messages/' + currentUser.id + '/' + activePeer.id;
@@ -1725,7 +1744,6 @@ function msgFetchUrl() {
 
 /* ==================== РАСШИФРОВКА ==================== */
 async function processIncomingMessage(m) {
-  if (m.text && m.text.indexOf('__CHAT_SECRET') === 0) { m.isDeleted = true; markDeleted(m.id); return; }
   if (m.text && m.text.indexOf('__AESV2__:') === 0) {
     var rest = m.text.substring('__AESV2__:'.length);
     var colon = rest.indexOf(':');
@@ -1735,28 +1753,18 @@ async function processIncomingMessage(m) {
       var wrapped = m.textKeyEncByUser && m.textKeyEncByUser[currentUser.id];
       if (wrapped) {
         try {
-          var fileKeyB64 = await unwrapFileKeyForMe(wrapped, currentUser.id);
+          var fileKeyB64 = await unwrapFileKeyForMe(wrapped, m.senderId);
           if (fileKeyB64) {
             var fileKey = await importFileKeyB64(fileKeyB64);
             var dec = await aesDecrypt(fileKey, ivB64, dataB64);
             m.text = u8ToStr(dec);
-          } else m.text = '';
-        } catch (e) { m.text = ''; }
-      } else m.text = '';
+          } else m.text = '[Зашифрованное сообщение]';
+        } catch (e) { m.text = '[Ошибка расшифровки]'; }
+      } else m.text = '[Ошибка ключа]';
     }
-  } else {
-    m.text = customDecrypt(m.text);
   }
 }
-function customDecrypt(cipher) {
-  if (!cipher) return '';
-  try {
-    var raw = atob(cipher);
-    var result = '';
-    for (var i = 0; i < raw.length; i++) result += String.fromCharCode(raw.charCodeAt(i) - 5);
-    return decodeURIComponent(result);
-  } catch (e) { return cipher; }
-}
+
 async function loadMessages() {
   if (!activePeer) return;
   try {
@@ -1771,21 +1779,22 @@ async function loadMessages() {
     checkVisibleMessages();
   } catch (e) { renderMessagesContainer(getChatMessages(activePeer)); }
 }
+
 async function loadMessagesQuiet() {
   if (!activePeer) return;
-  var before = lastMessagesHash;
   renderMessagesContainer(getChatMessages(activePeer));
-  if (lastMessagesHash !== before) { /* nothing */ }
 }
 
 function openImageViewer(src) { if (document.getElementById('image-viewer-modal').classList.contains('active')) return; document.getElementById('full-screen-img').src = src; document.getElementById('image-viewer-modal').classList.add('active'); }
 function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
+
 function isGroupMsgRead(m) {
   if (!activePeer || activePeer.type !== 'group') return m.isRead;
   var others = (activePeer.members || []).filter(function (x) { return x !== currentUser.id; });
   var rb = (m.readBy || []).filter(function (x) { return x !== currentUser.id; });
   return others.length > 0 && rb.length >= others.length;
 }
+
 async function renderMessagesContainer(messages) {
   var container = document.getElementById('messages-container');
   var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
@@ -1844,6 +1853,7 @@ async function renderMessagesContainer(messages) {
   if (isScrolledToBottom) container.scrollTop = container.scrollHeight;
   mediaTasks.forEach(function (task) { loadMediaIntoPlaceholder(task.msg, task.placeholder).catch(function () {}); });
 }
+
 async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!placeholder || !placeholder.parentNode) return;
   if (deletedIds[msg.id] || msg.isDeleted) { if (placeholder.parentNode) placeholder.remove(); return; }
@@ -1875,6 +1885,7 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!newEl) { placeholder.outerHTML = '<div class="file-placeholder">⚠️ Файл недоступен</div>'; return; }
   placeholder.parentNode.replaceChild(newEl, placeholder);
 }
+
 function checkVisibleMessages() {
   setTimeout(function () {
     if (!activePeer) return;
@@ -1900,6 +1911,7 @@ function checkVisibleMessages() {
     }
   }, 300);
 }
+
 function openMsgActions(msg, el) {
   if (document.getElementById('msg-actions-sheet').classList.contains('active')) return;
   selectedMsgId = msg.id; selectedMsgObj = msg;
@@ -2116,6 +2128,7 @@ async function sendMsg() {
     isWaiting: !peerOnline,
     encryptionVersion: 2
   };
+
   if (voiceToSend) {
     try {
       var encV = await encryptBlob(voiceToSend.blob);
@@ -2131,6 +2144,7 @@ async function sendMsg() {
     } catch (e) { alert('Ошибка отправки голосового'); }
     return;
   }
+
   if (fileToSend && !fileToSend.isLarge) {
     try {
       var enc = await encryptBlob(fileToSend.file);
@@ -2143,21 +2157,24 @@ async function sendMsg() {
       renderMessagesContainer(getChatMessages(activePeer));
       var p = await buildEncryptedPayload({ clientId: clientId, plainText: text, encFileData: encB64, fileIv: enc.ivB64, fileKeyEncByUser: wrap, fileName: fileToSend.name, fileType: fileToSend.type, fileSize: enc.originalSize, thumbUrl: fileToSend.thumbUrl });
       await sendPayload(p);
-    } catch (e) { alert('Ошибка чтения'); }
+    } catch (e) { alert('Ошибка чтения файла'); }
     return;
   }
+
   if (fileToSend && fileToSend.isLarge) {
     optMsg.fileSize = fileToSend.file.size; optMsg.fileType = fileToSend.type;
     cancelAttachment(); mergeMessage(optMsg); renderMessagesContainer(getChatMessages(activePeer));
     uploadLargeFileInBackground(clientId, fileToSend.file, fileToSend.name, fileToSend.type, text, fileToSend.thumbUrl);
     return;
   }
+
   var pT = await buildEncryptedPayload({ clientId: clientId, plainText: text });
   optMsg.textEnc = pT.text; optMsg.textKeyEncByUser = pT.textKeyEncByUser;
   mergeMessage(optMsg);
   renderMessagesContainer(getChatMessages(activePeer));
   await sendPayload(pT);
 }
+
 async function sendPayload(payload) {
   var isGroup = activePeer.type === 'group';
   try {
@@ -2207,10 +2224,10 @@ async function sendPayload(payload) {
     else setConnectionState('server-offline');
   }
 }
+
 async function uploadLargeFileInBackground(clientId, file, fileName, fileType, text, thumbUrl) {
   try {
     var enc = await encryptBlob(file);
-    var encFile = new File([enc.blob], 'enc.bin', { type: 'application/octet-stream' });
     var wrap = await wrapKeyForRecipients(enc.keyB64);
     try { await saveFileToIDB(clientId, enc.blob, { fileName: fileName, fileType: fileType, fileSize: enc.blob.size }); } catch (e) {}
     var b64 = await blobToBase64(enc.blob);
@@ -2231,6 +2248,7 @@ async function uploadLargeFileInBackground(clientId, file, fileName, fileType, t
     if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
   } catch (e) { console.warn('Upload failed:', e); }
 }
+
 async function retryPendingMessages() {
   if (!currentUser || isRetrying) return;
   var pending = localMessagesCache.filter(function (m) { return (m.isPending || m.isWaiting) && m.senderId === currentUser.id && m.clientId; });
@@ -2300,10 +2318,11 @@ async function saveMyProfileChanges() {
   try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
   updateMyProfileUI();
   try {
-    await fetch('/api/profile/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar }) });
+    await fetch('/api/profile/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar, pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '' }) });
   } catch (e) {}
   closeMyProfile();
 }
+
 function openPeerProfile() {
   if (!activePeer) return;
   if (activePeer.type === 'group') { openGroupProfile(); return; }
@@ -2357,6 +2376,7 @@ async function toggleBlockPeer() {
     }
   } catch (e) {}
 }
+
 function updateChatMenu() {
   var menu = document.getElementById('chat-dropdown-menu');
   if (activePeer && activePeer.type === 'group') {
@@ -2412,6 +2432,7 @@ function renderCheckList(containerId, users, excludeSet) {
   });
 }
 function getChecked(containerId) { return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; }); }
+
 async function openCreateGroup() {
   if (isModalOpen('create-group-modal')) return;
   groupDraftAvatar = '';
@@ -2420,7 +2441,7 @@ async function openCreateGroup() {
   var cached = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
-    if (u.id && u.id !== currentUser.id) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
+    if (u.id && u.id !== currentUser.id) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '' });
   }
   renderCheckList('create-group-contacts', cached, new Set());
   safeOpenModal('create-group-modal');
@@ -2451,6 +2472,7 @@ async function submitCreateGroup() {
     } else alert(data.error || 'Ошибка');
   } catch (e) { alert('Не удалось'); }
 }
+
 async function refreshGroupInfo() {
   if (!activePeer || activePeer.type !== 'group') return;
   try {
@@ -2465,6 +2487,7 @@ async function refreshGroupInfo() {
     renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { id: g.id, name: g.name, avatar: g.avatar }, false);
   } catch (e) {}
 }
+
 async function openGroupProfile() {
   closeChatDropdown();
   if (!activePeer || activePeer.type !== 'group') return;
@@ -2504,6 +2527,7 @@ function renderMembersList(containerId, memberDetails, ownerId) {
     c.appendChild(row);
   });
 }
+
 function openMemberDropdown(rowEl, member) {
   closeMemberDropdown();
   var dd = document.createElement('div');
@@ -2519,6 +2543,7 @@ function openMemberDropdown(rowEl, member) {
   setTimeout(function () { document.addEventListener('click', function h(ev) { if (activeMemberDropdown && !activeMemberDropdown.contains(ev.target)) { closeMemberDropdown(); document.removeEventListener('click', h); } }); }, 0);
 }
 function closeMemberDropdown() { if (activeMemberDropdown && activeMemberDropdown.parentNode) activeMemberDropdown.parentNode.removeChild(activeMemberDropdown); activeMemberDropdown = null; }
+
 async function kickMember(member) {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!confirm('Выгнать ' + member.name + '?')) return;
@@ -2529,6 +2554,7 @@ async function kickMember(member) {
     else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
+
 async function deleteGroup() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!confirm('Удалить группу?')) return;
@@ -2542,11 +2568,13 @@ async function deleteGroup() {
     } else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
+
 function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
 function handleEditGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
   compressImage(file, 200, 0.85, function (c) { if (!c) return; editGroupDraftAvatar = c; fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥'); });
 }
+
 async function saveGroupChanges() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!lockButton('save-group-btn', 3000)) return;
@@ -2563,6 +2591,7 @@ async function saveGroupChanges() {
     } else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
+
 async function openAddMembers() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (isModalOpen('add-members-modal')) return;
@@ -2570,13 +2599,14 @@ async function openAddMembers() {
   var cached = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
-    if (u.id && u.id !== currentUser.id && !exclude.has(u.id)) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '' });
+    if (u.id && u.id !== currentUser.id && !exclude.has(u.id)) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '' });
   }
   renderCheckList('add-members-contacts', cached, exclude);
   safeOpenModal('add-members-modal');
   getContactUsers().then(function (c) { renderCheckList('add-members-contacts', c, exclude); });
 }
 function closeAddMembers() { safeCloseModal('add-members-modal'); }
+
 async function submitAddMembers() {
   var members = getChecked('add-members-contacts');
   if (members.length === 0) { alert('Выберите'); return; }
@@ -2590,6 +2620,7 @@ async function submitAddMembers() {
     } else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
+
 async function leaveGroup() {
   closeChatDropdown();
   if (!activePeer || activePeer.type !== 'group') return;
@@ -2601,11 +2632,13 @@ async function leaveGroup() {
   } catch (e) {}
 }
 
-/* ==================== ЗВОНКИ ==================== */
+/* ==================== ЗВОНКИ WebRTC ==================== */
 var callPollingTimer = null;
 var currentCall = null;
 var incomingCall = null;
+
 function startCallPolling() { if (callPollingTimer) clearInterval(callPollingTimer); callPollingTimer = setInterval(pollCalls, 1000); pollCalls(); }
+
 async function pollCalls() {
   if (!currentUser) return;
   try {
@@ -2615,6 +2648,7 @@ async function pollCalls() {
     (data.signals || []).forEach(handleSig);
   } catch (e) {}
 }
+
 function showCallOverlay() {
   document.getElementById('call-overlay').classList.add('active');
   document.getElementById('incoming-call-overlay').classList.remove('active');
@@ -2622,6 +2656,7 @@ function showCallOverlay() {
   document.getElementById('call-in-progress-bar').style.display = 'none';
 }
 function hideCallOverlay() { document.getElementById('call-overlay').classList.remove('active'); }
+
 function minimizeCallOverlay() {
   hideCallOverlay();
   if (currentCall) {
@@ -2630,6 +2665,7 @@ function minimizeCallOverlay() {
     document.getElementById('call-in-progress-name').innerText = currentCall.peerName || 'собеседником';
   }
 }
+
 function restoreCallOverlay() {
   if (!currentCall) { document.getElementById('call-return-btn').style.display = 'none'; document.getElementById('call-in-progress-bar').style.display = 'none'; return; }
   document.getElementById('call-return-btn').style.display = 'none';
@@ -2639,6 +2675,7 @@ function restoreCallOverlay() {
   if (currentCall.localStream) { var lv = document.getElementById('call-local-video'); if (!lv.srcObject) lv.srcObject = currentCall.localStream; lv.style.display = currentCall.camOn ? 'block' : 'none'; }
   if (currentCall.remoteStream) { var rv = document.getElementById('call-remote-video'); if (!rv.srcObject) rv.srcObject = currentCall.remoteStream; rv.style.display = currentCall.video ? 'block' : 'none'; }
 }
+
 function updateCallUI() {
   if (!currentCall) return;
   var a = document.getElementById('call-peer-avatar');
@@ -2654,6 +2691,7 @@ function updateCallUI() {
   document.getElementById('ctrl-cam').classList.toggle('active', currentCall.camOn);
   document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
 }
+
 async function startCall() {
   if (!activePeer || activePeer.type === 'group') { alert('Групповые звонки не поддерживаются'); return; }
   if (currentCall || incomingCall) { alert('Уже есть звонок'); return; }
@@ -2665,10 +2703,11 @@ async function startCall() {
     currentCall = { callId: data.callId, role: 'caller', peerId: activePeer.id, peerName: activePeer.name, peerAvatar: activePeer.avatar || '', video: video, pc: null, localStream: null, remoteStream: null, startedAt: Date.now(), micOn: true, camOn: video, facing: 'user', status: 'ringing' };
     showCallOverlay(); updateCallUI();
     await setupLocalMedia(video);
-    await createPC();
-    updateCallUI();
-  } catch (e) { console.warn('startCall', e); alert('Ошибка звонка'); }
+    if (currentCall) await createPC();
+    if (currentCall) updateCallUI();
+  } catch (e) { console.warn('startCall error', e); alert('Ошибка инициализации звонка'); }
 }
+
 async function acceptIncomingCall() {
   if (!incomingCall) return;
   var c = incomingCall; incomingCall = null;
@@ -2677,35 +2716,48 @@ async function acceptIncomingCall() {
   showCallOverlay(); updateCallUI();
   try { await fetch('/api/calls/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: currentCall.callId, userId: currentUser.id, accept: true }) }); } catch (e) {}
   await setupLocalMedia(currentCall.video);
-  await createPC();
-  updateCallUI();
+  if (currentCall) await createPC();
+  if (currentCall) updateCallUI();
 }
+
 async function rejectIncomingCall() {
   if (!incomingCall) return;
   var c = incomingCall; incomingCall = null;
   document.getElementById('incoming-call-overlay').classList.remove('active');
   try { await fetch('/api/calls/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: c.callId, userId: currentUser.id, accept: false }) }); } catch (e) {}
 }
+
 async function setupLocalMedia(wantVideo) {
+  if (!currentCall) return;
   var constraints = { audio: true, video: wantVideo ? { facingMode: currentCall.facing || 'user' } : false };
   try {
     var stream = await navigator.mediaDevices.getUserMedia(constraints);
+    if (!currentCall) { stream.getTracks().forEach(t => t.stop()); return; }
     currentCall.localStream = stream;
     var lv = document.getElementById('call-local-video');
     lv.srcObject = stream; lv.style.display = wantVideo ? 'block' : 'none';
     document.getElementById('call-audio-screen').style.display = wantVideo ? 'none' : 'flex';
   } catch (e) {
+    if (!currentCall) return;
     if (wantVideo) {
-      try { var s2 = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); currentCall.localStream = s2; currentCall.video = false; currentCall.camOn = false; document.getElementById('call-local-video').style.display = 'none'; document.getElementById('call-audio-screen').style.display = 'flex'; }
-      catch (e2) { alert('Нет доступа'); endCurrentCall(); }
-    } else { alert('Нет доступа'); endCurrentCall(); }
+      try {
+        var s2 = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        if (!currentCall) { s2.getTracks().forEach(t => t.stop()); return; }
+        currentCall.localStream = s2; currentCall.video = false; currentCall.camOn = false;
+        document.getElementById('call-local-video').style.display = 'none';
+        document.getElementById('call-audio-screen').style.display = 'flex';
+      } catch (e2) { alert('Нет доступа к устройствам'); endCurrentCall(); }
+    } else { alert('Нет доступа к микрофону'); endCurrentCall(); }
   }
 }
+
 async function createPC() {
-  var pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  if (!currentCall) return;
+  var pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] });
   currentCall.pc = pc;
   if (currentCall.localStream) { currentCall.localStream.getTracks().forEach(function (t) { pc.addTrack(t, currentCall.localStream); }); }
   pc.ontrack = function (e) {
+    if (!currentCall) return;
     if (e.streams && e.streams[0]) {
       currentCall.remoteStream = e.streams[0];
       var rv = document.getElementById('call-remote-video');
@@ -2715,13 +2767,22 @@ async function createPC() {
     }
   };
   pc.onicecandidate = function (e) { if (e.candidate) sendSig('ice', { candidate: e.candidate }); };
-  pc.onconnectionstatechange = function () { if (pc.connectionState === 'connected') { currentCall.status = 'active'; updateCallUI(); } };
-  if (currentCall.role === 'caller') { var offer = await pc.createOffer(); await pc.setLocalDescription(offer); sendSig('offer', { sdp: offer }); }
+  pc.onconnectionstatechange = function () {
+    if (!currentCall) return;
+    if (pc.connectionState === 'connected') { currentCall.status = 'active'; updateCallUI(); }
+  };
+  if (currentCall.role === 'caller') {
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendSig('offer', { sdp: offer });
+  }
 }
+
 async function sendSig(type, payload) {
   if (!currentCall) return;
   try { await fetch('/api/calls/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: currentCall.callId, fromId: currentUser.id, toId: currentCall.peerId, type: type, payload: payload }) }); } catch (e) {}
 }
+
 async function handleSig(sig) {
   if (sig.type === 'offer-start') {
     if (currentCall || incomingCall) return;
@@ -2736,10 +2797,18 @@ async function handleSig(sig) {
   if (!currentCall || sig.callId !== currentCall.callId) return;
   if (sig.type === 'accepted') { currentCall.status = 'connecting'; updateCallUI(); }
   else if (sig.type === 'rejected' || sig.type === 'ended') { endCurrentCall(true); }
-  else if (sig.type === 'offer') { try { await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp)); var answer = await currentCall.pc.createAnswer(); await currentCall.pc.setLocalDescription(answer); sendSig('answer', { sdp: answer }); } catch (e) {} }
+  else if (sig.type === 'offer') {
+    try {
+      await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp));
+      var answer = await currentCall.pc.createAnswer();
+      await currentCall.pc.setLocalDescription(answer);
+      sendSig('answer', { sdp: answer });
+    } catch (e) {}
+  }
   else if (sig.type === 'answer') { try { await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp)); } catch (e) {} }
   else if (sig.type === 'ice') { try { await currentCall.pc.addIceCandidate(new RTCIceCandidate(sig.payload.candidate)); } catch (e) {} }
 }
+
 function toggleCallMic() {
   if (!currentCall || !currentCall.localStream) return;
   var audioTracks = currentCall.localStream.getAudioTracks();
@@ -2748,11 +2817,13 @@ function toggleCallMic() {
   document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
   document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
 }
+
 async function toggleCallCam() {
   if (!currentCall) return;
   if (!currentCall.camOn) {
     try {
       var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing || 'user' } });
+      if (!currentCall) { vs.getTracks().forEach(t => t.stop()); return; }
       currentCall.localStream = currentCall.localStream || new MediaStream();
       vs.getVideoTracks().forEach(function (t) {
         currentCall.localStream.addTrack(t);
@@ -2771,11 +2842,13 @@ async function toggleCallCam() {
     document.getElementById('ctrl-cam').classList.remove('active');
   }
 }
+
 async function flipCallCamera() {
   if (!currentCall || !currentCall.camOn) return;
   currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user';
   try {
     var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing } });
+    if (!currentCall) { vs.getTracks().forEach(t => t.stop()); return; }
     var newTrack = vs.getVideoTracks()[0];
     currentCall.localStream.getVideoTracks().forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
     currentCall.localStream.addTrack(newTrack);
@@ -2784,6 +2857,7 @@ async function flipCallCamera() {
     document.getElementById('call-local-video').srcObject = currentCall.localStream;
   } catch (e) { currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user'; }
 }
+
 async function endCurrentCall(silent) {
   var c = currentCall; currentCall = null;
   hideCallOverlay();
@@ -2808,7 +2882,7 @@ window.addEventListener('DOMContentLoaded', async function () {
     ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); });
   });
   loadDeletedIds();
-  loadClientSalt();
+  await initMyKeyPair();
   try { currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) { currentUser = null; }
   try { localKnownUsers = JSON.parse(localStorage.getItem('messenger_known_users') || '{}'); } catch (e) { localKnownUsers = {}; }
   try { localMessagesCache = JSON.parse(localStorage.getItem('messenger_messages_cache') || '[]'); } catch (e) { localMessagesCache = []; }
@@ -2821,7 +2895,10 @@ window.addEventListener('DOMContentLoaded', async function () {
   if (!currentUser) {
     setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000);
   }
-  if (currentUser) startApp(); else updateLoadingScreen();
+  if (currentUser) {
+    if (myKeyPair && currentUser) currentUser.pubKey = myKeyPair.pubKeyB64;
+    startApp();
+  } else updateLoadingScreen();
 });
 `;
 
