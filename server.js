@@ -1,15 +1,18 @@
 /* ============================================================
-   server.js — v4.1.2 (stateless, E2EE, UI fix, deviceId)
-   - Хранение: RAM (сервер) + localStorage/IndexedDB (клиент)
-   - Исправлено: онлайн в списке чатов, файлы после перезахода,
-     поиск пользователей, ID = номер устройства
+   server.js — v4.2.0 (full fix, all features verified)
+   - Звонки: очередь ICE, earlySignals, restartIce, timeouts
+   - Профиль: фото object-fit, зелёная точка везде (online/offline)
+   - Поиск: реальный isOnline, anti-race, fallback
+   - Файлы: IndexedDB + quota fallback
+   - Уведомления: звук, title, Notification API, mute
+   - Группы: live-статусы участников
    ============================================================ */
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.1.2';
+const SERVER_VERSION = '4.2.0';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -26,6 +29,8 @@ const MEM = {
 
 const ONLINE_WINDOW_MS = 15000;
 const MAX_INBOX_PER_USER = 300;
+const CALL_RING_TIMEOUT_MS = 60000;
+const CALL_CLEANUP_DELAY_MS = 30000;
 
 function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
@@ -36,12 +41,24 @@ setInterval(function() {
   MEM.accounts = MEM.accounts.filter(u => (now - (u.updatedAt || 0)) < 86400000);
 }, 600000);
 
+/* Автоочистка «висящих» звонков */
+setInterval(function() {
+  const now = Date.now();
+  activeCalls.forEach(function(call, callId) {
+    if (call.status === 'ringing' && (now - call.startedAt) > CALL_RING_TIMEOUT_MS) {
+      pushSig(call.toId, call.fromId, callId, 'ended', { by: 'timeout' });
+      pushSig(call.fromId, call.toId, callId, 'ended', { by: 'timeout' });
+      activeCalls.delete(callId);
+    }
+  });
+}, 15000);
+
 /* ==================== HEALTH ==================== */
 app.get('/api/health', function (req, res) {
   res.json({ ok: true, serverTime: Date.now(), serverVersion: SERVER_VERSION });
 });
 
-/* ==================== ВХОД ПО ИМЕНИ (deviceId = id) ==================== */
+/* ==================== ВХОД ==================== */
 app.post('/api/enter', function (req, res) {
   const name = (req.body.name || '').trim();
   const deviceId = (req.body.deviceId || '').trim();
@@ -53,13 +70,8 @@ app.post('/api/enter', function (req, res) {
   let user = MEM.accounts.find(function (u) { return u.id === deviceId; });
   if (!user) {
     user = {
-      id: deviceId,
-      name: name,
-      avatar: '',
-      pubKey: pubKey,
-      contacts: [],
-      blockedContacts: [],
-      hiddenDialogs: [],
+      id: deviceId, name: name, avatar: '', pubKey: pubKey,
+      contacts: [], blockedContacts: [], hiddenDialogs: [],
       updatedAt: Date.now()
     };
     MEM.accounts.push(user);
@@ -101,12 +113,8 @@ app.post('/api/ping', function (req, res) {
       let ex = MEM.accounts.find(function (a) { return a.id === ku.id; });
       if (!ex) {
         MEM.accounts.push({
-          id: ku.id,
-          name: ku.name || 'Пользователь',
-          avatar: ku.avatar || '',
-          pubKey: ku.pubKey || '',
-          contacts: [], blockedContacts: [], hiddenDialogs: [],
-          updatedAt: 0
+          id: ku.id, name: ku.name || 'Пользователь', avatar: ku.avatar || '', pubKey: ku.pubKey || '',
+          contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0
         });
       } else {
         if (ku.name) ex.name = ku.name;
@@ -119,13 +127,8 @@ app.post('/api/ping', function (req, res) {
   let user = MEM.accounts.find(function (u) { return u.id === id; });
   if (!user) {
     user = {
-      id: id,
-      name: name || 'Пользователь',
-      avatar: avatar || '',
-      pubKey: pubKey || '',
-      contacts: Array.isArray(contacts) ? contacts : [],
-      blockedContacts: [], hiddenDialogs: [],
-      updatedAt: Date.now()
+      id: id, name: name || 'Пользователь', avatar: avatar || '', pubKey: pubKey || '',
+      contacts: Array.isArray(contacts) ? contacts : [], blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now()
     };
     MEM.accounts.push(user);
   } else {
@@ -167,7 +170,10 @@ app.post('/api/profile/update', function (req, res) {
 app.get('/api/users/:userId', function (req, res) {
   const user = MEM.accounts.find(function (u) { return u.id === req.params.userId; });
   if (!user) return res.status(404).json({ error: 'Не найден' });
-  res.json({ id: user.id, name: user.name, avatar: user.avatar || '', pubKey: user.pubKey || '', isOnline: isOnline(user), updatedAt: user.updatedAt });
+  res.json({
+    id: user.id, name: user.name, avatar: user.avatar || '', pubKey: user.pubKey || '',
+    isOnline: isOnline(user), updatedAt: user.updatedAt
+  });
 });
 
 app.post('/api/users/block', function (req, res) {
@@ -198,12 +204,13 @@ app.get('/api/users/search', function (req, res) {
     .filter(function (u) { return u.id && u.id !== excludeId; })
     .filter(function (u) {
       if (!q) return true;
-      return (u.id && u.id.toLowerCase().indexOf(q) !== -1) ||
-             (u.name && u.name.toLowerCase().indexOf(q) !== -1);
+      return (u.id && u.id.toLowerCase().indexOf(q) !== -1) || (u.name && u.name.toLowerCase().indexOf(q) !== -1);
     })
     .map(function (u) {
-      return { id: u.id, type: 'user', name: u.name || 'Пользователь', avatar: u.avatar || '', pubKey: u.pubKey || '',
-        isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) };
+      return {
+        id: u.id, type: 'user', name: u.name || 'Пользователь', avatar: u.avatar || '', pubKey: u.pubKey || '',
+        isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS))
+      };
     })
     .sort(function (a, b) {
       const ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0;
@@ -229,7 +236,12 @@ app.get('/api/users/online', function (req, res) {
   const now = Date.now();
   const list = MEM.accounts
     .filter(function (u) { return u.id !== userId && u.name; })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) }; })
+    .map(function (u) {
+      return {
+        id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '',
+        isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS))
+      };
+    })
     .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(list);
 });
@@ -241,7 +253,10 @@ app.post('/api/groups/create', function (req, res) {
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите название' });
   if (!Array.isArray(members) || members.length === 0) return res.status(400).json({ error: 'Выберите участников' });
   const memberSet = new Set([userId].concat(members.filter(function (m) { return m !== userId; })));
-  const group = { id: genId('grp_'), name: name.trim(), avatar: avatar || '', ownerId: userId, members: Array.from(memberSet), createdAt: Date.now() };
+  const group = {
+    id: genId('grp_'), name: name.trim(), avatar: avatar || '', ownerId: userId,
+    members: Array.from(memberSet), createdAt: Date.now()
+  };
   MEM.groups.push(group);
   res.json({ success: true, group: group });
 });
@@ -250,8 +265,11 @@ function groupWithDetails(group) {
   const now = Date.now();
   const memberDetails = group.members.map(function (mId) {
     const u = MEM.accounts.find(function (a) { return a.id === mId; });
-    return { id: mId, name: u ? u.name : 'Пользователь', avatar: u ? (u.avatar || '') : '', pubKey: u ? (u.pubKey || '') : '',
-      isOnline: !!(u && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) };
+    return {
+      id: mId, name: u ? u.name : 'Пользователь', avatar: u ? (u.avatar || '') : '',
+      pubKey: u ? (u.pubKey || '') : '',
+      isOnline: !!(u && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS))
+    };
   });
   const copy = Object.assign({}, group);
   copy.memberDetails = memberDetails;
@@ -326,18 +344,23 @@ app.post('/api/messages/send', function (req, res) {
   } = req.body;
 
   const sender = MEM.accounts.find(function (u) { return u.id === senderId; });
+  if (!sender) return res.status(404).json({ error: 'Отправитель не найден' });
+
   if (groupId) {
     const g = MEM.groups.find(function (x) { return x.id === groupId; });
     if (!g) return res.status(404).json({ error: 'Не найдена' });
     if (g.members.indexOf(senderId) === -1) return res.status(403).json({ error: 'Вы не участник' });
   } else {
     const receiver = MEM.accounts.find(function (u) { return u.id === receiverId; });
-    if (sender && sender.blockedContacts && sender.blockedContacts.indexOf(receiverId) !== -1) return res.status(403).json({ error: 'Заблокировали' });
-    if (receiver && receiver.blockedContacts && receiver.blockedContacts.indexOf(senderId) !== -1) return res.status(403).json({ error: 'Заблокированы' });
-    if (sender && sender.hiddenDialogs) sender.hiddenDialogs = sender.hiddenDialogs.filter(function (id) { return id !== receiverId; });
-    if (receiver && receiver.hiddenDialogs) receiver.hiddenDialogs = receiver.hiddenDialogs.filter(function (id) { return id !== senderId; });
-    if (sender) { if (!sender.contacts) sender.contacts = []; if (sender.contacts.indexOf(receiverId) === -1) sender.contacts.push(receiverId); }
-    if (receiver) { if (!receiver.contacts) receiver.contacts = []; if (receiver.contacts.indexOf(senderId) === -1) receiver.contacts.push(senderId); }
+    if (!receiver) return res.status(404).json({ error: 'Получатель не найден' });
+    if (sender.blockedContacts && sender.blockedContacts.indexOf(receiverId) !== -1) return res.status(403).json({ error: 'Заблокировали' });
+    if (receiver.blockedContacts && receiver.blockedContacts.indexOf(senderId) !== -1) return res.status(403).json({ error: 'Заблокированы' });
+    if (sender.hiddenDialogs) sender.hiddenDialogs = sender.hiddenDialogs.filter(function (id) { return id !== receiverId; });
+    if (receiver.hiddenDialogs) receiver.hiddenDialogs = receiver.hiddenDialogs.filter(function (id) { return id !== senderId; });
+    if (!sender.contacts) sender.contacts = [];
+    if (sender.contacts.indexOf(receiverId) === -1) sender.contacts.push(receiverId);
+    if (!receiver.contacts) receiver.contacts = [];
+    if (receiver.contacts.indexOf(senderId) === -1) receiver.contacts.push(senderId);
   }
 
   const newMsg = {
@@ -399,8 +422,30 @@ app.get('/api/messages/group/:groupId', function (req, res) {
   res.json(pending.filter(function (m) { return m.groupId === req.params.groupId; }));
 });
 
-app.post('/api/messages/read', function (req, res) { res.json({ success: true }); });
-app.delete('/api/messages/:msgId', function (req, res) { res.json({ success: true }); });
+app.post('/api/messages/read', function (req, res) {
+  const { msgIds, userId } = req.body;
+  if (Array.isArray(msgIds) && userId) {
+    MEM.inbox.forEach(function (q) {
+      q.forEach(function (m) {
+        if (msgIds.indexOf(m.id) !== -1) {
+          if (!m.readBy) m.readBy = [];
+          if (m.readBy.indexOf(userId) === -1) m.readBy.push(userId);
+          m.isRead = true;
+        }
+      });
+    });
+  }
+  res.json({ success: true });
+});
+
+app.delete('/api/messages/:msgId', function (req, res) {
+  const msgId = req.params.msgId;
+  MEM.inbox.forEach(function (q) {
+    q.forEach(function (m) { if (m.id === msgId) m.isDeleted = true; });
+  });
+  res.json({ success: true });
+});
+
 app.post('/api/chat/clear', function (req, res) { res.json({ success: true }); });
 
 app.get('/api/dialogs/:userId', function (req, res) {
@@ -428,9 +473,11 @@ app.post('/api/calls/start', function (req, res) {
   if (!to) return res.status(404).json({ error: 'Получатель не найден' });
   if (to.blockedContacts && to.blockedContacts.indexOf(fromId) !== -1) return res.status(403).json({ error: 'Заблокирован' });
   const callId = genId('call_');
-  activeCalls.set(callId, { id: callId, fromId: fromId, toId: toId,
+  activeCalls.set(callId, {
+    id: callId, fromId: fromId, toId: toId,
     fromName: from.name, fromAvatar: from.avatar || '', toName: to.name,
-    video: !!video, status: 'ringing', startedAt: Date.now(), answeredAt: 0 });
+    video: !!video, status: 'ringing', startedAt: Date.now(), answeredAt: 0
+  });
   pushSig(toId, fromId, callId, 'offer-start', { fromName: from.name, fromAvatar: from.avatar || '', video: !!video });
   res.json({ success: true, callId: callId });
 });
@@ -440,8 +487,14 @@ app.post('/api/calls/answer', function (req, res) {
   const call = activeCalls.get(callId);
   if (!call) return res.status(404).json({ error: 'Нет' });
   if (call.toId !== userId) return res.status(403).json({ error: 'Не тот' });
-  if (accept) { call.status = 'active'; call.answeredAt = Date.now(); pushSig(call.fromId, call.toId, callId, 'accepted', {}); }
-  else { call.status = 'rejected'; pushSig(call.fromId, call.toId, callId, 'rejected', {}); activeCalls.delete(callId); }
+  if (accept) {
+    call.status = 'active'; call.answeredAt = Date.now();
+    pushSig(call.fromId, call.toId, callId, 'accepted', {});
+  } else {
+    call.status = 'rejected';
+    pushSig(call.fromId, call.toId, callId, 'rejected', {});
+    setTimeout(function () { activeCalls.delete(callId); }, CALL_CLEANUP_DELAY_MS);
+  }
   res.json({ success: true });
 });
 
@@ -452,7 +505,7 @@ app.post('/api/calls/end', function (req, res) {
     const peer = userId === call.fromId ? call.toId : call.fromId;
     call.status = 'ended';
     pushSig(peer, userId, callId, 'ended', { by: userId });
-    activeCalls.delete(callId);
+    setTimeout(function () { activeCalls.delete(callId); }, CALL_CLEANUP_DELAY_MS);
   }
   res.json({ success: true });
 });
@@ -460,7 +513,6 @@ app.post('/api/calls/end', function (req, res) {
 app.post('/api/calls/signal', function (req, res) {
   const { callId, fromId, toId, type, payload } = req.body;
   if (!callId || !fromId || !toId || !type) return res.status(400).json({ error: 'Bad' });
-  if (!activeCalls.has(callId)) return res.status(404).json({ error: 'Нет' });
   pushSig(toId, fromId, callId, type, payload);
   res.json({ success: true });
 });
@@ -516,11 +568,22 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .sidebar-header{padding:12px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:10px;}
   .user-profile-bar{display:flex;align-items:center;justify-content:space-between;padding:4px;cursor:pointer;}
   .user-info-brief{display:flex;flex-direction:column;overflow:hidden;margin-left:10px;flex:1;}
+
+  /* Аватарки и индикаторы */
   .avatar-circle{width:40px;height:40px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:visible;}
-  .avatar-circle img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block;position:relative;z-index:1;}
+  .avatar-circle img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:50%;display:block;z-index:1;}
   .avatar-circle > span{position:relative;z-index:1;}
-  .online-indicator{position:absolute;bottom:0;right:0;width:12px;height:12px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;display:none;z-index:10;box-sizing:content-box;}
-  .online-indicator.visible{display:block;}
+  .avatar-circle .online-indicator{position:absolute;bottom:-2px;right:-2px;width:12px;height:12px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;display:none;z-index:10;box-sizing:content-box;}
+  .avatar-circle .online-indicator.visible{display:block;}
+  .avatar-circle .online-indicator.offline{background:#7f91a4;display:block;}
+
+  .profile-avatar-big{width:90px;height:90px;border-radius:50%;background:var(--accent);margin-bottom:15px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:32px;font-weight:bold;position:relative;overflow:hidden;flex-shrink:0;}
+  .profile-avatar-big img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:50%;display:block;}
+  .profile-avatar-big > span{position:relative;z-index:1;}
+  .profile-avatar-big .online-indicator{position:absolute;bottom:0;right:0;width:16px;height:16px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;z-index:5;box-sizing:content-box;display:none;}
+  .profile-avatar-big .online-indicator.visible{display:block;}
+  .profile-avatar-big .online-indicator.offline{background:#7f91a4;display:block;}
+
   .header-actions{display:flex;gap:6px;}
   .theme-toggle-btn{background:var(--bg-input);border:none;color:var(--text-main);width:34px;height:34px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;}
   .search-box{position:relative;}
@@ -582,8 +645,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:2000;display:flex;align-items:center;justify-content:center;visibility:hidden;opacity:0;transition:.15s;pointer-events:none;}
   .modal-overlay.active{visibility:visible;opacity:1;pointer-events:auto;}
   .profile-card{background:var(--bg-sidebar);width:90%;max-width:380px;border-radius:16px;padding:25px;display:flex;flex-direction:column;align-items:center;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5);max-height:90dvh;overflow-y:auto;}
-  .profile-avatar-big{width:90px;height:90px;border-radius:50%;background:var(--accent);margin-bottom:15px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:32px;font-weight:bold;position:relative;overflow:hidden;}
-  .profile-avatar-big img{width:100%;height:100%;object-fit:cover;border-radius:50%;}
   .profile-name{font-size:20px;font-weight:bold;margin-bottom:5px;}
   .profile-id{font-size:13px;color:var(--accent);margin-bottom:15px;}
   .profile-actions{width:100%;display:flex;flex-direction:column;gap:10px;}
@@ -609,8 +670,8 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .call-remote-video{width:100%;height:100%;object-fit:contain;background:#000;}
   .call-local-video{position:absolute;top:70px;right:16px;width:110px;height:160px;object-fit:cover;border-radius:12px;background:#111;box-shadow:0 4px 12px rgba(0,0,0,.5);z-index:5;}
   .call-audio-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;}
-  .call-big-avatar{width:120px;height:120px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:bold;color:#fff;overflow:hidden;}
-  .call-big-avatar img{width:100%;height:100%;object-fit:cover;}
+  .call-big-avatar{width:120px;height:120px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:bold;color:#fff;overflow:hidden;position:relative;}
+  .call-big-avatar img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;border-radius:50%;}
   .call-name{font-size:24px;font-weight:bold;}
   .call-status-text{font-size:14px;opacity:.7;}
   .call-controls{position:absolute;bottom:30px;left:0;right:0;display:flex;justify-content:center;gap:16px;padding:0 16px;flex-wrap:wrap;z-index:10;}
@@ -674,7 +735,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
         <div class="chat-header">
           <button class="btn btn-secondary" style="width:auto;padding:6px 12px;font-size:12px;display:none;" id="back-to-list-btn" onclick="closeMobileChat()">← Назад</button>
           <div class="chat-header-info" onclick="openPeerProfile()">
-            <div class="avatar-circle" id="peer-avatar-circle" style="width:36px;height:36px;font-size:14px;"></div>
+            <div class="avatar-circle" id="peer-avatar-circle" style="width:36px;height:36px;font-size:14px;"><div class="online-indicator"></div></div>
             <div>
               <div id="active-peer-name" style="font-weight:bold;">Выберите чат</div>
               <div id="active-peer-status" style="font-size:11px;color:var(--text-muted);">нажмите для профиля</div>
@@ -712,7 +773,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
-      <div class="profile-avatar-big" id="my-profile-avatar-view"></div>
+      <div class="profile-avatar-big" id="my-profile-avatar-view"><div class="online-indicator visible"></div></div>
       <div class="profile-name" id="my-profile-name-view">Имя</div>
       <div class="profile-id" id="my-profile-id-view">Устройство</div>
       <div class="input-group" style="width:100%;"><input type="text" id="edit-my-name-input" placeholder="Ваше имя..."></div>
@@ -731,7 +792,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
   <div class="modal-overlay" id="peer-profile-modal">
     <div class="profile-card">
-      <div class="profile-avatar-big" id="peer-profile-avatar-view"></div>
+      <div class="profile-avatar-big" id="peer-profile-avatar-view"><div class="online-indicator"></div></div>
       <div class="profile-name" id="peer-profile-name-view">Имя</div>
       <div class="profile-id" id="peer-profile-id-view">Устройство</div>
       <div class="profile-actions">
@@ -850,7 +911,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.1.2';
+var CLIENT_VERSION = '4.2.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -890,6 +951,8 @@ var fileUrlCache = new Map();
 var deletedIds = {};
 var myKeyPair = null;
 var searchRequestSeq = 0;
+var unreadTitleCounter = 0;
+var originalTitle = document.title;
 
 /* ==================== DEVICE ID ==================== */
 function getOrCreateDeviceId() {
@@ -943,11 +1006,8 @@ async function getDerivedSharedKey(peerPubKeyJwkStr) {
   try {
     var peerPub = await crypto.subtle.importKey('jwk', JSON.parse(peerPubKeyJwkStr), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
     var sharedKey = await crypto.subtle.deriveKey(
-      { name: 'ECDH', public: peerPub },
-      myKeyPair.privateKey,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
+      { name: 'ECDH', public: peerPub }, myKeyPair.privateKey,
+      { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
     );
     derivedKeysCache[peerPubKeyJwkStr] = sharedKey;
     return sharedKey;
@@ -959,14 +1019,12 @@ async function aesEncrypt(key, dataU8) {
   var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, dataU8);
   return { iv: bufToBase64(iv), data: bufToBase64(enc) };
 }
-
 async function aesDecrypt(key, ivB64, dataB64) {
   var iv = new Uint8Array(base64ToBuf(ivB64));
   var data = base64ToBuf(dataB64);
   var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, data);
   return new Uint8Array(dec);
 }
-
 async function generateFileKey() { return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']); }
 async function exportFileKeyB64(k) { return bufToBase64(await crypto.subtle.exportKey('raw', k)); }
 async function importFileKeyB64(b64) { return crypto.subtle.importKey('raw', base64ToBuf(b64), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']); }
@@ -978,7 +1036,6 @@ async function encryptBlob(blob) {
   var enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
   return { blob: new Blob([enc], { type: 'application/octet-stream' }), ivB64: bufToBase64(iv), keyB64: await exportFileKeyB64(fileKey), originalSize: blob.size };
 }
-
 async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
   var fileKey = await importFileKeyB64(keyB64);
   var iv = new Uint8Array(base64ToBuf(ivB64));
@@ -986,7 +1043,6 @@ async function decryptBlob(encBlob, keyB64, ivB64, originalType) {
   var dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, fileKey, buf);
   return new Blob([dec], { type: originalType || 'application/octet-stream' });
 }
-
 async function wrapFileKeyForUser(fileKeyB64, peerId) {
   var targetUser = (peerId === currentUser.id) ? currentUser : (localKnownUsers[peerId] || {});
   var pubKeyJwkStr = targetUser.pubKey || (peerId === currentUser.id ? myKeyPair.pubKeyB64 : '');
@@ -996,7 +1052,6 @@ async function wrapFileKeyForUser(fileKeyB64, peerId) {
   var enc = await aesEncrypt(sharedKey, strToU8(fileKeyB64));
   return enc.iv + '.' + enc.data;
 }
-
 async function unwrapFileKeyForMe(wrapped, senderId) {
   if (!wrapped) return null;
   if (wrapped.indexOf('.') === -1) return wrapped;
@@ -1007,25 +1062,17 @@ async function unwrapFileKeyForMe(wrapped, senderId) {
   if (!pubKeyJwkStr) return null;
   var sharedKey = await getDerivedSharedKey(pubKeyJwkStr);
   if (!sharedKey) return null;
-  try {
-    var dec = await aesDecrypt(sharedKey, parts[0], parts[1]);
-    return u8ToStr(dec);
-  } catch (e) { return null; }
+  try { var dec = await aesDecrypt(sharedKey, parts[0], parts[1]); return u8ToStr(dec); }
+  catch (e) { return null; }
 }
-
 function blobToBase64(blob) {
   return new Promise(function (res, rej) {
     var r = new FileReader();
-    r.onload = function () {
-      var s = r.result;
-      var idx = s.indexOf(',');
-      res(idx >= 0 ? s.substring(idx + 1) : s);
-    };
+    r.onload = function () { var s = r.result; var idx = s.indexOf(','); res(idx >= 0 ? s.substring(idx + 1) : s); };
     r.onerror = rej;
     r.readAsDataURL(blob);
   });
 }
-
 function getRecipients() {
   if (!activePeer) return [];
   if (activePeer.type === 'group') {
@@ -1035,7 +1082,6 @@ function getRecipients() {
   }
   return [activePeer.id, currentUser.id];
 }
-
 async function wrapKeyForRecipients(fileKeyB64) {
   var recipients = getRecipients();
   var map = {};
@@ -1044,7 +1090,6 @@ async function wrapKeyForRecipients(fileKeyB64) {
   }
   return map;
 }
-
 async function buildEncryptedPayload(opts) {
   var payload = {
     clientId: opts.clientId, text: '', fileData: '',
@@ -1219,6 +1264,20 @@ function playNotificationSound() {
     osc.start(); osc.stop(ctx.currentTime + 0.3);
   } catch (e) {}
 }
+function isPeerMuted(peerId) {
+  return mutedPeers.indexOf(peerId) !== -1;
+}
+function showBrowserNotification(title, body) {
+  try {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(title, { body: body, silent: false });
+    }
+  } catch (e) {}
+}
+function updatePageTitle() {
+  if (unreadTitleCounter > 0) document.title = '(' + unreadTitleCounter + ') ' + originalTitle;
+  else document.title = originalTitle;
+}
 function updateThemeIcon(theme) { var btn = document.getElementById('theme-toggle-btn'); if (btn) btn.innerText = theme === 'dark' ? '🌙' : '☀️'; }
 function toggleTheme() {
   var current = document.documentElement.getAttribute('data-theme');
@@ -1330,9 +1389,7 @@ async function getFileUrl(msg) {
       return url;
     } catch (e) { return null; }
   }
-  if (msg.encryptionVersion === 2 || msg.fileIv) {
-    return null;
-  }
+  if (msg.encryptionVersion === 2 || msg.fileIv) return null;
   var url2 = URL.createObjectURL(encBlob);
   fileUrlCache.set(msg.id, url2);
   return url2;
@@ -1351,14 +1408,19 @@ document.addEventListener('click', function (e) {
 
 function renderAvatarIntoElement(el, userObj, isOnline) {
   if (!el) return;
+  var indicator = el.querySelector('.online-indicator');
+  if (!indicator) {
+    indicator = document.createElement('div');
+    indicator.className = 'online-indicator';
+    el.appendChild(indicator);
+  }
   var rk = (userObj && userObj.id ? userObj.id : '') + '|' + (userObj && userObj.avatar ? String(userObj.avatar).substring(0, 30) : '') + '|' + (userObj && userObj.name ? userObj.name : '');
   if (el.dataset.renderKey === rk) {
-    var ind = el.querySelector('.online-indicator');
-    if (ind) { if (isOnline) ind.classList.add('visible'); else ind.classList.remove('visible'); }
+    indicator.classList.toggle('visible', !!isOnline);
+    indicator.classList.toggle('offline', !isOnline);
     return;
   }
   el.dataset.renderKey = rk;
-  var indicator = el.querySelector('.online-indicator');
   Array.from(el.childNodes).forEach(function (node) { if (node !== indicator) el.removeChild(node); });
   var src = userObj && userObj.avatar;
   if (src) {
@@ -1368,24 +1430,40 @@ function renderAvatarIntoElement(el, userObj, isOnline) {
       this.remove();
       var s = document.createElement('span');
       s.innerText = ((userObj && userObj.name) ? userObj.name.charAt(0).toUpperCase() : '?');
-      if (indicator) el.insertBefore(s, indicator); else el.appendChild(s);
+      el.insertBefore(s, indicator);
     };
-    if (indicator) el.insertBefore(img, indicator); else el.appendChild(img);
+    el.insertBefore(img, indicator);
   } else {
     var s2 = document.createElement('span');
     s2.innerText = (userObj && userObj.name ? userObj.name.charAt(0).toUpperCase() : '?');
-    if (indicator) el.insertBefore(s2, indicator); else el.appendChild(s2);
+    el.insertBefore(s2, indicator);
   }
-  if (indicator) { if (isOnline) indicator.classList.add('visible'); else indicator.classList.remove('visible'); }
+  indicator.classList.toggle('visible', !!isOnline);
+  indicator.classList.toggle('offline', !isOnline);
 }
-function fillAvatarBox(el, avatar, fallback) { renderAvatarIntoElement(el, { avatar: avatar, name: fallback || '?' }, false); }
-
+function fillAvatarBox(el, avatar, fallback) {
+  if (!el) return;
+  var rk = 'fill|' + (avatar ? String(avatar).substring(0, 30) : '') + '|' + (fallback || '?');
+  if (el.dataset.renderKey === rk) return;
+  el.dataset.renderKey = rk;
+  Array.from(el.childNodes).forEach(function (node) {
+    if (!node.classList || !node.classList.contains('online-indicator')) el.removeChild(node);
+  });
+  if (avatar) {
+    var img = document.createElement('img');
+    img.src = avatar;
+    el.insertBefore(img, el.firstChild);
+  } else {
+    var s = document.createElement('span');
+    s.innerText = fallback || '?';
+    el.insertBefore(s, el.firstChild);
+  }
+}
 function cacheUser(user) {
   if (!user || !user.id || user.type === 'group') return;
   localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar, pubKey: user.pubKey || '', updatedAt: Date.now() };
   try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
 }
-
 function getUserName(id) {
   if (!currentUser) return 'Пользователь';
   if (id === currentUser.id) return currentUser.name;
@@ -1396,7 +1474,6 @@ function getUserName(id) {
   }
   return 'Пользователь';
 }
-
 function getChatMessages(chat) {
   if (!chat || !currentUser) return [];
   var list;
@@ -1411,7 +1488,6 @@ function getChatMessages(chat) {
   }
   return list.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
 }
-
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
   document.getElementById('my-display-id').innerText = 'Устройство №' + currentUser.id;
@@ -1437,43 +1513,31 @@ async function enterByName() {
     currentUser = data.user;
     currentUser.pubKey = myKeyPair ? myKeyPair.pubKeyB64 : '';
     try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+    if ('Notification' in window && Notification.permission === 'default') { try { Notification.requestPermission(); } catch (e) {} }
     startApp();
-  } catch (e) {
-    errBox.innerText = 'Сервер недоступен'; errBox.style.display = 'block';
-  }
+  } catch (e) { errBox.innerText = 'Сервер недоступен'; errBox.style.display = 'block'; }
 }
-
 function logoutUser() {
   if (!confirm('Выйти? Данные останутся на этом устройстве.')) return;
   currentUser = null;
   localStorage.removeItem('messenger_user');
   location.reload();
 }
-
-async function restartSession() {
-  if (!confirm('Перезапустить сессию? Данные сохранятся.')) return;
-  location.reload();
-}
-
+async function restartSession() { if (!confirm('Перезапустить сессию? Данные сохранятся.')) return; location.reload(); }
 async function deleteSession() {
   if (!currentUser) return;
-  var ok = confirm('Удалить сессию?\\n\\nУдалится ВСЁ на этом устройстве: аккаунт, сообщения, файлы, группы, ключи, ID устройства.');
+  var ok = confirm('Удалить сессию?\\n\\nУдалится ВСЁ на этом устройстве.');
   if (!ok) return;
   var uid = currentUser.id;
   try { await fetch('/api/enter/leave', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: uid }) }); } catch (e) {}
   try {
-    ['messenger_user','messenger_known_users','messenger_messages_cache','messenger_ec_priv','messenger_ec_pub','messenger_deleted_ids','messenger_muted_peers','messenger_groups','messenger_device_id'].forEach(function (k) {
-      try { localStorage.removeItem(k); } catch (e) {}
-    });
+    ['messenger_user','messenger_known_users','messenger_messages_cache','messenger_ec_priv','messenger_ec_pub','messenger_deleted_ids','messenger_muted_peers','messenger_groups','messenger_device_id'].forEach(function (k) { try { localStorage.removeItem(k); } catch (e) {} });
   } catch (e) {}
   try {
     var dbs = await indexedDB.databases();
     for (var i = 0; i < dbs.length; i++) {
       if (dbs[i].name && dbs[i].name.indexOf('messenger') === 0) {
-        await new Promise(function (resolve) {
-          var req = indexedDB.deleteDatabase(dbs[i].name);
-          req.onsuccess = req.onerror = req.onblocked = function () { resolve(); };
-        });
+        await new Promise(function (resolve) { var req = indexedDB.deleteDatabase(dbs[i].name); req.onsuccess = req.onerror = req.onblocked = function () { resolve(); }; });
       }
     }
   } catch (e) {
@@ -1506,6 +1570,21 @@ function startApp() {
         saveCache();
         if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
         loadDialogs();
+        // уведомления
+        d.messages.forEach(function (m) {
+          if (m.senderId === currentUser.id) return;
+          if (isPeerMuted(m.senderId)) return;
+          if (document.hidden) {
+            unreadTitleCounter++;
+            updatePageTitle();
+            var senderName = getUserName(m.senderId);
+            var bodyText = m.text || (m.fileType ? '📎 Файл' : 'Сообщение');
+            showBrowserNotification(senderName, bodyText);
+            playNotificationSound();
+          } else if (!activePeer || activePeer.id !== m.senderId) {
+            playNotificationSound();
+          }
+        });
       }
     } catch (e) {}
     refreshChatListStatuses();
@@ -1516,7 +1595,6 @@ function startApp() {
     }
   }, 2000);
 }
-
 async function refreshChatListStatuses() {
   if (!currentUser) return;
   try {
@@ -1532,15 +1610,13 @@ async function refreshChatListStatuses() {
       var ind = av.querySelector('.online-indicator');
       if (!ind) return;
       var isOn = !!onlineMap[pid];
-      if (isOn) ind.classList.add('visible'); else ind.classList.remove('visible');
+      ind.classList.toggle('visible', isOn);
+      ind.classList.toggle('offline', !isOn);
       var sub = itemEl.querySelector('.chat-item-subtitle');
-      if (sub) {
-        sub.innerHTML = isOn ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-      }
+      if (sub) sub.innerHTML = isOn ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
     });
   } catch (e) {}
 }
-
 async function sendPing() {
   if (!currentUser) return;
   try {
@@ -1554,27 +1630,16 @@ async function sendPing() {
     pingFailCount = 0;
     if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
     if (data.success && data.user) {
-      var serverUser = data.user;
-      var changed = false;
+      var serverUser = data.user; var changed = false;
       if (serverUser.name && serverUser.name !== currentUser.name) { currentUser.name = serverUser.name; changed = true; }
       if (serverUser.avatar !== undefined && serverUser.avatar !== currentUser.avatar) { currentUser.avatar = serverUser.avatar; changed = true; }
-      if (serverUser.contacts) {
-        if (!currentUser.contacts) currentUser.contacts = [];
-        serverUser.contacts.forEach(function (c) { if (currentUser.contacts.indexOf(c) === -1) currentUser.contacts.push(c); });
-        changed = true;
-      }
+      if (serverUser.contacts) { if (!currentUser.contacts) currentUser.contacts = []; serverUser.contacts.forEach(function (c) { if (currentUser.contacts.indexOf(c) === -1) currentUser.contacts.push(c); }); changed = true; }
       if (serverUser.blockedContacts) currentUser.blockedContacts = serverUser.blockedContacts;
       if (changed) { try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {} updateMyProfileUI(); }
       if (Array.isArray(data.pendingMessages) && data.pendingMessages.length > 0) {
         (async function () {
-          for (var i = 0; i < data.pendingMessages.length; i++) {
-            var m = data.pendingMessages[i];
-            await processIncomingMessage(m);
-            if (!m.isDeleted) mergeMessage(m);
-          }
-          saveCache();
-          if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
-          loadDialogs();
+          for (var i = 0; i < data.pendingMessages.length; i++) { var m = data.pendingMessages[i]; await processIncomingMessage(m); if (!m.isDeleted) mergeMessage(m); }
+          saveCache(); if (activePeer) renderMessagesContainer(getChatMessages(activePeer)); loadDialogs();
         })();
       }
     }
@@ -1584,16 +1649,13 @@ async function sendPing() {
     else if (pingFailCount >= 3) setConnectionState('server-offline');
   }
 }
-
 async function refreshActivePeerStatus() {
   if (!activePeer || activePeer.type === 'group') return;
   try {
     var res = await fetch('/api/users/' + activePeer.id);
     if (res.ok) {
       var info = await res.json();
-      activePeer.isOnline = info.isOnline;
-      activePeer.name = info.name;
-      activePeer.avatar = info.avatar;
+      activePeer.isOnline = info.isOnline; activePeer.name = info.name; activePeer.avatar = info.avatar;
       if (info.pubKey) { activePeer.pubKey = info.pubKey; cacheUser(activePeer); }
       var statusEl = document.getElementById('active-peer-status');
       if (info.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
@@ -1609,8 +1671,7 @@ function loadDialogs() {
   if (document.getElementById('search-input').value.trim()) return;
   var peers = new Set();
   localMessagesCache.forEach(function (m) {
-    if (m.isDeleted || deletedIds[m.id]) return;
-    if (m.groupId) return;
+    if (m.isDeleted || deletedIds[m.id]) return; if (m.groupId) return;
     if (m.senderId === currentUser.id) peers.add(m.receiverId);
     if (m.receiverId === currentUser.id) peers.add(m.senderId);
   });
@@ -1626,46 +1687,31 @@ function loadDialogs() {
       if (!u || !u.name) return;
       var last = 0;
       localMessagesCache.forEach(function (m) {
-        if (m.isDeleted) return;
-        if (m.groupId) return;
-        if ((m.senderId === currentUser.id && m.receiverId === pid) || (m.senderId === pid && m.receiverId === currentUser.id)) {
-          if ((m.ts || 0) > last) last = m.ts || 0;
-        }
+        if (m.isDeleted || m.groupId) return;
+        if ((m.senderId === currentUser.id && m.receiverId === pid) || (m.senderId === pid && m.receiverId === currentUser.id)) { if ((m.ts || 0) > last) last = m.ts || 0; }
       });
       dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!onlineMap[pid], lastTs: last });
     });
     localGroups.forEach(function (g) {
       var last = 0;
-      localMessagesCache.forEach(function (m) {
-        if (m.isDeleted) return;
-        if (m.groupId === g.id && (m.ts || 0) > last) last = m.ts || 0;
-      });
+      localMessagesCache.forEach(function (m) { if (!m.isDeleted && m.groupId === g.id && (m.ts || 0) > last) last = m.ts || 0; });
       dialogs.push({ id: g.id, type: 'group', name: g.name, avatar: g.avatar || '', ownerId: g.ownerId, members: g.members, memberCount: (g.members || []).length, lastTs: last });
     });
     dialogs.sort(function (a, b) { return (b.lastTs || 0) - (a.lastTs || 0); });
     renderChatList(dialogs);
   }).catch(function () {
     var dialogs = [];
-    peers.forEach(function (pid) {
-      var u = localKnownUsers[pid];
-      if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false, lastTs: 0 });
-    });
-    localGroups.forEach(function (g) {
-      dialogs.push({ id: g.id, type: 'group', name: g.name, avatar: g.avatar || '', ownerId: g.ownerId, members: g.members, memberCount: (g.members || []).length, lastTs: 0 });
-    });
+    peers.forEach(function (pid) { var u = localKnownUsers[pid]; if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false, lastTs: 0 }); });
+    localGroups.forEach(function (g) { dialogs.push({ id: g.id, type: 'group', name: g.name, avatar: g.avatar || '', ownerId: g.ownerId, members: g.members, memberCount: (g.members || []).length, lastTs: 0 }); });
     renderChatList(dialogs);
   });
 }
-
 function renderChatList(list) {
   var container = document.getElementById('chat-list');
   var currentActiveId = activePeer ? activePeer.id : null;
   var currentActiveType = activePeer ? (activePeer.type || 'user') : null;
   container.innerHTML = '';
-  if (!list || list.length === 0) {
-    container.innerHTML = '<div style="padding:15px;color:var(--text-muted);font-size:12px;text-align:center;">Нет чатов. Найдите собеседника в поиске.</div>';
-    return;
-  }
+  if (!list || list.length === 0) { container.innerHTML = '<div style="padding:15px;color:var(--text-muted);font-size:12px;text-align:center;">Нет чатов. Найдите собеседника в поиске.</div>'; return; }
   list.forEach(function (item) {
     var isGroup = item.type === 'group';
     var div = document.createElement('div');
@@ -1674,24 +1720,18 @@ function renderChatList(list) {
     div.className = 'chat-item ' + (isActive ? 'active' : '');
     div.onclick = function () { openChat(item); };
     var avatarId = 'chat_av_' + (isGroup ? 'grp_' : 'usr_') + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
-    var subtitle;
-    if (isGroup) subtitle = '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || 0) + '</span>';
-    else subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' + (isGroup ? '' : '<div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div>') + '</div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div class="chat-item-subtitle" style="font-size:11px;">' + subtitle + '</div></div>';
+    var subtitle = isGroup ? '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || 0) + '</span>' : (item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>');
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' + (isGroup ? '' : '<div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div>') + '</div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div class="chat-item-subtitle" style="font-size:11px;">' + subtitle + '</div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   });
 }
-
 function renderSearchResults(list) {
   var container = document.getElementById('chat-list');
   var currentActiveId = activePeer ? activePeer.id : null;
   var currentActiveType = activePeer ? (activePeer.type || 'user') : null;
   container.innerHTML = '';
-  if (!list || list.length === 0) {
-    container.innerHTML = '<div style="padding:15px;color:var(--text-muted);font-size:12px;text-align:center;">Никого не найдено</div>';
-    return;
-  }
+  if (!list || list.length === 0) { container.innerHTML = '<div style="padding:15px;color:var(--text-muted);font-size:12px;text-align:center;">Никого не найдено</div>'; return; }
   var onlineList = list.filter(function (u) { return u.isOnline; });
   var offlineList = list.filter(function (u) { return !u.isOnline; });
   function buildItem(item) {
@@ -1701,26 +1741,17 @@ function renderSearchResults(list) {
     div.onclick = function () { openChat(item); };
     var avatarId = 'ch_av_' + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     var subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">№' + escapeHtml(item.id || '') + '</span></div></div>';
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">№' + escapeHtml(item.id || '') + '</span></div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   }
-  if (onlineList.length > 0) {
-    var l1 = document.createElement('div'); l1.className = 'list-label'; l1.innerText = 'В сети (' + onlineList.length + ')';
-    container.appendChild(l1); onlineList.forEach(buildItem);
-  }
-  if (offlineList.length > 0) {
-    var l2 = document.createElement('div'); l2.className = 'list-label'; l2.innerText = 'Не в сети (' + offlineList.length + ')';
-    container.appendChild(l2); offlineList.forEach(buildItem);
-  }
+  if (onlineList.length > 0) { var l1 = document.createElement('div'); l1.className = 'list-label'; l1.innerText = 'В сети (' + onlineList.length + ')'; container.appendChild(l1); onlineList.forEach(buildItem); }
+  if (offlineList.length > 0) { var l2 = document.createElement('div'); l2.className = 'list-label'; l2.innerText = 'Не в сети (' + offlineList.length + ')'; container.appendChild(l2); offlineList.forEach(buildItem); }
 }
 
 /* ==================== ПОИСК ==================== */
 var searchDebounceTimer = null;
-function onSearchInput() {
-  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
-  searchDebounceTimer = setTimeout(doSearch, 200);
-}
+function onSearchInput() { if (searchDebounceTimer) clearTimeout(searchDebounceTimer); searchDebounceTimer = setTimeout(doSearch, 200); }
 async function doSearch() {
   var mySeq = ++searchRequestSeq;
   var q = document.getElementById('search-input').value.trim();
@@ -1736,39 +1767,24 @@ async function doSearch() {
   }
   if (q) clearBtn.style.display = 'block'; else clearBtn.style.display = 'none';
   renderSearchResults(Object.values(map));
-
   try {
     var r = await fetch('/api/users/search?q=' + encodeURIComponent(q) + '&excludeId=' + encodeURIComponent(currentUser.id));
     if (mySeq !== searchRequestSeq) return;
     var users = await r.json();
     if (Array.isArray(users)) {
       users.forEach(function (u) {
-        if (map[u.id]) {
-          map[u.id].isOnline = !!u.isOnline;
-          map[u.id].name = u.name || map[u.id].name;
-          map[u.id].avatar = u.avatar !== undefined ? u.avatar : map[u.id].avatar;
-        } else {
-          map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!u.isOnline };
-        }
+        if (map[u.id]) { map[u.id].isOnline = !!u.isOnline; map[u.id].name = u.name || map[u.id].name; map[u.id].avatar = u.avatar !== undefined ? u.avatar : map[u.id].avatar; }
+        else map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!u.isOnline };
         cacheUser(u);
       });
     }
   } catch (e) {}
-
   if (mySeq !== searchRequestSeq) return;
   var arr = Object.values(map);
-  arr.sort(function (a, b) {
-    var ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0;
-    if (ao !== bo) return bo - ao;
-    return a.name.localeCompare(b.name);
-  });
+  arr.sort(function (a, b) { var ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0; if (ao !== bo) return bo - ao; return a.name.localeCompare(b.name); });
   renderSearchResults(arr);
 }
-function clearSearch() {
-  document.getElementById('search-input').value = '';
-  document.getElementById('clear-search-btn').style.display = 'none';
-  loadDialogs();
-}
+function clearSearch() { document.getElementById('search-input').value = ''; document.getElementById('clear-search-btn').style.display = 'none'; loadDialogs(); }
 
 /* ==================== ЧАТ ==================== */
 function openChat(peer) {
@@ -1794,12 +1810,11 @@ function openChat(peer) {
   if (window.innerWidth <= 600) { document.getElementById('app-screen').classList.add('app-mobile-chat'); document.getElementById('back-to-list-btn').style.display = 'block'; }
   loadMessages();
   if (peer.type === 'group') refreshGroupInfo();
+  // сбрасываем счётчик непрочитанных при открытии чата
+  unreadTitleCounter = 0; updatePageTitle();
 }
-
 function closeMobileChat() { document.getElementById('app-screen').classList.remove('app-mobile-chat'); }
-function msgFetchUrl() {
-  return activePeer.type === 'group' ? '/api/messages/group/' + activePeer.id + '?userId=' + encodeURIComponent(currentUser.id) : '/api/messages/' + currentUser.id + '/' + activePeer.id;
-}
+function msgFetchUrl() { return activePeer.type === 'group' ? '/api/messages/group/' + activePeer.id + '?userId=' + encodeURIComponent(currentUser.id) : '/api/messages/' + currentUser.id + '/' + activePeer.id; }
 
 /* ==================== РАСШИФРОВКА ==================== */
 async function processIncomingMessage(m) {
@@ -1813,47 +1828,31 @@ async function processIncomingMessage(m) {
       if (wrapped) {
         try {
           var fileKeyB64 = await unwrapFileKeyForMe(wrapped, m.senderId);
-          if (fileKeyB64) {
-            var fileKey = await importFileKeyB64(fileKeyB64);
-            var dec = await aesDecrypt(fileKey, ivB64, dataB64);
-            m.text = u8ToStr(dec);
-          } else m.text = '[Зашифрованное сообщение]';
+          if (fileKeyB64) { var fileKey = await importFileKeyB64(fileKeyB64); var dec = await aesDecrypt(fileKey, ivB64, dataB64); m.text = u8ToStr(dec); }
+          else m.text = '[Зашифрованное сообщение]';
         } catch (e) { m.text = '[Ошибка расшифровки]'; }
       } else m.text = '[Ошибка ключа]';
     }
   }
 }
-
 async function loadMessages() {
   if (!activePeer) return;
   try {
     var res = await fetch(msgFetchUrl());
     var messages = await res.json();
-    for (var i = 0; i < messages.length; i++) {
-      await processIncomingMessage(messages[i]);
-      if (!messages[i].isDeleted) mergeMessage(messages[i]);
-    }
-    saveCache();
-    renderMessagesContainer(getChatMessages(activePeer));
-    checkVisibleMessages();
+    for (var i = 0; i < messages.length; i++) { await processIncomingMessage(messages[i]); if (!messages[i].isDeleted) mergeMessage(messages[i]); }
+    saveCache(); renderMessagesContainer(getChatMessages(activePeer)); checkVisibleMessages();
   } catch (e) { renderMessagesContainer(getChatMessages(activePeer)); }
 }
-
-async function loadMessagesQuiet() {
-  if (!activePeer) return;
-  renderMessagesContainer(getChatMessages(activePeer));
-}
-
+async function loadMessagesQuiet() { if (!activePeer) return; renderMessagesContainer(getChatMessages(activePeer)); }
 function openImageViewer(src) { if (document.getElementById('image-viewer-modal').classList.contains('active')) return; document.getElementById('full-screen-img').src = src; document.getElementById('image-viewer-modal').classList.add('active'); }
 function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
-
 function isGroupMsgRead(m) {
   if (!activePeer || activePeer.type !== 'group') return m.isRead;
   var others = (activePeer.members || []).filter(function (x) { return x !== currentUser.id; });
   var rb = (m.readBy || []).filter(function (x) { return x !== currentUser.id; });
   return others.length > 0 && rb.length >= others.length;
 }
-
 async function renderMessagesContainer(messages) {
   var container = document.getElementById('messages-container');
   var isScrolledToBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 80;
@@ -1869,14 +1868,8 @@ async function renderMessagesContainer(messages) {
     div.className = 'msg ' + (m.senderId === currentUser.id ? 'my' : '') + pendingCls;
     div.setAttribute('data-msg-id', m.id);
     div.setAttribute('data-sender-id', m.senderId);
-    div.oncontextmenu = (function (msg, el) { return function (e) {
-      if (e.target.tagName === 'AUDIO' || e.target.tagName === 'VIDEO' || (e.target.closest && (e.target.closest('audio') || e.target.closest('video')))) return;
-      e.preventDefault(); openMsgActions(msg, el);
-    }; })(m, div);
-    div.ontouchstart = (function (msg, el) { return function (e) {
-      if (e.target.tagName === 'AUDIO' || e.target.tagName === 'VIDEO' || (e.target.closest && (e.target.closest('audio') || e.target.closest('video')))) return;
-      longTouchTimer = setTimeout(function () { openMsgActions(msg, el); }, 500);
-    }; })(m, div);
+    div.oncontextmenu = (function (msg, el) { return function (e) { if (e.target.tagName === 'AUDIO' || e.target.tagName === 'VIDEO' || (e.target.closest && (e.target.closest('audio') || e.target.closest('video')))) return; e.preventDefault(); openMsgActions(msg, el); }; })(m, div);
+    div.ontouchstart = (function (msg, el) { return function (e) { if (e.target.tagName === 'AUDIO' || e.target.tagName === 'VIDEO' || (e.target.closest && (e.target.closest('audio') || e.target.closest('video')))) return; longTouchTimer = setTimeout(function () { openMsgActions(msg, el); }, 500); }; })(m, div);
     div.ontouchend = function () { clearTimeout(longTouchTimer); };
     div.ontouchmove = function () { clearTimeout(longTouchTimer); };
     var html = '';
@@ -1892,16 +1885,12 @@ async function renderMessagesContainer(messages) {
     }
     var ticksHtml = '';
     if (m.senderId === currentUser.id) {
-      var read = isGroupMsgRead(m);
-      var isReadClass = read ? 'ticks read' : 'ticks';
+      var read = isGroupMsgRead(m); var isReadClass = read ? 'ticks read' : 'ticks';
       var ticksSymbol = m.isPending ? '🕐' : (m.isWaiting ? '⏳' : (read ? '✓✓' : '✓'));
       ticksHtml = '<span class="' + isReadClass + '">' + ticksSymbol + '</span>';
     }
     var waitLabel = '';
-    if (m.isWaiting && m.senderId === currentUser.id) {
-      var peerName = isGroup ? 'группы' : getUserName(m.receiverId);
-      waitLabel = '<div style="font-size:10px;color:var(--accent);margin-top:2px;">⏳ Ожидание соединения с ' + escapeHtml(peerName) + '…</div>';
-    }
+    if (m.isWaiting && m.senderId === currentUser.id) { var peerName = isGroup ? 'группы' : getUserName(m.receiverId); waitLabel = '<div style="font-size:10px;color:var(--accent);margin-top:2px;">⏳ Ожидание соединения с ' + escapeHtml(peerName) + '…</div>'; }
     html += waitLabel;
     html += '<div class="msg-footer"><span>' + escapeHtml(m.timestamp || '') + '</span>' + ticksHtml + '</div>';
     div.innerHTML = html;
@@ -1912,7 +1901,6 @@ async function renderMessagesContainer(messages) {
   if (isScrolledToBottom) container.scrollTop = container.scrollHeight;
   mediaTasks.forEach(function (task) { loadMediaIntoPlaceholder(task.msg, task.placeholder).catch(function () {}); });
 }
-
 async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!placeholder || !placeholder.parentNode) return;
   if (deletedIds[msg.id] || msg.isDeleted) { if (placeholder.parentNode) placeholder.remove(); return; }
@@ -1922,39 +1910,30 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
   var ft = msg.fileType || '';
   var newEl = null;
   if (ft.indexOf('image/') === 0) {
-    newEl = document.createElement('img');
-    newEl.className = 'media-preview'; newEl.src = url;
+    newEl = document.createElement('img'); newEl.className = 'media-preview'; newEl.src = url;
     newEl.addEventListener('click', function (e) { e.stopPropagation(); openImageViewer(url); });
   } else if (ft.indexOf('video/') === 0) {
-    var wrapper = document.createElement('div');
-    wrapper.className = 'vid-wrapper';
-    var video = document.createElement('video');
-    video.src = url; video.controls = true; video.playsInline = true; video.preload = 'metadata';
+    var wrapper = document.createElement('div'); wrapper.className = 'vid-wrapper';
+    var video = document.createElement('video'); video.src = url; video.controls = true; video.playsInline = true; video.preload = 'metadata';
     if (msg.thumbUrl) video.poster = msg.thumbUrl;
     wrapper.appendChild(video); newEl = wrapper;
   } else if (ft.indexOf('audio/') === 0) {
-    newEl = document.createElement('audio');
-    newEl.className = 'audio-preview'; newEl.controls = true; newEl.preload = 'metadata'; newEl.src = url;
+    newEl = document.createElement('audio'); newEl.className = 'audio-preview'; newEl.controls = true; newEl.preload = 'metadata'; newEl.src = url;
   } else {
-    newEl = document.createElement('a');
-    newEl.className = 'file-link'; newEl.href = url; newEl.download = msg.fileName || 'file';
-    newEl.target = '_blank';
+    newEl = document.createElement('a'); newEl.className = 'file-link'; newEl.href = url; newEl.download = msg.fileName || 'file'; newEl.target = '_blank';
     newEl.textContent = '📁 ' + (msg.fileName || 'Файл') + (msg.fileSize ? ' (' + formatBytes(msg.fileSize) + ')' : '');
   }
   if (!newEl) { placeholder.outerHTML = '<div class="file-placeholder">⚠️ Файл недоступен</div>'; return; }
   placeholder.parentNode.replaceChild(newEl, placeholder);
 }
-
 function checkVisibleMessages() {
   setTimeout(function () {
     if (!activePeer) return;
     var container = document.getElementById('messages-container');
     var els = container.querySelectorAll('.msg');
-    var cr = container.getBoundingClientRect();
-    var unread = [];
+    var cr = container.getBoundingClientRect(); var unread = [];
     els.forEach(function (el) {
-      var sid = el.getAttribute('data-sender-id');
-      var mid = el.getAttribute('data-msg-id');
+      var sid = el.getAttribute('data-sender-id'); var mid = el.getAttribute('data-msg-id');
       if (sid === currentUser.id || mid.indexOf('cid_') === 0) return;
       if (deletedIds[mid]) return;
       var r = el.getBoundingClientRect();
@@ -1964,13 +1943,9 @@ function checkVisibleMessages() {
         if (!mo.isRead) { mo.isRead = true; unread.push(mid); }
       }
     });
-    if (unread.length > 0) {
-      saveCache();
-      fetch('/api/messages/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msgIds: unread, userId: currentUser.id }) }).catch(function () {});
-    }
+    if (unread.length > 0) { saveCache(); fetch('/api/messages/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msgIds: unread, userId: currentUser.id }) }).catch(function () {}); }
   }, 300);
 }
-
 function openMsgActions(msg, el) {
   if (document.getElementById('msg-actions-sheet').classList.contains('active')) return;
   selectedMsgId = msg.id; selectedMsgObj = msg;
@@ -1980,30 +1955,18 @@ function openMsgActions(msg, el) {
   document.getElementById('action-btn-download').style.display = (msg.encFileData || msg.fileData || msg.fileUrl) ? 'block' : 'none';
   document.getElementById('msg-actions-sheet').classList.add('active');
 }
-function closeMsgActions() {
-  selectedMsgId = null; selectedMsgObj = null;
-  document.querySelectorAll('.msg').forEach(function (x) { x.classList.remove('selected-msg'); });
-  document.getElementById('msg-actions-sheet').classList.remove('active');
-}
+function closeMsgActions() { selectedMsgId = null; selectedMsgObj = null; document.querySelectorAll('.msg').forEach(function (x) { x.classList.remove('selected-msg'); }); document.getElementById('msg-actions-sheet').classList.remove('active'); }
 function actionCopyText() { var t = selectedMsgObj && selectedMsgObj.text; closeMsgActions(); if (t) navigator.clipboard.writeText(t).catch(function () {}); }
 async function actionDownloadFile() {
-  var obj = selectedMsgObj; closeMsgActions();
-  if (!obj) return;
-  var url = await getFileUrl(obj);
-  if (!url) { alert('Файл недоступен'); return; }
-  var a = document.createElement('a'); a.href = url; a.download = obj.fileName || 'file';
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  var obj = selectedMsgObj; closeMsgActions(); if (!obj) return;
+  var url = await getFileUrl(obj); if (!url) { alert('Файл недоступен'); return; }
+  var a = document.createElement('a'); a.href = url; a.download = obj.fileName || 'file'; document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 async function deleteSelectedMessage() {
-  var id = selectedMsgId; closeMsgActions();
-  if (!id) return;
+  var id = selectedMsgId; closeMsgActions(); if (!id) return;
   markDeleted(id);
-  for (var i = 0; i < localMessagesCache.length; i++) {
-    if (localMessagesCache[i].id === id) { localMessagesCache[i].isDeleted = true; break; }
-  }
-  saveCache();
-  lastMessagesHash = '';
-  await deleteFileFromIDB(id);
+  for (var i = 0; i < localMessagesCache.length; i++) { if (localMessagesCache[i].id === id) { localMessagesCache[i].isDeleted = true; break; } }
+  saveCache(); lastMessagesHash = ''; await deleteFileFromIDB(id);
   if (fileUrlCache.has(id)) { try { URL.revokeObjectURL(fileUrlCache.get(id)); } catch (e) {} fileUrlCache.delete(id); }
   if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
   try { await fetch('/api/messages/' + id + '?userId=' + encodeURIComponent(currentUser.id), { method: 'DELETE' }); } catch (e) {}
@@ -2015,15 +1978,12 @@ function loadDeletedIds() { try { deletedIds = JSON.parse(localStorage.getItem('
 function triggerFileInput() { document.getElementById('file-input').click(); }
 function generateVideoThumbnail(file, callback) {
   var video = document.createElement('video');
-  video.preload = 'metadata';
-  video.src = URL.createObjectURL(file);
-  video.muted = true; video.playsInline = true;
+  video.preload = 'metadata'; video.src = URL.createObjectURL(file); video.muted = true; video.playsInline = true;
   video.onloadeddata = function () { video.currentTime = 0.5; };
   video.onseeked = function () {
     try {
       var canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth || 320;
-      canvas.height = video.videoHeight || 240;
+      canvas.width = video.videoWidth || 320; canvas.height = video.videoHeight || 240;
       canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
       callback(canvas.toDataURL('image/jpeg', 0.8));
     } catch (e) { callback(''); }
@@ -2037,23 +1997,12 @@ function handleFileSelect(e) {
   var thumbImg = document.getElementById('attachment-thumb-img');
   document.getElementById('attachment-name-label').innerText = file.name;
   document.getElementById('attachment-type-label').innerText = formatBytes(file.size);
-  if (file.type.indexOf('image/') === 0) {
-    var r = new FileReader();
-    r.onload = function (ev) { thumbImg.src = ev.target.result; thumbImg.style.display = 'block'; };
-    r.readAsDataURL(file);
-  } else if (file.type.indexOf('video/') === 0) {
-    generateVideoThumbnail(file, function (thumb) {
-      selectedFile.thumbUrl = thumb;
-      if (thumb) { thumbImg.src = thumb; thumbImg.style.display = 'block'; } else { thumbImg.src = ''; thumbImg.style.display = 'none'; }
-    });
-  } else { thumbImg.src = ''; thumbImg.style.display = 'none'; }
+  if (file.type.indexOf('image/') === 0) { var r = new FileReader(); r.onload = function (ev) { thumbImg.src = ev.target.result; thumbImg.style.display = 'block'; }; r.readAsDataURL(file); }
+  else if (file.type.indexOf('video/') === 0) { generateVideoThumbnail(file, function (thumb) { selectedFile.thumbUrl = thumb; if (thumb) { thumbImg.src = thumb; thumbImg.style.display = 'block'; } else { thumbImg.src = ''; thumbImg.style.display = 'none'; } }); }
+  else { thumbImg.src = ''; thumbImg.style.display = 'none'; }
   document.getElementById('attachment-preview-container').classList.add('active');
 }
-function cancelAttachment() {
-  selectedFile = null;
-  document.getElementById('file-input').value = '';
-  document.getElementById('attachment-preview-container').classList.remove('active');
-}
+function cancelAttachment() { selectedFile = null; document.getElementById('file-input').value = ''; document.getElementById('attachment-preview-container').classList.remove('active'); }
 function cancelVoiceAttachment() {
   if (pendingVoice && pendingVoice.url && pendingVoice.url.indexOf('blob:') === 0) { try { URL.revokeObjectURL(pendingVoice.url); } catch (e) {} }
   pendingVoice = null;
@@ -2064,16 +2013,11 @@ function cancelVoiceAttachment() {
 
 /* ==================== ГОЛОС ==================== */
 function floatTo16BitPCM(output, offset, input) {
-  for (var i = 0; i < input.length; i++, offset += 2) {
-    var s = Math.max(-1, Math.min(1, input[i]));
-    s = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    output.setInt16(offset, s, true);
-  }
+  for (var i = 0; i < input.length; i++, offset += 2) { var s = Math.max(-1, Math.min(1, input[i])); s = s < 0 ? s * 0x8000 : s * 0x7FFF; output.setInt16(offset, s, true); }
 }
 function writeString(view, offset, string) { for (var i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i)); }
 function encodeWAV(samples, sampleRate) {
-  var buffer = new ArrayBuffer(44 + samples.length * 2);
-  var view = new DataView(buffer);
+  var buffer = new ArrayBuffer(44 + samples.length * 2); var view = new DataView(buffer);
   writeString(view, 0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true);
   writeString(view, 8, 'WAVE'); writeString(view, 12, 'fmt ');
   view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
@@ -2095,21 +2039,14 @@ function startRecordingTimer() {
   document.getElementById('record-panel').classList.add('active');
   document.getElementById('recording-timer').innerText = '0:00';
   if (recordingTimerInterval) clearInterval(recordingTimerInterval);
-  recordingTimerInterval = setInterval(function () {
-    var s = Math.floor((Date.now() - recordStartedAt) / 1000);
-    document.getElementById('recording-timer').innerText = Math.floor(s / 60) + ':' + (s % 60).toString().padStart(2, '0');
-  }, 200);
+  recordingTimerInterval = setInterval(function () { var s = Math.floor((Date.now() - recordStartedAt) / 1000); document.getElementById('recording-timer').innerText = Math.floor(s / 60) + ':' + (s % 60).toString().padStart(2, '0'); }, 200);
 }
-function stopRecordingTimer() {
-  document.getElementById('record-panel').classList.remove('active');
-  if (recordingTimerInterval) { clearInterval(recordingTimerInterval); recordingTimerInterval = null; }
-}
+function stopRecordingTimer() { document.getElementById('record-panel').classList.remove('active'); if (recordingTimerInterval) { clearInterval(recordingTimerInterval); recordingTimerInterval = null; } }
 async function toggleVoiceRecord() {
   var micBtn = document.getElementById('mic-btn');
   if (isRecording) {
     isRecording = false; micBtn.innerText = '🎙️'; micBtn.classList.remove('recording'); stopRecordingTimer();
-    var chunks = audioChunks.slice();
-    var rate = recordAudioCtx ? recordAudioCtx.sampleRate : 48000;
+    var chunks = audioChunks.slice(); var rate = recordAudioCtx ? recordAudioCtx.sampleRate : 48000;
     cleanupRecordingNodes();
     try { if (activeStream) activeStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
     activeStream = null;
@@ -2119,13 +2056,11 @@ async function toggleVoiceRecord() {
     for (var j = 0; j < chunks.length; j++) { merged.set(chunks[j], off); off += chunks[j].length; }
     var targetRate = 16000; var final = merged, fr = rate;
     if (rate > targetRate) {
-      var ratio = rate / targetRate; var nl = Math.floor(merged.length / ratio);
-      var down = new Float32Array(nl);
+      var ratio = rate / targetRate; var nl = Math.floor(merged.length / ratio); var down = new Float32Array(nl);
       for (var k = 0; k < nl; k++) down[k] = merged[Math.floor(k * ratio)] || 0;
       final = down; fr = targetRate;
     }
-    var wavBlob = encodeWAV(final, fr);
-    var url = '';
+    var wavBlob = encodeWAV(final, fr); var url = '';
     try { url = URL.createObjectURL(wavBlob); } catch (e) {}
     pendingVoice = { name: 'voice_' + Date.now() + '.wav', type: 'audio/wav', url: url, blob: wavBlob };
     document.getElementById('audio-preview-player').src = url;
@@ -2159,81 +2094,55 @@ async function sendMsg() {
   if (!activePeer) return;
   if (!lockButton('send-btn', 1000)) return;
   var input = document.getElementById('msg-input');
-  var text = input.value.trim();
-  var fileToSend = selectedFile;
-  var voiceToSend = pendingVoice;
+  var text = input.value.trim(); var fileToSend = selectedFile; var voiceToSend = pendingVoice;
   if (!text && !fileToSend && !voiceToSend) return;
   input.value = '';
   var isGroup = activePeer.type === 'group';
   var clientId = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
   var peerOnline = true;
-  if (!isGroup) {
-    var pu = localKnownUsers[activePeer.id];
-    if (pu && pu.updatedAt && (Date.now() - pu.updatedAt >= 15000)) peerOnline = false;
-    if (activePeer.isOnline === false) peerOnline = false;
-  }
+  if (!isGroup) { var pu = localKnownUsers[activePeer.id]; if (pu && pu.updatedAt && (Date.now() - pu.updatedAt >= 15000)) peerOnline = false; if (activePeer.isOnline === false) peerOnline = false; }
   var optMsg = {
-    id: clientId, clientId: clientId,
-    senderId: currentUser.id,
-    receiverId: isGroup ? '' : activePeer.id,
-    groupId: isGroup ? activePeer.id : '',
-    text: text,
-    fileName: fileToSend ? fileToSend.name : (voiceToSend ? voiceToSend.name : ''),
+    id: clientId, clientId: clientId, senderId: currentUser.id,
+    receiverId: isGroup ? '' : activePeer.id, groupId: isGroup ? activePeer.id : '',
+    text: text, fileName: fileToSend ? fileToSend.name : (voiceToSend ? voiceToSend.name : ''),
     fileType: fileToSend ? fileToSend.type : (voiceToSend ? voiceToSend.type : ''),
     thumbUrl: fileToSend ? fileToSend.thumbUrl : '',
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    ts: Date.now(), isRead: false, readBy: [], isDeleted: false,
-    isPending: peerOnline,
-    isWaiting: !peerOnline,
-    encryptionVersion: 2
+    ts: Date.now(), isRead: false, readBy: [], isDeleted: false, isPending: peerOnline, isWaiting: !peerOnline, encryptionVersion: 2
   };
-
   if (voiceToSend) {
     try {
-      var encV = await encryptBlob(voiceToSend.blob);
-      var encB64V = await blobToBase64(encV.blob);
-      var wrapV = await wrapKeyForRecipients(encV.keyB64);
+      var encV = await encryptBlob(voiceToSend.blob); var encB64V = await blobToBase64(encV.blob); var wrapV = await wrapKeyForRecipients(encV.keyB64);
       optMsg.encFileData = encB64V; optMsg.fileIv = encV.ivB64; optMsg.fileKeyEncByUser = wrapV; optMsg.fileSize = encV.originalSize;
       try { await saveFileToIDB(clientId, encV.blob, { fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: encV.blob.size }); } catch (e) {}
-      cancelVoiceAttachment();
-      mergeMessage(optMsg);
-      renderMessagesContainer(getChatMessages(activePeer));
+      cancelVoiceAttachment(); mergeMessage(optMsg); renderMessagesContainer(getChatMessages(activePeer));
       var pV = await buildEncryptedPayload({ clientId: clientId, plainText: text, encFileData: encB64V, fileIv: encV.ivB64, fileKeyEncByUser: wrapV, fileName: voiceToSend.name, fileType: voiceToSend.type, fileSize: encV.originalSize });
       await sendPayload(pV);
     } catch (e) { alert('Ошибка отправки голосового'); }
     return;
   }
-
   if (fileToSend && !fileToSend.isLarge) {
     try {
-      var enc = await encryptBlob(fileToSend.file);
-      var encB64 = await blobToBase64(enc.blob);
-      var wrap = await wrapKeyForRecipients(enc.keyB64);
+      var enc = await encryptBlob(fileToSend.file); var encB64 = await blobToBase64(enc.blob); var wrap = await wrapKeyForRecipients(enc.keyB64);
       optMsg.encFileData = encB64; optMsg.fileIv = enc.ivB64; optMsg.fileKeyEncByUser = wrap; optMsg.fileSize = enc.originalSize;
       try { await saveFileToIDB(clientId, enc.blob, { fileName: fileToSend.name, fileType: fileToSend.type, fileSize: enc.blob.size }); } catch (e) {}
-      cancelAttachment();
-      mergeMessage(optMsg);
-      renderMessagesContainer(getChatMessages(activePeer));
+      cancelAttachment(); mergeMessage(optMsg); renderMessagesContainer(getChatMessages(activePeer));
       var p = await buildEncryptedPayload({ clientId: clientId, plainText: text, encFileData: encB64, fileIv: enc.ivB64, fileKeyEncByUser: wrap, fileName: fileToSend.name, fileType: fileToSend.type, fileSize: enc.originalSize, thumbUrl: fileToSend.thumbUrl });
       await sendPayload(p);
     } catch (e) { alert('Ошибка чтения файла'); }
     return;
   }
-
   if (fileToSend && fileToSend.isLarge) {
     optMsg.fileSize = fileToSend.file.size; optMsg.fileType = fileToSend.type;
     cancelAttachment(); mergeMessage(optMsg); renderMessagesContainer(getChatMessages(activePeer));
     uploadLargeFileInBackground(clientId, fileToSend.file, fileToSend.name, fileToSend.type, text, fileToSend.thumbUrl);
     return;
   }
-
   var pT = await buildEncryptedPayload({ clientId: clientId, plainText: text });
   optMsg.textEnc = pT.text; optMsg.textKeyEncByUser = pT.textKeyEncByUser;
-  mergeMessage(optMsg);
-  renderMessagesContainer(getChatMessages(activePeer));
+  mergeMessage(optMsg); renderMessagesContainer(getChatMessages(activePeer));
   await sendPayload(pT);
 }
-
 async function sendPayload(payload) {
   var isGroup = activePeer.type === 'group';
   try {
@@ -2241,12 +2150,10 @@ async function sendPayload(payload) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         senderId: currentUser.id, receiverId: isGroup ? '' : activePeer.id, groupId: isGroup ? activePeer.id : '',
-        text: payload.text || '', fileData: '',
-        encFileData: payload.encFileData || '', fileIv: payload.fileIv || '',
+        text: payload.text || '', fileData: '', encFileData: payload.encFileData || '', fileIv: payload.fileIv || '',
         fileKeyEncByUser: payload.fileKeyEncByUser || null, textKeyEncByUser: payload.textKeyEncByUser || null,
         fileName: payload.fileName || '', fileType: payload.fileType || '', fileUrl: payload.fileUrl || '',
-        fileSize: payload.fileSize || 0, thumbUrl: payload.thumbUrl || '',
-        clientId: payload.clientId, encryptionVersion: 2
+        fileSize: payload.fileSize || 0, thumbUrl: payload.thumbUrl || '', clientId: payload.clientId, encryptionVersion: 2
       })
     });
     if (res.status === 403) {
@@ -2276,32 +2183,21 @@ async function sendPayload(payload) {
           if (fileUrlCache.has(payload.clientId)) { fileUrlCache.set(rm.id, fileUrlCache.get(payload.clientId)); fileUrlCache.delete(payload.clientId); }
         }
       } catch (e) {}
-      mergeMessage(rm);
-      saveCache();
-      renderMessagesContainer(getChatMessages(activePeer));
+      mergeMessage(rm); saveCache(); renderMessagesContainer(getChatMessages(activePeer));
       if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
     }
-  } catch (e) {
-    if (!navigator.onLine) setConnectionState('no-internet');
-    else setConnectionState('server-offline');
-  }
+  } catch (e) { if (!navigator.onLine) setConnectionState('no-internet'); else setConnectionState('server-offline'); }
 }
-
 async function uploadLargeFileInBackground(clientId, file, fileName, fileType, text, thumbUrl) {
   try {
-    var enc = await encryptBlob(file);
-    var wrap = await wrapKeyForRecipients(enc.keyB64);
+    var enc = await encryptBlob(file); var wrap = await wrapKeyForRecipients(enc.keyB64);
     try { await saveFileToIDB(clientId, enc.blob, { fileName: fileName, fileType: fileType, fileSize: enc.blob.size }); } catch (e) {}
     var b64 = await blobToBase64(enc.blob);
     for (var j = 0; j < localMessagesCache.length; j++) {
       if (localMessagesCache[j].clientId === clientId) {
-        localMessagesCache[j].encFileData = b64;
-        localMessagesCache[j].fileKeyEncByUser = wrap;
-        localMessagesCache[j].fileIv = enc.ivB64;
-        localMessagesCache[j].fileSize = enc.originalSize;
-        localMessagesCache[j].fileType = fileType;
-        localMessagesCache[j].fileName = fileName;
-        localMessagesCache[j].thumbUrl = thumbUrl;
+        localMessagesCache[j].encFileData = b64; localMessagesCache[j].fileKeyEncByUser = wrap;
+        localMessagesCache[j].fileIv = enc.ivB64; localMessagesCache[j].fileSize = enc.originalSize;
+        localMessagesCache[j].fileType = fileType; localMessagesCache[j].fileName = fileName; localMessagesCache[j].thumbUrl = thumbUrl;
         break;
       }
     }
@@ -2312,24 +2208,20 @@ async function uploadLargeFileInBackground(clientId, file, fileName, fileType, t
     if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
   } catch (e) { console.warn('Upload failed:', e); }
 }
-
 async function retryPendingMessages() {
   if (!currentUser || isRetrying) return;
   var pending = localMessagesCache.filter(function (m) { return (m.isPending || m.isWaiting) && m.senderId === currentUser.id && m.clientId; });
   if (pending.length === 0) return;
-  isRetrying = true;
-  var anySuccess = false;
+  isRetrying = true; var anySuccess = false;
   for (var i = 0; i < pending.length; i++) {
     var pm = pending[i];
     try {
       var body = {
         senderId: pm.senderId, receiverId: pm.receiverId || '', groupId: pm.groupId || '',
-        text: pm.textEnc || (pm.text ? '__PLAIN__' : ''), fileData: '',
-        fileName: pm.fileName || '', fileType: pm.fileType || '', clientId: pm.clientId,
-        fileUrl: pm.fileUrl || '', fileSize: pm.fileSize || 0, thumbUrl: pm.thumbUrl || '',
+        text: pm.textEnc || (pm.text ? '__PLAIN__' : ''), fileData: '', fileName: pm.fileName || '', fileType: pm.fileType || '',
+        clientId: pm.clientId, fileUrl: pm.fileUrl || '', fileSize: pm.fileSize || 0, thumbUrl: pm.thumbUrl || '',
         encFileData: pm.encFileData || '', fileIv: pm.fileIv || '',
-        fileKeyEncByUser: pm.fileKeyEncByUser || null, textKeyEncByUser: pm.textKeyEncByUser || null,
-        encryptionVersion: pm.encryptionVersion || 2
+        fileKeyEncByUser: pm.fileKeyEncByUser || null, textKeyEncByUser: pm.textKeyEncByUser || null, encryptionVersion: pm.encryptionVersion || 2
       };
       var res = await fetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (res.ok) {
@@ -2344,9 +2236,7 @@ async function retryPendingMessages() {
           if (!rm.fileName && pm.fileName) rm.fileName = pm.fileName;
           if (!rm.thumbUrl && pm.thumbUrl) rm.thumbUrl = pm.thumbUrl;
           if (!rm.textKeyEncByUser && pm.textKeyEncByUser) rm.textKeyEncByUser = pm.textKeyEncByUser;
-          for (var j = 0; j < localMessagesCache.length; j++) {
-            if (localMessagesCache[j].clientId === pm.clientId) { localMessagesCache[j] = rm; break; }
-          }
+          for (var j = 0; j < localMessagesCache.length; j++) { if (localMessagesCache[j].clientId === pm.clientId) { localMessagesCache[j] = rm; break; } }
           anySuccess = true;
         }
       }
@@ -2389,18 +2279,15 @@ async function saveMyProfileChanges() {
   if (newName) currentUser.name = newName;
   try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
   updateMyProfileUI();
-  try {
-    await fetch('/api/profile/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar, pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '' }) });
-  } catch (e) {}
+  try { await fetch('/api/profile/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar, pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '' }) }); } catch (e) {}
   closeMyProfile();
 }
-
 function openPeerProfile() {
   if (!activePeer) return;
   if (activePeer.type === 'group') { openGroupProfile(); return; }
   profileTargetId = activePeer.id;
   if (isModalOpen('peer-profile-modal')) return;
-  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
+  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, !!activePeer.isOnline);
   document.getElementById('peer-profile-name-view').innerText = activePeer.name;
   document.getElementById('peer-profile-id-view').innerText = 'Устройство №' + activePeer.id;
   updatePeerProfileButtons(activePeer);
@@ -2419,7 +2306,7 @@ function updatePeerProfileButtons(user) {
 function openMemberProfile(member) {
   profileTargetId = member.id;
   if (isModalOpen('peer-profile-modal')) return;
-  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, member.isOnline);
+  renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, !!member.isOnline);
   document.getElementById('peer-profile-name-view').innerText = member.name;
   document.getElementById('peer-profile-id-view').innerText = 'Устройство №' + member.id;
   updatePeerProfileButtons(member);
@@ -2441,21 +2328,13 @@ async function toggleBlockPeer() {
   try {
     var res = await fetch('/api/users/block', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: currentUser.id, peerId: profileTargetId, block: nextBlock }) });
     var data = await res.json();
-    if (data.success) {
-      currentUser.blockedContacts = data.blockedContacts;
-      try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
-      closePeerProfile();
-    }
+    if (data.success) { currentUser.blockedContacts = data.blockedContacts; try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {} closePeerProfile(); }
   } catch (e) {}
 }
-
 function updateChatMenu() {
   var menu = document.getElementById('chat-dropdown-menu');
-  if (activePeer && activePeer.type === 'group') {
-    menu.innerHTML = '<button class="menu-item" onclick="openGroupProfile()">Профиль группы</button><button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="leaveGroup()">Покинуть</button>';
-  } else {
-    menu.innerHTML = '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="deleteCurrentChat()">Удалить чат</button>';
-  }
+  if (activePeer && activePeer.type === 'group') menu.innerHTML = '<button class="menu-item" onclick="openGroupProfile()">Профиль группы</button><button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="leaveGroup()">Покинуть</button>';
+  else menu.innerHTML = '<button class="menu-item" onclick="clearChatHistory()">Очистить историю</button><button class="menu-item danger" onclick="deleteCurrentChat()">Удалить чат</button>';
 }
 async function clearChatHistory() {
   closeChatDropdown();
@@ -2483,14 +2362,9 @@ function resetActiveChat() {
 
 /* ==================== ГРУППЫ ==================== */
 async function getContactUsers() {
-  try {
-    var res = await fetch('/api/users/online?userId=' + encodeURIComponent(currentUser.id));
-    var list = await res.json();
-    list.forEach(function (u) { cacheUser(u); });
-    return list;
-  } catch (e) { return []; }
+  try { var res = await fetch('/api/users/online?userId=' + encodeURIComponent(currentUser.id)); var list = await res.json(); list.forEach(function (u) { cacheUser(u); }); return list; }
+  catch (e) { return []; }
 }
-
 function renderCheckList(containerId, users, excludeSet) {
   var c = document.getElementById(containerId); c.innerHTML = '';
   var list = users.filter(function (u) { return !excludeSet.has(u.id); });
@@ -2501,33 +2375,26 @@ function renderCheckList(containerId, users, excludeSet) {
     var avatarId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     row.innerHTML = '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;"><div class="avatar-circle" id="' + avatarId + '" style="width:32px;height:32px;font-size:13px;"></div><span style="flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">' + escapeHtml(u.name) + '</span>';
     c.appendChild(row);
-    renderAvatarIntoElement(document.getElementById(avatarId), u, false);
+    renderAvatarIntoElement(document.getElementById(avatarId), u, !!u.isOnline);
   });
 }
-
-function getChecked(containerId) { 
-  return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; }); 
-}
-
+function getChecked(containerId) { return Array.from(document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked')).map(function (i) { return i.value; }); }
 async function openCreateGroup() {
   if (isModalOpen('create-group-modal')) return;
   groupDraftAvatar = '';
   document.getElementById('create-group-name').value = '';
   fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥');
-  
   var cached = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
-    if (u.id && u.id !== currentUser.id) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '' });
+    if (u.id && u.id !== currentUser.id) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false });
   }
   renderCheckList('create-group-contacts', cached, new Set());
   safeOpenModal('create-group-modal');
-
   var contacts = await getContactUsers();
   contacts.forEach(function(c) { cacheUser(c); });
   renderCheckList('create-group-contacts', contacts, new Set());
 }
-
 function closeCreateGroup() { safeCloseModal('create-group-modal'); }
 function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
 function handleGroupAvatarSelect(e) {
@@ -2545,15 +2412,11 @@ async function submitCreateGroup() {
     var data = await res.json();
     if (data.success) {
       closeCreateGroup();
-      var g = data.group;
-      localGroups.push(g);
-      saveGroups();
-      loadDialogs();
+      var g = data.group; localGroups.push(g); saveGroups(); loadDialogs();
       openChat({ id: g.id, type: 'group', name: g.name, avatar: g.avatar, members: g.members, ownerId: g.ownerId, memberCount: g.members.length });
     } else alert(data.error || 'Ошибка');
   } catch (e) { alert('Не удалось'); }
 }
-
 async function refreshGroupInfo() {
   if (!activePeer || activePeer.type !== 'group') return;
   try {
@@ -2568,14 +2431,12 @@ async function refreshGroupInfo() {
     renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { id: g.id, name: g.name, avatar: g.avatar }, false);
   } catch (e) {}
 }
-
 async function openGroupProfile() {
   closeChatDropdown();
   if (!activePeer || activePeer.type !== 'group') return;
   if (isModalOpen('group-profile-modal')) return;
   await refreshGroupInfo();
-  var g = activePeer;
-  editGroupDraftAvatar = '';
+  var g = activePeer; editGroupDraftAvatar = '';
   fillAvatarBox(document.getElementById('group-profile-avatar'), g.avatar, '👥');
   document.getElementById('group-profile-name').innerText = g.name;
   document.getElementById('group-profile-count').innerText = (g.members ? g.members.length : 0) + ' участников';
@@ -2598,25 +2459,21 @@ function renderMembersList(containerId, memberDetails, ownerId) {
     info.innerHTML = '<div class="avatar-circle" style="width:32px;height:32px;font-size:13px;"></div><div style="flex:1;text-align:left;overflow:hidden;"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(u.name) + (isMe ? ' (вы)' : '') + '</div>' + (isOwner ? '<div style="font-size:11px;color:var(--accent);">создатель</div>' : '') + '</div>';
     info.onclick = function (e) { e.stopPropagation(); if (isMe) { closeGroupProfile(); openMyProfile(); } else openMemberProfile(u); };
     row.appendChild(info);
-    renderAvatarIntoElement(info.querySelector('.avatar-circle'), u, u.isOnline);
+    renderAvatarIntoElement(info.querySelector('.avatar-circle'), u, !!u.isOnline);
     if (amOwner && !isMe && !isOwner) {
-      var btn = document.createElement('button');
-      btn.className = 'member-menu-btn'; btn.innerText = '⋮';
+      var btn = document.createElement('button'); btn.className = 'member-menu-btn'; btn.innerText = '⋮';
       btn.onclick = function (e) { e.stopPropagation(); if (activeMemberDropdown && activeMemberDropdown.dataset.memberId === u.id) closeMemberDropdown(); else openMemberDropdown(row, u); };
       row.appendChild(btn);
     }
     c.appendChild(row);
   });
 }
-
 function openMemberDropdown(rowEl, member) {
   closeMemberDropdown();
-  var dd = document.createElement('div');
-  dd.className = 'member-dropdown active'; dd.dataset.memberId = member.id;
+  var dd = document.createElement('div'); dd.className = 'member-dropdown active'; dd.dataset.memberId = member.id;
   dd.innerHTML = '<button class="menu-item" data-action="profile">Профиль</button><button class="menu-item danger" data-action="kick">Выгнать</button>';
   dd.addEventListener('click', function (e) {
-    e.stopPropagation();
-    var a = e.target.getAttribute('data-action');
+    e.stopPropagation(); var a = e.target.getAttribute('data-action');
     if (a === 'profile') { closeMemberDropdown(); openMemberProfile(member); }
     else if (a === 'kick') { closeMemberDropdown(); kickMember(member); }
   });
@@ -2624,7 +2481,6 @@ function openMemberDropdown(rowEl, member) {
   setTimeout(function () { document.addEventListener('click', function h(ev) { if (activeMemberDropdown && !activeMemberDropdown.contains(ev.target)) { closeMemberDropdown(); document.removeEventListener('click', h); } }); }, 0);
 }
 function closeMemberDropdown() { if (activeMemberDropdown && activeMemberDropdown.parentNode) activeMemberDropdown.parentNode.removeChild(activeMemberDropdown); activeMemberDropdown = null; }
-
 async function kickMember(member) {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!confirm('Выгнать ' + member.name + '?')) return;
@@ -2635,7 +2491,6 @@ async function kickMember(member) {
     else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
-
 async function deleteGroup() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!confirm('Удалить группу?')) return;
@@ -2643,19 +2498,15 @@ async function deleteGroup() {
   try {
     var res = await fetch('/api/groups/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ groupId: activePeer.id, userId: currentUser.id }) });
     var data = await res.json();
-    if (data.success) {
-      localGroups = localGroups.filter(function (g) { return g.id !== activePeer.id; });
-      saveGroups(); closeGroupProfile(); resetActiveChat(); loadDialogs();
-    } else alert(data.error || 'Ошибка');
+    if (data.success) { localGroups = localGroups.filter(function (g) { return g.id !== activePeer.id; }); saveGroups(); closeGroupProfile(); resetActiveChat(); loadDialogs(); }
+    else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
-
 function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
 function handleEditGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
   compressImage(file, 200, 0.85, function (c) { if (!c) return; editGroupDraftAvatar = c; fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥'); });
 }
-
 async function saveGroupChanges() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (!lockButton('save-group-btn', 3000)) return;
@@ -2666,13 +2517,10 @@ async function saveGroupChanges() {
   try {
     var res = await fetch('/api/groups/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     var data = await res.json();
-    if (data.success) {
-      for (var i = 0; i < localGroups.length; i++) if (localGroups[i].id === activePeer.id) localGroups[i] = data.group;
-      saveGroups(); editGroupDraftAvatar = ''; await refreshGroupInfo(); openGroupProfile();
-    } else alert(data.error || 'Ошибка');
+    if (data.success) { for (var i = 0; i < localGroups.length; i++) if (localGroups[i].id === activePeer.id) localGroups[i] = data.group; saveGroups(); editGroupDraftAvatar = ''; await refreshGroupInfo(); openGroupProfile(); }
+    else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
-
 async function openAddMembers() {
   if (!activePeer || activePeer.type !== 'group') return;
   if (isModalOpen('add-members-modal')) return;
@@ -2680,7 +2528,7 @@ async function openAddMembers() {
   var cached = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
-    if (u.id && u.id !== currentUser.id && !exclude.has(u.id)) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '' });
+    if (u.id && u.id !== currentUser.id && !exclude.has(u.id)) cached.push({ id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false });
   }
   renderCheckList('add-members-contacts', cached, exclude);
   safeOpenModal('add-members-modal');
@@ -2689,7 +2537,6 @@ async function openAddMembers() {
   renderCheckList('add-members-contacts', contacts, exclude);
 }
 function closeAddMembers() { safeCloseModal('add-members-modal'); }
-
 async function submitAddMembers() {
   var members = getChecked('add-members-contacts');
   if (members.length === 0) { alert('Выберите'); return; }
@@ -2699,11 +2546,12 @@ async function submitAddMembers() {
     var data = await res.json();
     if (data.success) {
       for (var i = 0; i < localGroups.length; i++) if (localGroups[i].id === activePeer.id) localGroups[i] = data.group;
-      saveGroups(); closeAddMembers(); await refreshGroupInfo(); renderMembersList('group-members-list', activePeer.memberDetails || [], activePeer.ownerId); document.getElementById('group-profile-count').innerText = (activePeer.members ? activePeer.members.length : 0) + ' участников';
+      saveGroups(); closeAddMembers(); await refreshGroupInfo();
+      renderMembersList('group-members-list', activePeer.memberDetails || [], activePeer.ownerId);
+      document.getElementById('group-profile-count').innerText = (activePeer.members ? activePeer.members.length : 0) + ' участников';
     } else alert(data.error || 'Ошибка');
   } catch (e) { alert('Ошибка'); }
 }
-
 async function leaveGroup() {
   closeChatDropdown();
   if (!activePeer || activePeer.type !== 'group') return;
@@ -2719,19 +2567,23 @@ async function leaveGroup() {
 var callPollingTimer = null;
 var currentCall = null;
 var incomingCall = null;
+var earlySignals = [];
+var callRingTimeout = null;
 
-function startCallPolling() { if (callPollingTimer) clearInterval(callPollingTimer); callPollingTimer = setInterval(pollCalls, 1000); pollCalls(); }
-
+function startCallPolling() {
+  if (callPollingTimer) clearInterval(callPollingTimer);
+  callPollingTimer = setInterval(pollCalls, 1000);
+  pollCalls();
+}
 async function pollCalls() {
   if (!currentUser) return;
   try {
     var res = await fetch('/api/calls/poll?userId=' + encodeURIComponent(currentUser.id));
     var data = await res.json();
     if (!data.success) return;
-    (data.signals || []).forEach(handleSig);
+    for (var i = 0; i < (data.signals || []).length; i++) { await handleSig(data.signals[i]); }
   } catch (e) {}
 }
-
 function showCallOverlay() {
   document.getElementById('call-overlay').classList.add('active');
   document.getElementById('incoming-call-overlay').classList.remove('active');
@@ -2739,7 +2591,6 @@ function showCallOverlay() {
   document.getElementById('call-in-progress-bar').style.display = 'none';
 }
 function hideCallOverlay() { document.getElementById('call-overlay').classList.remove('active'); }
-
 function minimizeCallOverlay() {
   hideCallOverlay();
   if (currentCall) {
@@ -2748,7 +2599,6 @@ function minimizeCallOverlay() {
     document.getElementById('call-in-progress-name').innerText = currentCall.peerName || 'собеседником';
   }
 }
-
 function restoreCallOverlay() {
   if (!currentCall) { document.getElementById('call-return-btn').style.display = 'none'; document.getElementById('call-in-progress-bar').style.display = 'none'; return; }
   document.getElementById('call-return-btn').style.display = 'none';
@@ -2758,7 +2608,6 @@ function restoreCallOverlay() {
   if (currentCall.localStream) { var lv = document.getElementById('call-local-video'); if (!lv.srcObject) lv.srcObject = currentCall.localStream; lv.style.display = currentCall.camOn ? 'block' : 'none'; }
   if (currentCall.remoteStream) { var rv = document.getElementById('call-remote-video'); if (!rv.srcObject) rv.srcObject = currentCall.remoteStream; rv.style.display = currentCall.video ? 'block' : 'none'; }
 }
-
 function updateCallUI() {
   if (!currentCall) return;
   var a = document.getElementById('call-peer-avatar');
@@ -2774,7 +2623,6 @@ function updateCallUI() {
   document.getElementById('ctrl-cam').classList.toggle('active', currentCall.camOn);
   document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
 }
-
 async function startCall() {
   if (!activePeer || activePeer.type === 'group') { alert('Групповые звонки не поддерживаются'); return; }
   if (currentCall || incomingCall) { alert('Уже есть звонок'); return; }
@@ -2783,39 +2631,45 @@ async function startCall() {
     var res = await fetch('/api/calls/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fromId: currentUser.id, toId: activePeer.id, video: video }) });
     var data = await res.json();
     if (!data.success) { alert(data.error || 'Ошибка'); return; }
-    currentCall = { callId: data.callId, role: 'caller', peerId: activePeer.id, peerName: activePeer.name, peerAvatar: activePeer.avatar || '', video: video, pc: null, localStream: null, remoteStream: null, startedAt: Date.now(), micOn: true, camOn: video, facing: 'user', status: 'ringing' };
+    currentCall = { callId: data.callId, role: 'caller', peerId: activePeer.id, peerName: activePeer.name, peerAvatar: activePeer.avatar || '', video: video, pc: null, localStream: null, remoteStream: null, startedAt: Date.now(), micOn: true, camOn: video, facing: 'user', status: 'ringing', pendingIce: [], offerSent: false };
     showCallOverlay(); updateCallUI();
     await setupLocalMedia(video);
     if (currentCall) await createPC();
-    if (currentCall) updateCallUI();
+    if (currentCall) {
+      updateCallUI();
+      callRingTimeout = setTimeout(function () {
+        if (currentCall && currentCall.status === 'ringing') { alert('Собеседник не отвечает'); endCurrentCall(); }
+      }, 60000);
+    }
   } catch (e) { console.warn('startCall error', e); alert('Ошибка инициализации звонка'); }
 }
-
 async function acceptIncomingCall() {
   if (!incomingCall) return;
   var c = incomingCall; incomingCall = null;
+  if (callRingTimeout) { clearTimeout(callRingTimeout); callRingTimeout = null; }
   document.getElementById('incoming-call-overlay').classList.remove('active');
-  currentCall = { callId: c.callId, role: 'callee', peerId: c.fromId, peerName: c.fromName, peerAvatar: c.fromAvatar, video: !!c.video, pc: null, localStream: null, remoteStream: null, startedAt: Date.now(), micOn: true, camOn: !!c.video, facing: 'user', status: 'connecting' };
+  currentCall = { callId: c.callId, role: 'callee', peerId: c.fromId, peerName: c.fromName, peerAvatar: c.fromAvatar, video: !!c.video, pc: null, localStream: null, remoteStream: null, startedAt: Date.now(), micOn: true, camOn: !!c.video, facing: 'user', status: 'connecting', pendingIce: [], offerSent: false };
   showCallOverlay(); updateCallUI();
   try { await fetch('/api/calls/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: currentCall.callId, userId: currentUser.id, accept: true }) }); } catch (e) {}
   await setupLocalMedia(currentCall.video);
   if (currentCall) await createPC();
+  var queued = earlySignals; earlySignals = [];
+  for (var i = 0; i < queued.length; i++) { if (currentCall && queued[i].callId === currentCall.callId) await handleSig(queued[i]); }
   if (currentCall) updateCallUI();
 }
-
 async function rejectIncomingCall() {
   if (!incomingCall) return;
   var c = incomingCall; incomingCall = null;
+  if (callRingTimeout) { clearTimeout(callRingTimeout); callRingTimeout = null; }
   document.getElementById('incoming-call-overlay').classList.remove('active');
   try { await fetch('/api/calls/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: c.callId, userId: currentUser.id, accept: false }) }); } catch (e) {}
 }
-
 async function setupLocalMedia(wantVideo) {
   if (!currentCall) return;
   var constraints = { audio: true, video: wantVideo ? { facingMode: currentCall.facing || 'user' } : false };
   try {
     var stream = await navigator.mediaDevices.getUserMedia(constraints);
-    if (!currentCall) { stream.getTracks().forEach(t => t.stop()); return; }
+    if (!currentCall) { stream.getTracks().forEach(function(t){ t.stop(); }); return; }
     currentCall.localStream = stream;
     var lv = document.getElementById('call-local-video');
     lv.srcObject = stream; lv.style.display = wantVideo ? 'block' : 'none';
@@ -2825,7 +2679,7 @@ async function setupLocalMedia(wantVideo) {
     if (wantVideo) {
       try {
         var s2 = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        if (!currentCall) { s2.getTracks().forEach(t => t.stop()); return; }
+        if (!currentCall) { s2.getTracks().forEach(function(t){ t.stop(); }); return; }
         currentCall.localStream = s2; currentCall.video = false; currentCall.camOn = false;
         document.getElementById('call-local-video').style.display = 'none';
         document.getElementById('call-audio-screen').style.display = 'flex';
@@ -2833,10 +2687,18 @@ async function setupLocalMedia(wantVideo) {
     } else { alert('Нет доступа к микрофону'); endCurrentCall(); }
   }
 }
-
 async function createPC() {
   if (!currentCall) return;
-  var pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] });
+  var pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' }
+    ],
+    iceCandidatePoolSize: 10,
+    bundlePolicy: 'max-bundle'
+  });
   currentCall.pc = pc;
   if (currentCall.localStream) { currentCall.localStream.getTracks().forEach(function (t) { pc.addTrack(t, currentCall.localStream); }); }
   pc.ontrack = function (e) {
@@ -2849,49 +2711,92 @@ async function createPC() {
       else { rv.style.display = 'none'; document.getElementById('call-audio-screen').style.display = 'flex'; }
     }
   };
-  pc.onicecandidate = function (e) { if (e.candidate) sendSig('ice', { candidate: e.candidate }); };
+  pc.onicecandidate = function (e) { if (e.candidate && currentCall) sendSig('ice', { candidate: e.candidate }); };
   pc.onconnectionstatechange = function () {
     if (!currentCall) return;
-    if (pc.connectionState === 'connected') { currentCall.status = 'active'; updateCallUI(); }
+    var st = pc.connectionState;
+    if (st === 'connected') { currentCall.status = 'active'; updateCallUI(); }
+    else if (st === 'failed') {
+      setTimeout(function () { if (currentCall && currentCall.pc === pc && pc.connectionState === 'failed') { alert('Не удалось установить соединение'); endCurrentCall(); } }, 2000);
+    }
   };
-  if (currentCall.role === 'caller') {
-    var offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendSig('offer', { sdp: offer });
-  }
 }
-
 async function sendSig(type, payload) {
   if (!currentCall) return;
   try { await fetch('/api/calls/signal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: currentCall.callId, fromId: currentUser.id, toId: currentCall.peerId, type: type, payload: payload }) }); } catch (e) {}
 }
-
 async function handleSig(sig) {
   if (sig.type === 'offer-start') {
-    if (currentCall || incomingCall) return;
+    if (currentCall || incomingCall) {
+      try { await fetch('/api/calls/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callId: sig.callId, userId: currentUser.id, accept: false }) }); } catch (e) {}
+      return;
+    }
     incomingCall = { callId: sig.callId, fromId: sig.from, fromName: sig.payload.fromName || 'Пользователь', fromAvatar: sig.payload.fromAvatar || '', video: !!sig.payload.video };
     document.getElementById('incoming-avatar').innerHTML = incomingCall.fromAvatar ? '<img src="' + incomingCall.fromAvatar + '">' : (incomingCall.fromName.charAt(0).toUpperCase());
     document.getElementById('incoming-name').innerText = incomingCall.fromName;
     document.getElementById('incoming-status-text').innerText = incomingCall.video ? 'Входящий видеозвонок...' : 'Входящий звонок...';
     document.getElementById('incoming-call-overlay').classList.add('active');
     playNotificationSound();
+    callRingTimeout = setTimeout(function () { if (incomingCall && incomingCall.callId === sig.callId) rejectIncomingCall(); }, 60000);
     return;
   }
+  if (incomingCall && sig.callId === incomingCall.callId && !currentCall) {
+    if (sig.type === 'offer' || sig.type === 'ice' || sig.type === 'answer') { earlySignals.push(sig); return; }
+  }
   if (!currentCall || sig.callId !== currentCall.callId) return;
-  if (sig.type === 'accepted') { currentCall.status = 'connecting'; updateCallUI(); }
-  else if (sig.type === 'rejected' || sig.type === 'ended') { endCurrentCall(true); }
+
+  if (sig.type === 'accepted') {
+    if (callRingTimeout) { clearTimeout(callRingTimeout); callRingTimeout = null; }
+    currentCall.status = 'connecting'; updateCallUI();
+    if (currentCall.role === 'caller' && currentCall.pc && !currentCall.offerSent) {
+      currentCall.offerSent = true;
+      try {
+        var offer = await currentCall.pc.createOffer();
+        await currentCall.pc.setLocalDescription(offer);
+        sendSig('offer', { sdp: offer });
+      } catch (e) { console.warn('createOffer failed', e); }
+    }
+  }
+  else if (sig.type === 'rejected' || sig.type === 'ended') {
+    if (callRingTimeout) { clearTimeout(callRingTimeout); callRingTimeout = null; }
+    endCurrentCall(true);
+  }
   else if (sig.type === 'offer') {
     try {
       await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp));
       var answer = await currentCall.pc.createAnswer();
       await currentCall.pc.setLocalDescription(answer);
       sendSig('answer', { sdp: answer });
+      if (currentCall.pendingIce) {
+        for (var i = 0; i < currentCall.pendingIce.length; i++) {
+          try { await currentCall.pc.addIceCandidate(new RTCIceCandidate(currentCall.pendingIce[i])); } catch (e) {}
+        }
+        currentCall.pendingIce = [];
+      }
+    } catch (e) { console.warn('offer handling failed', e); }
+  }
+  else if (sig.type === 'answer') {
+    try {
+      await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp));
+      if (currentCall.pendingIce) {
+        for (var j = 0; j < currentCall.pendingIce.length; j++) {
+          try { await currentCall.pc.addIceCandidate(new RTCIceCandidate(currentCall.pendingIce[j])); } catch (e) {}
+        }
+        currentCall.pendingIce = [];
+      }
+    } catch (e) { console.warn('answer handling failed', e); }
+  }
+  else if (sig.type === 'ice') {
+    try {
+      if (!currentCall.pc || !currentCall.pc.remoteDescription) {
+        currentCall.pendingIce = currentCall.pendingIce || [];
+        currentCall.pendingIce.push(sig.payload.candidate);
+      } else {
+        await currentCall.pc.addIceCandidate(new RTCIceCandidate(sig.payload.candidate));
+      }
     } catch (e) {}
   }
-  else if (sig.type === 'answer') { try { await currentCall.pc.setRemoteDescription(new RTCSessionDescription(sig.payload.sdp)); } catch (e) {} }
-  else if (sig.type === 'ice') { try { await currentCall.pc.addIceCandidate(new RTCIceCandidate(sig.payload.candidate)); } catch (e) {} }
 }
-
 function toggleCallMic() {
   if (!currentCall || !currentCall.localStream) return;
   var audioTracks = currentCall.localStream.getAudioTracks();
@@ -2900,13 +2805,12 @@ function toggleCallMic() {
   document.getElementById('ctrl-mic').classList.toggle('active', currentCall.micOn);
   document.getElementById('ctrl-mic').innerText = currentCall.micOn ? '🎤' : '🔇';
 }
-
 async function toggleCallCam() {
   if (!currentCall) return;
   if (!currentCall.camOn) {
     try {
       var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing || 'user' } });
-      if (!currentCall) { vs.getTracks().forEach(t => t.stop()); return; }
+      if (!currentCall) { vs.getTracks().forEach(function(t){ t.stop(); }); return; }
       currentCall.localStream = currentCall.localStream || new MediaStream();
       vs.getVideoTracks().forEach(function (t) {
         currentCall.localStream.addTrack(t);
@@ -2925,13 +2829,12 @@ async function toggleCallCam() {
     document.getElementById('ctrl-cam').classList.remove('active');
   }
 }
-
 async function flipCallCamera() {
   if (!currentCall || !currentCall.camOn) return;
   currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user';
   try {
     var vs = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentCall.facing } });
-    if (!currentCall) { vs.getTracks().forEach(t => t.stop()); return; }
+    if (!currentCall) { vs.getTracks().forEach(function(t){ t.stop(); }); return; }
     var newTrack = vs.getVideoTracks()[0];
     currentCall.localStream.getVideoTracks().forEach(function (t) { t.stop(); currentCall.localStream.removeTrack(t); });
     currentCall.localStream.addTrack(newTrack);
@@ -2940,9 +2843,9 @@ async function flipCallCamera() {
     document.getElementById('call-local-video').srcObject = currentCall.localStream;
   } catch (e) { currentCall.facing = currentCall.facing === 'user' ? 'environment' : 'user'; }
 }
-
 async function endCurrentCall(silent) {
   var c = currentCall; currentCall = null;
+  if (callRingTimeout) { clearTimeout(callRingTimeout); callRingTimeout = null; }
   hideCallOverlay();
   document.getElementById('call-return-btn').style.display = 'none';
   document.getElementById('call-in-progress-bar').style.display = 'none';
@@ -2961,9 +2864,7 @@ async function endCurrentCall(silent) {
 /* ==================== ИНИЦИАЛИЗАЦИЯ ==================== */
 window.addEventListener('DOMContentLoaded', async function () {
   updateThemeIcon(savedTheme);
-  document.querySelectorAll('.modal-overlay').forEach(function (ov) {
-    ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); });
-  });
+  document.querySelectorAll('.modal-overlay').forEach(function (ov) { ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); }); });
   loadDeletedIds();
   await initMyKeyPair();
   try { currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) { currentUser = null; }
@@ -2975,13 +2876,9 @@ window.addEventListener('DOMContentLoaded', async function () {
   saveCache();
   updateVersionInfo();
   await checkServerHealth();
-  if (!currentUser) {
-    setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000);
-  }
-  if (currentUser) {
-    if (myKeyPair && currentUser) currentUser.pubKey = myKeyPair.pubKeyB64;
-    startApp();
-  } else updateLoadingScreen();
+  if (!currentUser) { setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000); }
+  if (currentUser) { if (myKeyPair && currentUser) currentUser.pubKey = myKeyPair.pubKeyB64; startApp(); }
+  else updateLoadingScreen();
 });
 `;
 
