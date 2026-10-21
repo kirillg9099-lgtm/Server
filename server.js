@@ -1,14 +1,15 @@
 /* ============================================================
-   server.js — v4.1.1 (stateless, E2EE, UI fix)
+   server.js — v4.1.2 (stateless, E2EE, UI fix, deviceId)
    - Хранение: RAM (сервер) + localStorage/IndexedDB (клиент)
-   - Исправлены баги: индикатор сети и создание групп
+   - Исправлено: онлайн в списке чатов, файлы после перезахода,
+     поиск пользователей, ID = номер устройства
    ============================================================ */
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.1.1';
+const SERVER_VERSION = '4.1.2';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -18,19 +19,18 @@ process.on('unhandledRejection', function (r) { console.error('[ПРОМИС]:',
 
 /* ==================== RAM STORAGE ==================== */
 const MEM = {
-  accounts: [],           // {id, name, avatar, pubKey, contacts, blockedContacts, hiddenDialogs, updatedAt}
-  groups: [],             // {id, name, avatar, ownerId, members, createdAt}
-  inbox: new Map()        // receiverId -> [messages]
+  accounts: [],
+  groups: [],
+  inbox: new Map()
 };
 
-const ONLINE_WINDOW_MS = 15000;   // 15 сек — «в сети»
-const MAX_INBOX_PER_USER = 300;   // макс сообщений в RAM на пользователя
+const ONLINE_WINDOW_MS = 15000;
+const MAX_INBOX_PER_USER = 300;
 
 function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
 function isOnline(u) { return !!(u && u.updatedAt && (Date.now() - u.updatedAt < ONLINE_WINDOW_MS)); }
 
-/* Автоочистка неактивных данных в RAM каждые 10 минут */
 setInterval(function() {
   const now = Date.now();
   MEM.accounts = MEM.accounts.filter(u => (now - (u.updatedAt || 0)) < 86400000);
@@ -41,20 +41,19 @@ app.get('/api/health', function (req, res) {
   res.json({ ok: true, serverTime: Date.now(), serverVersion: SERVER_VERSION });
 });
 
-/* ==================== ВХОД ПО ИМЕНИ ==================== */
+/* ==================== ВХОД ПО ИМЕНИ (deviceId = id) ==================== */
 app.post('/api/enter', function (req, res) {
   const name = (req.body.name || '').trim();
-  const clientId = (req.body.clientId || '').trim();
+  const deviceId = (req.body.deviceId || '').trim();
   const pubKey = req.body.pubKey || '';
   if (!name) return res.status(400).json({ error: 'Введите имя' });
   if (name.length > 60) return res.status(400).json({ error: 'Слишком длинное имя' });
+  if (!deviceId || !/^\d{6,15}$/.test(deviceId)) return res.status(400).json({ error: 'Неверный ID устройства' });
 
-  let user = null;
-  if (clientId) user = MEM.accounts.find(function (u) { return u.id === clientId; });
-  if (!user) user = MEM.accounts.find(function (u) { return u.name === name; });
+  let user = MEM.accounts.find(function (u) { return u.id === deviceId; });
   if (!user) {
     user = {
-      id: 'id_' + Math.random().toString(36).substr(2, 9),
+      id: deviceId,
       name: name,
       avatar: '',
       pubKey: pubKey,
@@ -72,7 +71,6 @@ app.post('/api/enter', function (req, res) {
   res.json({ success: true, user: user });
 });
 
-/* Удалить сессию */
 app.post('/api/enter/leave', function (req, res) {
   const userId = (req.body.userId || '').trim();
   if (!userId) return res.status(400).json({ error: 'No user' });
@@ -197,14 +195,14 @@ app.get('/api/users/search', function (req, res) {
   const excludeId = req.query.excludeId || '';
   const now = Date.now();
   const results = MEM.accounts
-    .filter(function (u) { return u.id && u.id !== excludeId && u.name; })
+    .filter(function (u) { return u.id && u.id !== excludeId; })
     .filter(function (u) {
       if (!q) return true;
       return (u.id && u.id.toLowerCase().indexOf(q) !== -1) ||
              (u.name && u.name.toLowerCase().indexOf(q) !== -1);
     })
     .map(function (u) {
-      return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '',
+      return { id: u.id, type: 'user', name: u.name || 'Пользователь', avatar: u.avatar || '', pubKey: u.pubKey || '',
         isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) };
     })
     .sort(function (a, b) {
@@ -230,7 +228,7 @@ app.get('/api/users/online', function (req, res) {
   const userId = req.query.userId || '';
   const now = Date.now();
   const list = MEM.accounts
-    .filter(function (u) { return u.id !== userId && u.name; }) // Убрали жесткую привязку к строгой разнице таймингов онлайн, чтобы список контактов для групп был всегда заполнен
+    .filter(function (u) { return u.id !== userId && u.name; })
     .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) }; })
     .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(list);
@@ -477,7 +475,7 @@ app.get('/api/calls/poll', function (req, res) {
   res.json({ success: true, signals: fresh });
 });
 
-/* ==================== HTML И КЛИЕНТСКИЙ ИНТЕРФЕЙС ==================== */
+/* ==================== HTML ==================== */
 const CLIENT_HTML = `<!DOCTYPE html>
 <html lang="ru" data-theme="dark">
 <head>
@@ -518,14 +516,11 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .sidebar-header{padding:12px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:10px;}
   .user-profile-bar{display:flex;align-items:center;justify-content:space-between;padding:4px;cursor:pointer;}
   .user-info-brief{display:flex;flex-direction:column;overflow:hidden;margin-left:10px;flex:1;}
-  
-  /* ИСПРАВЛЕНИЕ АВАТАРКИ И ЗЕЛЕНОГО ИНДИКАТОРА */
   .avatar-circle{width:40px;height:40px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:visible;}
   .avatar-circle img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block;position:relative;z-index:1;}
   .avatar-circle > span{position:relative;z-index:1;}
   .online-indicator{position:absolute;bottom:0;right:0;width:12px;height:12px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;display:none;z-index:10;box-sizing:content-box;}
   .online-indicator.visible{display:block;}
-
   .header-actions{display:flex;gap:6px;}
   .theme-toggle-btn{background:var(--bg-input);border:none;color:var(--text-main);width:34px;height:34px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;}
   .search-box{position:relative;}
@@ -661,7 +656,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             <div class="avatar-circle" id="my-avatar-circle" onclick="openMyProfile()"><div class="online-indicator visible"></div></div>
             <div class="user-info-brief" onclick="openMyProfile()">
               <b id="my-display-name">Имя</b>
-              <div style="font-size:11px;color:var(--accent);" id="my-display-id">ID</div>
+              <div style="font-size:11px;color:var(--accent);" id="my-display-id">Устройство</div>
             </div>
             <div class="header-actions">
               <button class="theme-toggle-btn" onclick="openCreateGroup()" title="Создать группу">👥</button>
@@ -669,7 +664,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             </div>
           </div>
           <div class="search-box">
-            <input type="text" id="search-input" placeholder="Поиск по имени или ID..." oninput="onSearchInput()">
+            <input type="text" id="search-input" placeholder="Поиск по имени или номеру устройства..." oninput="onSearchInput()">
             <span class="clear-search" id="clear-search-btn" onclick="clearSearch()">✕</span>
           </div>
         </div>
@@ -719,7 +714,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <div class="profile-card">
       <div class="profile-avatar-big" id="my-profile-avatar-view"></div>
       <div class="profile-name" id="my-profile-name-view">Имя</div>
-      <div class="profile-id" id="my-profile-id-view">ID</div>
+      <div class="profile-id" id="my-profile-id-view">Устройство</div>
       <div class="input-group" style="width:100%;"><input type="text" id="edit-my-name-input" placeholder="Ваше имя..."></div>
       <div class="profile-actions" style="align-items:center;">
         <button class="profile-link-btn" onclick="triggerAvatarInput()">Загрузить фото</button>
@@ -738,7 +733,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <div class="profile-card">
       <div class="profile-avatar-big" id="peer-profile-avatar-view"></div>
       <div class="profile-name" id="peer-profile-name-view">Имя</div>
-      <div class="profile-id" id="peer-profile-id-view">ID</div>
+      <div class="profile-id" id="peer-profile-id-view">Устройство</div>
       <div class="profile-actions">
         <button class="btn btn-secondary" id="mute-peer-btn" onclick="toggleMutePeer()">Выключить звук</button>
         <button class="btn btn-secondary" id="block-peer-btn" onclick="toggleBlockPeer()">Заблокировать</button>
@@ -855,7 +850,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.1.1';
+var CLIENT_VERSION = '4.1.2';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -894,6 +889,16 @@ var filesDB = null;
 var fileUrlCache = new Map();
 var deletedIds = {};
 var myKeyPair = null;
+var searchRequestSeq = 0;
+
+/* ==================== DEVICE ID ==================== */
+function getOrCreateDeviceId() {
+  var existing = localStorage.getItem('messenger_device_id');
+  if (existing && /^\\d{6,15}$/.test(existing)) return existing;
+  var num = String(Math.floor(1000000000 + Math.random() * 9000000000));
+  localStorage.setItem('messenger_device_id', num);
+  return num;
+}
 
 /* ==================== ШИФРОВАНИЕ E2EE ==================== */
 function bufToBase64(buf) {
@@ -1160,7 +1165,20 @@ function formatBytes(bytes) {
   if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' МБ';
   return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' ГБ';
 }
-function saveCache() { try { localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache)); } catch (e) {} }
+function saveCache() {
+  try { localStorage.setItem('messenger_messages_cache', JSON.stringify(localMessagesCache)); }
+  catch (e) {
+    try {
+      var light = localMessagesCache.map(function (m) {
+        var c = Object.assign({}, m);
+        if (c.encFileData && c.encFileData.length > 50000) c.encFileData = '';
+        if (c.fileData && c.fileData.length > 50000) c.fileData = '';
+        return c;
+      });
+      localStorage.setItem('messenger_messages_cache', JSON.stringify(light));
+    } catch (e2) { console.warn('Cache save failed', e2); }
+  }
+}
 function saveGroups() { try { localStorage.setItem('messenger_groups', JSON.stringify(localGroups)); } catch (e) {} }
 
 function mergeMessage(msg) {
@@ -1174,6 +1192,11 @@ function mergeMessage(msg) {
       if (!msg.fileIv && m.fileIv) msg.fileIv = m.fileIv;
       if (!msg.fileKeyEncByUser && m.fileKeyEncByUser) msg.fileKeyEncByUser = m.fileKeyEncByUser;
       if (!msg.textKeyEncByUser && m.textKeyEncByUser) msg.textKeyEncByUser = m.textKeyEncByUser;
+      if (!msg.fileSize && m.fileSize) msg.fileSize = m.fileSize;
+      if (!msg.fileType && m.fileType) msg.fileType = m.fileType;
+      if (!msg.fileName && m.fileName) msg.fileName = m.fileName;
+      if (!msg.thumbUrl && m.thumbUrl) msg.thumbUrl = m.thumbUrl;
+      if (!msg.encryptionVersion && m.encryptionVersion) msg.encryptionVersion = m.encryptionVersion;
       localMessagesCache[i] = msg;
       saveCache();
       return;
@@ -1307,6 +1330,9 @@ async function getFileUrl(msg) {
       return url;
     } catch (e) { return null; }
   }
+  if (msg.encryptionVersion === 2 || msg.fileIv) {
+    return null;
+  }
   var url2 = URL.createObjectURL(encBlob);
   fileUrlCache.set(msg.id, url2);
   return url2;
@@ -1388,7 +1414,7 @@ function getChatMessages(chat) {
 
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
-  document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
+  document.getElementById('my-display-id').innerText = 'Устройство №' + currentUser.id;
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
@@ -1401,11 +1427,10 @@ async function enterByName() {
   if (!lockButton('enter-btn', 3000)) return;
   try {
     await initMyKeyPair();
-    var prev = null;
-    try { prev = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) {}
+    var deviceId = getOrCreateDeviceId();
     var res = await fetch('/api/enter', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, clientId: prev ? prev.id : '', pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '' })
+      body: JSON.stringify({ name: name, deviceId: deviceId, pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '' })
     });
     var data = await res.json();
     if (!data.success) { errBox.innerText = data.error || 'Ошибка'; errBox.style.display = 'block'; return; }
@@ -1432,12 +1457,12 @@ async function restartSession() {
 
 async function deleteSession() {
   if (!currentUser) return;
-  var ok = confirm('Удалить сессию?\\n\\nУдалится ВСЁ на этом устройстве: аккаунт, сообщения, файлы, группы, ключи.');
+  var ok = confirm('Удалить сессию?\\n\\nУдалится ВСЁ на этом устройстве: аккаунт, сообщения, файлы, группы, ключи, ID устройства.');
   if (!ok) return;
   var uid = currentUser.id;
   try { await fetch('/api/enter/leave', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: uid }) }); } catch (e) {}
   try {
-    ['messenger_user','messenger_known_users','messenger_messages_cache','messenger_ec_priv','messenger_ec_pub','messenger_deleted_ids','messenger_muted_peers','messenger_groups'].forEach(function (k) {
+    ['messenger_user','messenger_known_users','messenger_messages_cache','messenger_ec_priv','messenger_ec_pub','messenger_deleted_ids','messenger_muted_peers','messenger_groups','messenger_device_id'].forEach(function (k) {
       try { localStorage.removeItem(k); } catch (e) {}
     });
   } catch (e) {}
@@ -1483,6 +1508,7 @@ function startApp() {
         loadDialogs();
       }
     } catch (e) {}
+    refreshChatListStatuses();
     if (activePeer) {
       loadMessagesQuiet();
       if (activePeer.type === 'group') refreshGroupInfo();
@@ -1491,7 +1517,30 @@ function startApp() {
   }, 2000);
 }
 
-/* ==================== PING ==================== */
+async function refreshChatListStatuses() {
+  if (!currentUser) return;
+  try {
+    var res = await fetch('/api/dialogs/' + encodeURIComponent(currentUser.id));
+    var onlineList = await res.json();
+    var onlineMap = {};
+    onlineList.forEach(function (u) { onlineMap[u.id] = true; cacheUser(u); });
+    document.querySelectorAll('#chat-list .chat-item').forEach(function (itemEl) {
+      var pid = itemEl.dataset.peerId;
+      if (!pid) return;
+      var av = itemEl.querySelector('.avatar-circle');
+      if (!av) return;
+      var ind = av.querySelector('.online-indicator');
+      if (!ind) return;
+      var isOn = !!onlineMap[pid];
+      if (isOn) ind.classList.add('visible'); else ind.classList.remove('visible');
+      var sub = itemEl.querySelector('.chat-item-subtitle');
+      if (sub) {
+        sub.innerHTML = isOn ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
+      }
+    });
+  } catch (e) {}
+}
+
 async function sendPing() {
   if (!currentUser) return;
   try {
@@ -1620,6 +1669,7 @@ function renderChatList(list) {
   list.forEach(function (item) {
     var isGroup = item.type === 'group';
     var div = document.createElement('div');
+    div.dataset.peerId = isGroup ? '' : item.id;
     var isActive = currentActiveId === item.id && currentActiveType === (item.type || 'user');
     div.className = 'chat-item ' + (isActive ? 'active' : '');
     div.onclick = function () { openChat(item); };
@@ -1627,7 +1677,7 @@ function renderChatList(list) {
     var subtitle;
     if (isGroup) subtitle = '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || 0) + '</span>';
     else subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' + (isGroup ? '' : '<div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div>') + '</div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '</div></div>';
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' + (isGroup ? '' : '<div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div>') + '</div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div class="chat-item-subtitle" style="font-size:11px;">' + subtitle + '</div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   });
@@ -1651,7 +1701,7 @@ function renderSearchResults(list) {
     div.onclick = function () { openChat(item); };
     var avatarId = 'ch_av_' + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     var subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">' + escapeHtml(item.id || '') + '</span></div></div>';
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : '') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">№' + escapeHtml(item.id || '') + '</span></div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   }
@@ -1672,33 +1722,40 @@ function onSearchInput() {
   searchDebounceTimer = setTimeout(doSearch, 200);
 }
 async function doSearch() {
+  var mySeq = ++searchRequestSeq;
   var q = document.getElementById('search-input').value.trim();
   var clearBtn = document.getElementById('clear-search-btn');
   var ql = q.toLowerCase();
   var map = {};
-  var nowTs = Date.now();
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
     if (u.id === currentUser.id) continue;
-    var isOn = u.updatedAt && (nowTs - u.updatedAt < 15000);
-    if (!q || (u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1))
-      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!isOn };
+    if (!q || (u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
+      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false };
+    }
   }
   if (q) clearBtn.style.display = 'block'; else clearBtn.style.display = 'none';
   renderSearchResults(Object.values(map));
 
-  if (q) {
-    try {
-      var r = await fetch('/api/users/search?q=' + encodeURIComponent(q) + '&excludeId=' + encodeURIComponent(currentUser.id));
-      var users = await r.json();
+  try {
+    var r = await fetch('/api/users/search?q=' + encodeURIComponent(q) + '&excludeId=' + encodeURIComponent(currentUser.id));
+    if (mySeq !== searchRequestSeq) return;
+    var users = await r.json();
+    if (Array.isArray(users)) {
       users.forEach(function (u) {
-        var existing = map[u.id];
-        if (existing) existing.isOnline = u.isOnline;
-        else map[u.id] = u;
+        if (map[u.id]) {
+          map[u.id].isOnline = !!u.isOnline;
+          map[u.id].name = u.name || map[u.id].name;
+          map[u.id].avatar = u.avatar !== undefined ? u.avatar : map[u.id].avatar;
+        } else {
+          map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!u.isOnline };
+        }
         cacheUser(u);
       });
-    } catch (e) {}
-  }
+    }
+  } catch (e) {}
+
+  if (mySeq !== searchRequestSeq) return;
   var arr = Object.values(map);
   arr.sort(function (a, b) {
     var ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0;
@@ -1826,7 +1883,7 @@ async function renderMessagesContainer(messages) {
     if (isGroup && m.senderId !== currentUser.id) html += '<div class="msg-sender">' + escapeHtml(getUserName(m.senderId)) + '</div>';
     if (m.text) html += '<div>' + escapeHtml(m.text) + '</div>';
     var ft = m.fileType || '';
-    if (m.encFileData || m.fileData || m.fileUrl) {
+    if (m.encFileData || m.fileData || m.fileUrl || (m.fileType && m.fileSize)) {
       var mid = m.id;
       if (ft.indexOf('image/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">📷 Загрузка...</div>';
       else if (ft.indexOf('video/') === 0) html += '<div class="media-loading" data-media-msg-id="' + mid + '">🎬 Загрузка...</div>';
@@ -2208,6 +2265,9 @@ async function sendPayload(payload) {
       if (payload.fileIv) rm.fileIv = payload.fileIv;
       if (payload.fileKeyEncByUser) rm.fileKeyEncByUser = payload.fileKeyEncByUser;
       if (payload.textKeyEncByUser) rm.textKeyEncByUser = payload.textKeyEncByUser;
+      if (!rm.fileType && payload.fileType) rm.fileType = payload.fileType;
+      if (!rm.fileName && payload.fileName) rm.fileName = payload.fileName;
+      if (!rm.thumbUrl && payload.thumbUrl) rm.thumbUrl = payload.thumbUrl;
       try {
         var entry = await getFileFromIDB(payload.clientId);
         if (entry && entry.blob) {
@@ -2240,6 +2300,8 @@ async function uploadLargeFileInBackground(clientId, file, fileName, fileType, t
         localMessagesCache[j].fileIv = enc.ivB64;
         localMessagesCache[j].fileSize = enc.originalSize;
         localMessagesCache[j].fileType = fileType;
+        localMessagesCache[j].fileName = fileName;
+        localMessagesCache[j].thumbUrl = thumbUrl;
         break;
       }
     }
@@ -2274,6 +2336,14 @@ async function retryPendingMessages() {
         var data = await res.json();
         if (data && data.message) {
           var rm = Object.assign({}, data.message); rm.isPending = false; rm.isWaiting = false; rm.text = pm.text || '';
+          if (!rm.encFileData && pm.encFileData) rm.encFileData = pm.encFileData;
+          if (!rm.fileIv && pm.fileIv) rm.fileIv = pm.fileIv;
+          if (!rm.fileKeyEncByUser && pm.fileKeyEncByUser) rm.fileKeyEncByUser = pm.fileKeyEncByUser;
+          if (!rm.fileSize && pm.fileSize) rm.fileSize = pm.fileSize;
+          if (!rm.fileType && pm.fileType) rm.fileType = pm.fileType;
+          if (!rm.fileName && pm.fileName) rm.fileName = pm.fileName;
+          if (!rm.thumbUrl && pm.thumbUrl) rm.thumbUrl = pm.thumbUrl;
+          if (!rm.textKeyEncByUser && pm.textKeyEncByUser) rm.textKeyEncByUser = pm.textKeyEncByUser;
           for (var j = 0; j < localMessagesCache.length; j++) {
             if (localMessagesCache[j].clientId === pm.clientId) { localMessagesCache[j] = rm; break; }
           }
@@ -2292,7 +2362,7 @@ function openMyProfile() {
   document.getElementById('edit-my-name-input').value = currentUser.name;
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
-  document.getElementById('my-profile-id-view').innerText = 'ID: ' + currentUser.id;
+  document.getElementById('my-profile-id-view').innerText = 'Устройство №' + currentUser.id;
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
   safeOpenModal('my-profile-modal');
 }
@@ -2332,7 +2402,7 @@ function openPeerProfile() {
   if (isModalOpen('peer-profile-modal')) return;
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, activePeer.isOnline);
   document.getElementById('peer-profile-name-view').innerText = activePeer.name;
-  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + activePeer.id;
+  document.getElementById('peer-profile-id-view').innerText = 'Устройство №' + activePeer.id;
   updatePeerProfileButtons(activePeer);
   safeOpenModal('peer-profile-modal');
 }
@@ -2351,7 +2421,7 @@ function openMemberProfile(member) {
   if (isModalOpen('peer-profile-modal')) return;
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, member.isOnline);
   document.getElementById('peer-profile-name-view').innerText = member.name;
-  document.getElementById('peer-profile-id-view').innerText = 'ID: ' + member.id;
+  document.getElementById('peer-profile-id-view').innerText = 'Устройство №' + member.id;
   updatePeerProfileButtons(member);
   safeOpenModal('peer-profile-modal');
 }
@@ -2453,7 +2523,6 @@ async function openCreateGroup() {
   renderCheckList('create-group-contacts', cached, new Set());
   safeOpenModal('create-group-modal');
 
-  // Подгружаем актуальные контакты с сервера
   var contacts = await getContactUsers();
   contacts.forEach(function(c) { cacheUser(c); });
   renderCheckList('create-group-contacts', contacts, new Set());
