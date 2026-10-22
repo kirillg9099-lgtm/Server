@@ -1,16 +1,14 @@
 /* ============================================================
-   server.js — v4.3.2 (GitHub / Single-File Web App Edition)
-   - Исправлены сбои WebRTC (звонки) и таймауты очистки
-   - Исправлена передача голосовых сообщений (WAV PCM16)
-   - Исправлено сквозное E2EE-шифрование файлов и текста
-   - Добавлен автоматический GC для памяти на сервере
+   server.js — v5.1.0 (Фиксация ID пользователя и устойчивая доставка)
+   - Постоянный закрепившийся ID устройства/пользователя
+   - Убраны жесткие ограничения на формат ID
+   - Полная синхронизация онлайн-статусов и доставки (ACK)
    ============================================================ */
 const express = require('express');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.3.2';
+const SERVER_VERSION = '5.1.0';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -19,19 +17,19 @@ process.on('uncaughtException', function (err) { console.error('[СЕРВЕР EX
 process.on('unhandledRejection', function (r) { console.error('[ПРОМИС REJECTION]:', r); });
 
 const MEM = { accounts: [], groups: [], inbox: new Map() };
-const ONLINE_WINDOW_MS = 15000;
-const MAX_INBOX_PER_USER = 300;
+const ONLINE_WINDOW_MS = 45000; 
+const MAX_INBOX_PER_USER = 500;
 const CALL_RING_TIMEOUT_MS = 60000;
-const CALL_CLEANUP_DELAY_MS = 3000; // Уменьшено с 30с до 3с для моментального освобождения линии
+const CALL_CLEANUP_DELAY_MS = 3000;
 
 function timeStr() { return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
 function genId(prefix) { return prefix + Date.now() + '_' + Math.random().toString(36).substr(2, 6); }
 function isOnline(u) { return !!(u && u.updatedAt && (Date.now() - u.updatedAt < ONLINE_WINDOW_MS)); }
 
-// Очистка неактивных аккаунтов (> 24 часов без пинга)
+// Очистка старых неактивных аккаунтов (> 48 часов)
 setInterval(function() {
   const now = Date.now();
-  MEM.accounts = MEM.accounts.filter(u => (now - (u.updatedAt || 0)) < 86400000);
+  MEM.accounts = MEM.accounts.filter(u => (now - (u.updatedAt || 0)) < 172800000);
 }, 600000);
 
 const callSignals = new Map();
@@ -39,7 +37,6 @@ const activeCalls = new Map();
 function ensureQ(uid) { if (!callSignals.has(uid)) callSignals.set(uid, []); return callSignals.get(uid); }
 function pushSig(t, f, c, ty, p) { ensureQ(t).push({ id: genId('sig_'), from: f, callId: c, type: ty, payload: p || null, ts: Date.now() }); }
 
-// Таймаут для звонков без ответа
 setInterval(function() {
   const now = Date.now();
   activeCalls.forEach(function(call, callId) {
@@ -55,15 +52,16 @@ app.get('/api/health', function (req, res) {
   res.json({ ok: true, serverTime: Date.now(), serverVersion: SERVER_VERSION });
 });
 
-/* ==================== ВХОД ==================== */
+/* ==================== ВХОД / ВЫХОД ==================== */
 app.post('/api/enter', function (req, res) {
   const name = (req.body.name || '').trim();
   const deviceId = (req.body.deviceId || '').trim();
   const pubKey = req.body.pubKey || '';
   const userAgent = (req.body.userAgent || '').substring(0, 300);
+
   if (!name) return res.status(400).json({ error: 'Введите имя' });
   if (name.length > 60) return res.status(400).json({ error: 'Слишком длинное имя' });
-  if (!deviceId || !/^\d{6,15}$/.test(deviceId)) return res.status(400).json({ error: 'Неверный ID устройства' });
+  if (!deviceId || deviceId.length < 3) return res.status(400).json({ error: 'Ошибка ID устройства' });
 
   let user = MEM.accounts.find(function (u) { return u.id === deviceId; });
   if (!user) {
@@ -100,7 +98,7 @@ app.post('/api/enter/leave', function (req, res) {
   res.json({ success: true });
 });
 
-/* ==================== PING ==================== */
+/* ==================== PING И СИНХРОНИЗАЦИЯ ==================== */
 app.post('/api/ping', function (req, res) {
   const { id, name, avatar, pubKey, contacts, knownUsers, userAgent } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
@@ -151,9 +149,17 @@ app.post('/api/ping', function (req, res) {
   });
 
   const pending = MEM.inbox.get(id) || [];
-  MEM.inbox.delete(id);
-
   res.json({ success: true, user: user, pendingMessages: pending });
+});
+
+app.post('/api/messages/ack', function (req, res) {
+  const { userId, messageIds } = req.body;
+  if (!userId || !Array.isArray(messageIds)) return res.status(400).json({ error: 'Bad data' });
+  let q = MEM.inbox.get(userId);
+  if (q && q.length > 0) {
+    MEM.inbox.set(userId, q.filter(m => !messageIds.includes(m.id)));
+  }
+  res.json({ success: true });
 });
 
 app.post('/api/profile/update', function (req, res) {
@@ -196,7 +202,7 @@ app.post('/api/chat/hide', function (req, res) {
   res.json({ success: true, hiddenDialogs: user.hiddenDialogs });
 });
 
-/* ==================== SEARCH / ONLINE ==================== */
+/* ==================== ПОИСК / ОНЛАЙН ==================== */
 app.get('/api/users/search', function (req, res) {
   const q = (req.query.q || '').toLowerCase().trim();
   const excludeId = req.query.excludeId || '';
@@ -219,17 +225,6 @@ app.get('/api/users/search', function (req, res) {
       if (ao !== bo) return bo - ao;
       return a.name.localeCompare(b.name);
     });
-  res.json(results);
-});
-
-app.get('/api/users/online-all', function (req, res) {
-  const excludeId = req.query.excludeId || '';
-  const now = Date.now();
-  const results = MEM.accounts
-    .filter(function (u) { return u.id && u.id !== excludeId && u.name; })
-    .filter(function (u) { return u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS); })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: true }; })
-    .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(results);
 });
 
@@ -347,16 +342,22 @@ app.post('/api/messages/send', function (req, res) {
     textKeyEncByUser, encryptionVersion
   } = req.body;
 
-  const sender = MEM.accounts.find(function (u) { return u.id === senderId; });
-  if (!sender) return res.status(404).json({ error: 'Отправитель не найден' });
+  let sender = MEM.accounts.find(function (u) { return u.id === senderId; });
+  if (!sender) {
+    sender = { id: senderId, name: 'Пользователь', avatar: '', pubKey: '', userAgent: '', contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now() };
+    MEM.accounts.push(sender);
+  }
 
   if (groupId) {
     const g = MEM.groups.find(function (x) { return x.id === groupId; });
     if (!g) return res.status(404).json({ error: 'Не найдена' });
     if (g.members.indexOf(senderId) === -1) return res.status(403).json({ error: 'Вы не участник' });
   } else {
-    const receiver = MEM.accounts.find(function (u) { return u.id === receiverId; });
-    if (!receiver) return res.status(404).json({ error: 'Получатель не найден' });
+    let receiver = MEM.accounts.find(function (u) { return u.id === receiverId; });
+    if (!receiver) {
+      receiver = { id: receiverId, name: 'Пользователь', avatar: '', pubKey: '', userAgent: '', contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0 };
+      MEM.accounts.push(receiver);
+    }
     if (sender.blockedContacts && sender.blockedContacts.indexOf(receiverId) !== -1) return res.status(403).json({ error: 'Заблокировали' });
     if (receiver.blockedContacts && receiver.blockedContacts.indexOf(senderId) !== -1) return res.status(403).json({ error: 'Заблокированы' });
     if (sender.hiddenDialogs) sender.hiddenDialogs = sender.hiddenDialogs.filter(function (id) { return id !== receiverId; });
@@ -391,12 +392,13 @@ app.post('/api/messages/send', function (req, res) {
   const targets = groupId
     ? (MEM.groups.find(function (x) { return x.id === groupId; }) || { members: [] }).members.filter(function (m) { return m !== senderId; })
     : [receiverId];
+
   targets.forEach(function (tid) {
     if (!tid) return;
-    const q = MEM.inbox.get(tid) || [];
+    if (!MEM.inbox.has(tid)) MEM.inbox.set(tid, []);
+    const q = MEM.inbox.get(tid);
     q.push(newMsg);
     if (q.length > MAX_INBOX_PER_USER) q.splice(0, q.length - MAX_INBOX_PER_USER);
-    MEM.inbox.set(tid, q);
   });
 
   res.json({ success: true, message: newMsg });
@@ -406,24 +408,7 @@ app.get('/api/messages/receive', function (req, res) {
   const userId = req.query.userId;
   if (!userId) return res.status(400).json({ error: 'No user' });
   const pending = MEM.inbox.get(userId) || [];
-  MEM.inbox.delete(userId);
   res.json({ success: true, messages: pending });
-});
-
-app.get('/api/messages/:userId/:peerId', function (req, res) {
-  const { userId, peerId } = req.params;
-  const pending = MEM.inbox.get(userId) || [];
-  const match = pending.filter(function (m) {
-    return (m.senderId === peerId && m.receiverId === userId) ||
-           (m.senderId === userId && m.receiverId === peerId);
-  });
-  res.json(match);
-});
-
-app.get('/api/messages/group/:groupId', function (req, res) {
-  const userId = req.query.userId;
-  const pending = MEM.inbox.get(userId) || [];
-  res.json(pending.filter(function (m) { return m.groupId === req.params.groupId; }));
 });
 
 app.post('/api/messages/read', function (req, res) {
@@ -471,8 +456,7 @@ app.post('/api/calls/start', function (req, res) {
   if (!from) return res.status(404).json({ error: 'Отправитель не найден' });
   if (!to) return res.status(404).json({ error: 'Получатель не найден' });
   if (to.blockedContacts && to.blockedContacts.indexOf(fromId) !== -1) return res.status(403).json({ error: 'Заблокирован' });
-  
-  // Очистка предыдущих зависших звонков с этими участниками
+
   activeCalls.forEach((call, cId) => {
     if (call.fromId === fromId || call.toId === fromId || call.fromId === toId || call.toId === toId) {
       activeCalls.delete(cId);
@@ -492,7 +476,7 @@ app.post('/api/calls/start', function (req, res) {
 app.post('/api/calls/answer', function (req, res) {
   const { callId, userId, accept } = req.body;
   const call = activeCalls.get(callId);
-  if (!call) return res.status(404).json({ error: 'Звонок не найден или завершен' });
+  if (!call) return res.status(404).json({ error: 'Звонок не найден' });
   if (call.toId !== userId) return res.status(403).json({ error: 'Не тот получатель' });
   if (accept) {
     call.status = 'active'; call.answeredAt = Date.now();
@@ -519,7 +503,7 @@ app.post('/api/calls/end', function (req, res) {
 
 app.post('/api/calls/signal', function (req, res) {
   const { callId, fromId, toId, type, payload } = req.body;
-  if (!callId || !fromId || !toId || !type) return res.status(400).json({ error: 'Bad signal data' });
+  if (!callId || !fromId || !toId || !type) return res.status(400).json({ error: 'Bad' });
   pushSig(toId, fromId, callId, type, payload);
   res.json({ success: true });
 });
@@ -755,7 +739,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             </div>
           </div>
           <div class="search-box">
-            <input type="text" id="search-input" placeholder="Поиск по имени или номеру устройства..." oninput="onSearchInput()">
+            <input type="text" id="search-input" placeholder="Поиск по имени или ID..." oninput="onSearchInput()">
             <span class="clear-search" id="clear-search-btn" onclick="clearSearch()">✕</span>
           </div>
         </div>
@@ -945,7 +929,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.3.2';
+var CLIENT_VERSION = '5.1.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -956,7 +940,6 @@ var activeStream = null;
 var recordStartedAt = 0;
 var recordingTimerInterval = null;
 var recordAudioCtx = null, recordSourceNode = null, recordProcessor = null, recordSilentGain = null;
-var lastDialogsHash = '';
 var lastMessagesHash = '';
 var selectedMsgId = null;
 var selectedMsgObj = null;
@@ -988,17 +971,16 @@ var searchRequestSeq = 0;
 var unreadTitleCounter = 0;
 var originalTitle = document.title;
 
-/* ==================== DEVICE ==================== */
+/* ==================== DEVICE & ID ==================== */
 function getOrCreateDeviceId() {
   var existing = localStorage.getItem('messenger_device_id');
-  if (existing && /^\\d{6,15}$/.test(existing)) return existing;
-  var num = String(Math.floor(1000000000 + Math.random() * 9000000000));
-  localStorage.setItem('messenger_device_id', num);
-  return num;
+  if (existing && existing.length >= 6) return existing;
+  var newId = 'usr_' + Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 6);
+  localStorage.setItem('messenger_device_id', newId);
+  return newId;
 }
 function getDeviceInfo() {
   var ua = navigator.userAgent || '';
-  var platform = navigator.platform || '';
   var browser = 'Браузер';
   if (/Edg\\//i.test(ua)) browser = 'Edge';
   else if (/OPR\\//i.test(ua) || /Opera/i.test(ua)) browser = 'Opera';
@@ -1013,10 +995,7 @@ function getDeviceInfo() {
   else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
   else if (/Mac OS X/i.test(ua)) os = 'macOS';
   else if (/Linux/i.test(ua)) os = 'Linux';
-  var type = 'ПК';
-  if (/Android/i.test(ua) || /iPhone/i.test(ua)) type = 'Телефон';
-  else if (/iPad|Tablet/i.test(ua)) type = 'Планшет';
-  return { browser: browser, os: os, type: type, platform: platform };
+  return { browser: browser, os: os };
 }
 function getDeviceInfoString() {
   var d = getDeviceInfo();
@@ -1297,7 +1276,7 @@ function saveCache() {
         return c;
       });
       localStorage.setItem('messenger_messages_cache', JSON.stringify(light));
-    } catch (e2) { console.warn('Cache save failed', e2); }
+    } catch (e2) {}
   }
 }
 function saveGroups() { try { localStorage.setItem('messenger_groups', JSON.stringify(localGroups)); } catch (e) {} }
@@ -1661,13 +1640,24 @@ function startApp() {
       var r = await fetch('/api/messages/receive?userId=' + encodeURIComponent(currentUser.id));
       var d = await r.json();
       if (d.success && d.messages && d.messages.length > 0) {
+        var receivedIds = [];
         for (var i = 0; i < d.messages.length; i++) {
-          await processIncomingMessage(d.messages[i]);
-          if (!d.messages[i].isDeleted) mergeMessage(d.messages[i]);
+          var m = d.messages[i];
+          receivedIds.push(m.id);
+          await processIncomingMessage(m);
+          if (!m.isDeleted) mergeMessage(m);
         }
+        if (receivedIds.length > 0) {
+          fetch('/api/messages/ack', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: currentUser.id, messageIds: receivedIds })
+          }).catch(function(){});
+        }
+
         saveCache();
         if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
         loadDialogs();
+
         d.messages.forEach(function (m) {
           if (m.senderId === currentUser.id) return;
           if (isPeerMuted(m.senderId)) return;
@@ -1736,7 +1726,16 @@ async function sendPing() {
       if (changed) { try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {} updateMyProfileUI(); }
       if (Array.isArray(data.pendingMessages) && data.pendingMessages.length > 0) {
         (async function () {
-          for (var i = 0; i < data.pendingMessages.length; i++) { var m = data.pendingMessages[i]; await processIncomingMessage(m); if (!m.isDeleted) mergeMessage(m); }
+          var ackIds = [];
+          for (var i = 0; i < data.pendingMessages.length; i++) {
+            var m = data.pendingMessages[i];
+            ackIds.push(m.id);
+            await processIncomingMessage(m);
+            if (!m.isDeleted) mergeMessage(m);
+          }
+          if (ackIds.length > 0) {
+            fetch('/api/messages/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: currentUser.id, messageIds: ackIds }) }).catch(function(){});
+          }
           saveCache(); if (activePeer) renderMessagesContainer(getChatMessages(activePeer)); loadDialogs();
         })();
       }
@@ -1922,7 +1921,6 @@ function openChat(peer) {
   unreadTitleCounter = 0; updatePageTitle();
 }
 function closeMobileChat() { document.getElementById('app-screen').classList.remove('app-mobile-chat'); }
-function msgFetchUrl() { return activePeer.type === 'group' ? '/api/messages/group/' + activePeer.id + '?userId=' + encodeURIComponent(currentUser.id) : '/api/messages/' + currentUser.id + '/' + activePeer.id; }
 
 /* ==================== РАСШИФРОВКА ==================== */
 async function processIncomingMessage(m) {
@@ -1945,12 +1943,8 @@ async function processIncomingMessage(m) {
 }
 async function loadMessages() {
   if (!activePeer) return;
-  try {
-    var res = await fetch(msgFetchUrl());
-    var messages = await res.json();
-    for (var i = 0; i < messages.length; i++) { await processIncomingMessage(messages[i]); if (!messages[i].isDeleted) mergeMessage(messages[i]); }
-    saveCache(); renderMessagesContainer(getChatMessages(activePeer)); checkVisibleMessages();
-  } catch (e) { renderMessagesContainer(getChatMessages(activePeer)); }
+  renderMessagesContainer(getChatMessages(activePeer));
+  checkVisibleMessages();
 }
 async function loadMessagesQuiet() {
   if (!activePeer) return;
@@ -2301,7 +2295,7 @@ async function toggleVoiceRecord() {
     return;
   }
   if (!activePeer) { alert('Выберите чат'); return; }
-  if (!navigator.mediaDevices) { alert('Нет доступа к устройствам'); return; }
+  if (!navigator.mediaDevices) { alert('Нет доступа'); return; }
   if (recordAudioCtx) { try { await recordAudioCtx.close(); } catch (e) {} recordAudioCtx = null; }
   try {
     var stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }, video: false });
@@ -2335,7 +2329,7 @@ async function sendMsg() {
   var isGroup = activePeer.type === 'group';
   var clientId = 'cid_' + Date.now() + '_' + Math.random().toString(36).substr(2, 8);
   var peerOnline = true;
-  if (!isGroup) { var pu = localKnownUsers[activePeer.id]; if (pu && pu.updatedAt && (Date.now() - pu.updatedAt >= 15000)) peerOnline = false; if (activePeer.isOnline === false) peerOnline = false; }
+  if (!isGroup) { var pu = localKnownUsers[activePeer.id]; if (pu && pu.updatedAt && (Date.now() - pu.updatedAt >= ONLINE_WINDOW_MS)) peerOnline = false; if (activePeer.isOnline === false) peerOnline = false; }
   var optMsg = {
     id: clientId, clientId: clientId, senderId: currentUser.id,
     receiverId: isGroup ? '' : activePeer.id, groupId: isGroup ? activePeer.id : '',
@@ -2441,7 +2435,7 @@ async function uploadLargeFileInBackground(clientId, file, fileName, fileType, t
     await sendPayload(p);
     lastMessagesHash = '';
     if (activePeer) renderMessagesContainer(getChatMessages(activePeer));
-  } catch (e) { console.warn('Upload failed:', e); }
+  } catch (e) {}
 }
 async function retryPendingMessages() {
   if (!currentUser || isRetrying) return;
@@ -2645,9 +2639,12 @@ async function openCreateGroup() {
   }
   renderCheckList('create-group-contacts', cached, new Set());
   safeOpenModal('create-group-modal');
-  var contacts = await getContactUsers();
-  contacts.forEach(function(c) { cacheUser(c); });
-  renderCheckList('create-group-contacts', contacts, new Set());
+  try {
+    var res = await fetch('/api/users/online?userId=' + encodeURIComponent(currentUser.id));
+    var list = await res.json();
+    list.forEach(function (u) { cacheUser(u); });
+    renderCheckList('create-group-contacts', list, new Set());
+  } catch(e){}
 }
 function closeCreateGroup() { safeCloseModal('create-group-modal'); }
 function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
@@ -2918,7 +2915,7 @@ async function startCall() {
         if (currentCall && currentCall.status === 'ringing') { alert('Собеседник не отвечает'); endCurrentCall(); }
       }, 60000);
     }
-  } catch (e) { console.warn('startCall error', e); alert('Ошибка инициализации звонка'); }
+  } catch (e) { alert('Ошибка инициализации звонка'); }
 }
 async function acceptIncomingCall() {
   if (!incomingCall) return;
@@ -3029,7 +3026,7 @@ async function handleSig(sig) {
         var offer = await currentCall.pc.createOffer();
         await currentCall.pc.setLocalDescription(offer);
         sendSig('offer', { sdp: offer });
-      } catch (e) { console.warn('createOffer failed', e); }
+      } catch (e) {}
     }
   }
   else if (sig.type === 'rejected' || sig.type === 'ended') {
@@ -3048,7 +3045,7 @@ async function handleSig(sig) {
         }
         currentCall.pendingIce = [];
       }
-    } catch (e) { console.warn('offer handling failed', e); }
+    } catch (e) {}
   }
   else if (sig.type === 'answer') {
     try {
@@ -3059,7 +3056,7 @@ async function handleSig(sig) {
         }
         currentCall.pendingIce = [];
       }
-    } catch (e) { console.warn('answer handling failed', e); }
+    } catch (e) {}
   }
   else if (sig.type === 'ice') {
     try {
@@ -3152,7 +3149,11 @@ window.addEventListener('DOMContentLoaded', async function () {
   updateVersionInfo();
   await checkServerHealth();
   if (!currentUser) { setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000); }
-  if (currentUser) { if (myKeyPair && currentUser) currentUser.pubKey = myKeyPair.pubKeyB64; startApp(); }
+  if (currentUser) {
+    if (!currentUser.id) currentUser.id = getOrCreateDeviceId();
+    if (myKeyPair && currentUser) currentUser.pubKey = myKeyPair.pubKeyB64;
+    startApp();
+  }
   else updateLoadingScreen();
 });
 `;
