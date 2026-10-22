@@ -1,17 +1,15 @@
 /* ============================================================
-   server.js — v4.3.0 (full)
-   - DOM обновление на месте (не дёргается скролл/аудио)
-   - Тёмные кнопки при записи + подсказка
-   - Группы: список участников + добавление
-   - Реальное устройство (userAgent) в профилях
-   - Удаление только реально удалённых
+   server.js — v4.3.1 (на базе рабочей v4.3.0)
+   - ID везде остаётся
+   - Браузер + устройство (ОС · браузер) — второй строкой
+   - Всё остальное без изменений от v4.3.0
    ============================================================ */
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.3.0';
+const SERVER_VERSION = '4.3.1';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -628,7 +626,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   #audio-attachment-preview.active{display:flex;}
   #audio-attachment-preview audio{height:36px;}
 
-  /* ==== Запись: панель и подсказка ==== */
   .record-panel{display:none;background:var(--bg-sidebar);border-top:1px solid var(--border);padding:6px 12px;align-items:center;justify-content:center;gap:10px;flex-shrink:0;height:40px;}
   .record-panel.active{display:flex;}
   .recording-indicator{display:none;align-items:center;gap:6px;font-size:13px;color:#e53935;}
@@ -644,7 +641,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .icon-btn{cursor:pointer;font-size:22px;border:none;background:transparent;color:var(--text-main);padding:4px;flex-shrink:0;transition:opacity .15s,filter .15s;}
   .icon-btn.recording{color:#e53935;}
 
-  /* Недоступные кнопки — тёмные/приглушённые */
   .input-bar.recording-mode .icon-btn,
   .input-bar.recording-mode #send-btn,
   .input-bar.recording-mode #msg-input {
@@ -740,7 +736,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             <div class="avatar-circle" id="my-avatar-circle" onclick="openMyProfile()"><div class="online-indicator visible"></div></div>
             <div class="user-info-brief" onclick="openMyProfile()">
               <b id="my-display-name">Имя</b>
-              <div style="font-size:11px;color:var(--accent);" id="my-display-id">Устройство</div>
+              <div style="font-size:11px;color:var(--text-muted);" id="my-display-device">Устройство</div>
             </div>
             <div class="header-actions">
               <button class="theme-toggle-btn" onclick="openCreateGroup()" title="Создать группу">👥</button>
@@ -938,7 +934,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.3.0';
+var CLIENT_VERSION = '4.3.1';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -1013,7 +1009,7 @@ function getDeviceInfo() {
 }
 function getDeviceInfoString() {
   var d = getDeviceInfo();
-  return d.type + ' · ' + d.os + ' · ' + d.browser;
+  return d.os + ' · ' + d.browser;
 }
 function parseUserAgent(ua) {
   if (!ua) return '';
@@ -1031,10 +1027,7 @@ function parseUserAgent(ua) {
   else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
   else if (/Mac OS X/i.test(ua)) os = 'macOS';
   else if (/Linux/i.test(ua)) os = 'Linux';
-  var type = 'ПК';
-  if (/Android/i.test(ua) || /iPhone/i.test(ua)) type = 'Телефон';
-  else if (/iPad|Tablet/i.test(ua)) type = 'Планшет';
-  return type + ' · ' + os + ' · ' + browser;
+  return os + ' · ' + browser;
 }
 
 /* ==================== ШИФРОВАНИЕ ==================== */
@@ -1582,7 +1575,7 @@ function messagesHash(msgs) {
 }
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
-  document.getElementById('my-display-id').innerText = 'Устройство №' + currentUser.id;
+  document.getElementById('my-display-device').innerText = 'ID: ' + currentUser.id + ' · ' + getDeviceInfoString();
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
@@ -1835,7 +1828,7 @@ function renderSearchResults(list) {
     div.onclick = function () { openChat(item); };
     var avatarId = 'ch_av_' + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     var subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">№' + escapeHtml(item.id || '') + '</span></div></div>';
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">ID: ' + escapeHtml(item.id || '') + '</span></div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   }
@@ -1884,18 +1877,27 @@ function clearSearch() { document.getElementById('search-input').value = ''; doc
 function openChat(peer) {
   cancelVoiceAttachment();
   if (!peer.type) peer.type = 'user';
+  var cameFromSearch = !!peer._fromSearch;
   activePeer = peer;
   cacheUser(peer);
   lastMessagesHash = '';
   document.getElementById('active-peer-name').innerText = peer.name;
   var statusEl = document.getElementById('active-peer-status');
-  if (peer.type === 'group') { statusEl.innerText = (peer.memberCount || 0) + ' участников'; statusEl.style.color = 'var(--text-muted)'; document.getElementById('call-btn').style.display = 'none'; }
-  else {
+  if (peer.type === 'group') {
+    statusEl.innerText = (peer.memberCount || 0) + ' участников';
+    statusEl.style.color = 'var(--text-muted)';
+    document.getElementById('call-btn').style.display = 'none';
+  } else {
     if (peer.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
     else { statusEl.innerText = 'не в сети'; statusEl.style.color = 'var(--text-muted)'; }
     document.getElementById('call-btn').style.display = 'flex';
-    if (!currentUser.contacts) currentUser.contacts = [];
-    if (currentUser.contacts.indexOf(peer.id) === -1) { currentUser.contacts.push(peer.id); try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {} }
+    if (!cameFromSearch) {
+      if (!currentUser.contacts) currentUser.contacts = [];
+      if (currentUser.contacts.indexOf(peer.id) === -1) {
+        currentUser.contacts.push(peer.id);
+        try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+      }
+    }
   }
   renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { id: peer.id, avatar: peer.avatar, name: peer.name }, peer.isOnline || false);
   document.getElementById('input-bar').style.display = 'flex';
@@ -1953,7 +1955,7 @@ function isGroupMsgRead(m) {
   return others.length > 0 && rb.length >= others.length;
 }
 
-/* ==================== РЕНДЕР СООБЩЕНИЙ (обновление, не пересоздание) ==================== */
+/* ==================== РЕНДЕР СООБЩЕНИЙ ==================== */
 async function renderMessagesContainer(messages) {
   var container = document.getElementById('messages-container');
   if (!container) return;
@@ -2472,8 +2474,9 @@ function openMyProfile() {
   document.getElementById('edit-my-name-input').value = currentUser.name;
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
-  var devStr = getDeviceInfoString();
-  document.getElementById('my-profile-id-view').innerHTML = 'Устройство №' + escapeHtml(currentUser.id) + '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>';
+  document.getElementById('my-profile-id-view').innerHTML =
+    '<span style="color:var(--text-main);">ID: ' + escapeHtml(currentUser.id) + '</span>' +
+    '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(getDeviceInfoString()) + '</span>';
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
   safeOpenModal('my-profile-modal');
 }
@@ -2511,7 +2514,9 @@ function openPeerProfile() {
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, !!activePeer.isOnline);
   document.getElementById('peer-profile-name-view').innerText = activePeer.name;
   var devStr = activePeer.userAgent ? parseUserAgent(activePeer.userAgent) : '';
-  document.getElementById('peer-profile-id-view').innerHTML = 'Устройство №' + escapeHtml(activePeer.id) + (devStr ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>' : '');
+  document.getElementById('peer-profile-id-view').innerHTML =
+    '<span style="color:var(--text-main);">ID: ' + escapeHtml(activePeer.id) + '</span>' +
+    (devStr ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>' : '');
   updatePeerProfileButtons(activePeer);
   safeOpenModal('peer-profile-modal');
   fetch('/api/users/' + activePeer.id).then(function (r) { return r.json(); }).then(function (info) {
@@ -2519,7 +2524,9 @@ function openPeerProfile() {
       activePeer.userAgent = info.userAgent;
       var s = parseUserAgent(info.userAgent);
       var el = document.getElementById('peer-profile-id-view');
-      if (el) el.innerHTML = 'Устройство №' + escapeHtml(activePeer.id) + (s ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(s) + '</span>' : '');
+      if (el) el.innerHTML =
+        '<span style="color:var(--text-main);">ID: ' + escapeHtml(activePeer.id) + '</span>' +
+        (s ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(s) + '</span>' : '');
     }
   }).catch(function () {});
 }
@@ -2539,7 +2546,9 @@ function openMemberProfile(member) {
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, !!member.isOnline);
   document.getElementById('peer-profile-name-view').innerText = member.name;
   var devStr = member.userAgent ? parseUserAgent(member.userAgent) : '';
-  document.getElementById('peer-profile-id-view').innerHTML = 'Устройство №' + escapeHtml(member.id) + (devStr ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>' : '');
+  document.getElementById('peer-profile-id-view').innerHTML =
+    '<span style="color:var(--text-main);">ID: ' + escapeHtml(member.id) + '</span>' +
+    (devStr ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>' : '');
   updatePeerProfileButtons(member);
   safeOpenModal('peer-profile-modal');
 }
