@@ -1,18 +1,16 @@
 /* ============================================================
-   server.js — v4.3.1 (на базе v4.3.0)
-   - ID возвращён везде
-   - Аватарки — синий accent (без --avatar-hue)
-   - Точка «в сети» скрыта в своём профиле
-   - Список поиска для группы — с аватаркой, ID, статусом
-   - Аудио-плеер шире (max-width 320, min-width 260)
-   - Чаты, звонки, группы, онлайн — как в 4.3.0
+   server.js — v4.5.1
+   - Взято из рабочей v4.5.0
+   - ID везде остаётся
+   - Браузер + устройство показываются второй строкой
+   - Всё остальное без изменений
    ============================================================ */
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.3.1';
+const SERVER_VERSION = '4.5.1';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -60,6 +58,7 @@ app.post('/api/enter', function (req, res) {
   const name = (req.body.name || '').trim();
   const deviceId = (req.body.deviceId || '').trim();
   const pubKey = req.body.pubKey || '';
+  const userAgent = (req.body.userAgent || '').substring(0, 300);
   if (!name) return res.status(400).json({ error: 'Введите имя' });
   if (name.length > 60) return res.status(400).json({ error: 'Слишком длинное имя' });
   if (!deviceId || !/^\d{6,15}$/.test(deviceId)) return res.status(400).json({ error: 'Неверный ID устройства' });
@@ -67,13 +66,14 @@ app.post('/api/enter', function (req, res) {
   let user = MEM.accounts.find(function (u) { return u.id === deviceId; });
   if (!user) {
     user = {
-      id: deviceId, name: name, avatar: '', pubKey: pubKey,
+      id: deviceId, name: name, avatar: '', pubKey: pubKey, userAgent: userAgent,
       contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now()
     };
     MEM.accounts.push(user);
   } else {
     user.name = name;
     if (pubKey) user.pubKey = pubKey;
+    if (userAgent) user.userAgent = userAgent;
     user.updatedAt = Date.now();
   }
   res.json({ success: true, user: user });
@@ -100,8 +100,13 @@ app.post('/api/enter/leave', function (req, res) {
 
 /* ==================== PING ==================== */
 app.post('/api/ping', function (req, res) {
-  const { id, name, avatar, pubKey, contacts, knownUsers } = req.body;
+  const { id, name, avatar, pubKey, contacts, knownUsers, userAgent } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
+
+  if (!/^\d{6,15}$/.test(String(id))) {
+    const hashNum = String(Math.abs(crypto.createHash('sha256').update(String(id)).digest().readInt32BE(0)) || 1).padStart(10, '0');
+    return res.json({ success: false, migrateTo: hashNum });
+  }
 
   if (Array.isArray(knownUsers)) {
     knownUsers.forEach(function (ku) {
@@ -110,12 +115,13 @@ app.post('/api/ping', function (req, res) {
       if (!ex) {
         MEM.accounts.push({
           id: ku.id, name: ku.name || 'Пользователь', avatar: ku.avatar || '', pubKey: ku.pubKey || '',
-          contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0
+          userAgent: ku.userAgent || '', contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0
         });
       } else {
         if (ku.name) ex.name = ku.name;
         if (ku.avatar !== undefined) ex.avatar = ku.avatar;
         if (ku.pubKey) ex.pubKey = ku.pubKey;
+        if (ku.userAgent) ex.userAgent = ku.userAgent;
       }
     });
   }
@@ -124,6 +130,7 @@ app.post('/api/ping', function (req, res) {
   if (!user) {
     user = {
       id: id, name: name || 'Пользователь', avatar: avatar || '', pubKey: pubKey || '',
+      userAgent: userAgent ? String(userAgent).substring(0, 300) : '',
       contacts: Array.isArray(contacts) ? contacts : [], blockedContacts: [], hiddenDialogs: [], updatedAt: Date.now()
     };
     MEM.accounts.push(user);
@@ -132,6 +139,7 @@ app.post('/api/ping', function (req, res) {
     if (name) user.name = name;
     if (avatar !== undefined) user.avatar = avatar;
     if (pubKey) user.pubKey = pubKey;
+    if (userAgent) user.userAgent = String(userAgent).substring(0, 300);
     if (Array.isArray(contacts)) {
       if (!user.contacts) user.contacts = [];
       contacts.forEach(function (cid) { if (user.contacts.indexOf(cid) === -1) user.contacts.push(cid); });
@@ -166,7 +174,11 @@ app.post('/api/profile/update', function (req, res) {
 app.get('/api/users/:userId', function (req, res) {
   const user = MEM.accounts.find(function (u) { return u.id === req.params.userId; });
   if (!user) return res.status(404).json({ error: 'Не найден' });
-  res.json({ id: user.id, name: user.name, avatar: user.avatar || '', pubKey: user.pubKey || '', isOnline: isOnline(user), updatedAt: user.updatedAt });
+  res.json({
+    id: user.id, name: user.name, avatar: user.avatar || '', pubKey: user.pubKey || '',
+    userAgent: user.userAgent || '',
+    isOnline: isOnline(user), updatedAt: user.updatedAt
+  });
 });
 
 app.post('/api/users/block', function (req, res) {
@@ -200,7 +212,11 @@ app.get('/api/users/search', function (req, res) {
       return (u.id && u.id.toLowerCase().indexOf(q) !== -1) || (u.name && u.name.toLowerCase().indexOf(q) !== -1);
     })
     .map(function (u) {
-      return { id: u.id, type: 'user', name: u.name || 'Пользователь', avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) };
+      return {
+        id: u.id, type: 'user', name: u.name || 'Пользователь', avatar: u.avatar || '', pubKey: u.pubKey || '',
+        userAgent: u.userAgent || '',
+        isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS))
+      };
     })
     .sort(function (a, b) {
       const ao = a.isOnline ? 1 : 0, bo = b.isOnline ? 1 : 0;
@@ -216,7 +232,7 @@ app.get('/api/users/online-all', function (req, res) {
   const results = MEM.accounts
     .filter(function (u) { return u.id && u.id !== excludeId && u.name; })
     .filter(function (u) { return u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS); })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: true }; })
+    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: true }; })
     .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(results);
 });
@@ -226,7 +242,13 @@ app.get('/api/users/online', function (req, res) {
   const now = Date.now();
   const list = MEM.accounts
     .filter(function (u) { return u.id !== userId && u.name; })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) }; })
+    .map(function (u) {
+      return {
+        id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '',
+        userAgent: u.userAgent || '',
+        isOnline: !!(u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS))
+      };
+    })
     .sort(function (a, b) { return a.name.localeCompare(b.name); });
   res.json(list);
 });
@@ -238,7 +260,10 @@ app.post('/api/groups/create', function (req, res) {
   if (!name || !name.trim()) return res.status(400).json({ error: 'Введите название' });
   if (!Array.isArray(members) || members.length === 0) return res.status(400).json({ error: 'Выберите участников' });
   const memberSet = new Set([userId].concat(members.filter(function (m) { return m !== userId; })));
-  const group = { id: genId('grp_'), name: name.trim(), avatar: avatar || '', ownerId: userId, members: Array.from(memberSet), createdAt: Date.now() };
+  const group = {
+    id: genId('grp_'), name: name.trim(), avatar: avatar || '', ownerId: userId,
+    members: Array.from(memberSet), createdAt: Date.now()
+  };
   MEM.groups.push(group);
   res.json({ success: true, group: group });
 });
@@ -247,7 +272,12 @@ function groupWithDetails(group) {
   const now = Date.now();
   const memberDetails = group.members.map(function (mId) {
     const u = MEM.accounts.find(function (a) { return a.id === mId; });
-    return { id: mId, name: u ? u.name : 'Пользователь', avatar: u ? (u.avatar || '') : '', pubKey: u ? (u.pubKey || '') : '', isOnline: !!(u && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS)) };
+    return {
+      id: mId, name: u ? u.name : 'Пользователь', avatar: u ? (u.avatar || '') : '',
+      pubKey: u ? (u.pubKey || '') : '',
+      userAgent: u ? (u.userAgent || '') : '',
+      isOnline: !!(u && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS))
+    };
   });
   const copy = Object.assign({}, group);
   copy.memberDetails = memberDetails;
@@ -431,7 +461,7 @@ app.get('/api/dialogs/:userId', function (req, res) {
   const now = Date.now();
   const list = MEM.accounts
     .filter(function (u) { return u.id !== userId && u.name && u.updatedAt && (now - u.updatedAt < ONLINE_WINDOW_MS); })
-    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: true }; });
+    .map(function (u) { return { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: true }; });
   res.json(list);
 });
 
@@ -542,21 +572,19 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .user-profile-bar{display:flex;align-items:center;justify-content:space-between;padding:4px;cursor:pointer;}
   .user-info-brief{display:flex;flex-direction:column;overflow:hidden;margin-left:10px;flex:1;}
 
-  .avatar-circle{width:40px;height:40px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:visible;}
+  .avatar-circle{width:40px;height:40px;border-radius:50%;background:hsl(var(--avatar-hue, 210), 55%, 45%);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:visible;}
   .avatar-circle img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:50%;display:block;z-index:1;}
   .avatar-circle > span{position:relative;z-index:1;}
   .avatar-circle .online-indicator{position:absolute;bottom:-2px;right:-2px;width:12px;height:12px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;display:none;z-index:10;box-sizing:content-box;}
   .avatar-circle .online-indicator.visible{display:block;}
   .avatar-circle .online-indicator.offline{background:#7f91a4;display:block;}
 
-  .profile-avatar-big{width:90px;height:90px;border-radius:50%;background:var(--accent);margin-bottom:15px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:32px;font-weight:bold;position:relative;overflow:hidden;flex-shrink:0;}
+  .profile-avatar-big{width:90px;height:90px;border-radius:50%;background:hsl(var(--avatar-hue, 210), 55%, 45%);margin-bottom:15px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:32px;font-weight:bold;position:relative;overflow:hidden;flex-shrink:0;}
   .profile-avatar-big img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:50%;display:block;}
   .profile-avatar-big > span{position:relative;z-index:1;}
   .profile-avatar-big .online-indicator{position:absolute;bottom:0;right:0;width:16px;height:16px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;z-index:5;box-sizing:content-box;display:none;}
   .profile-avatar-big .online-indicator.visible{display:block;}
   .profile-avatar-big .online-indicator.offline{background:#7f91a4;display:block;}
-  /* Скрываем точку «в сети» в своём профиле */
-  #my-profile-avatar-view .online-indicator { display: none !important; }
 
   .header-actions{display:flex;gap:6px;}
   .theme-toggle-btn{background:var(--bg-input);border:none;color:var(--text-main);width:34px;height:34px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;}
@@ -591,12 +619,12 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .file-link{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg-input);border-radius:6px;color:var(--accent);text-decoration:none;margin-top:5px;font-size:13px;}
   .file-placeholder{padding:8px 12px;background:var(--bg-input);border-radius:6px;margin-top:5px;font-size:12px;color:var(--text-muted);}
 
-  /* Аудио-плеер — шире */
+  /* Аудио-плеер: нативная высота, не обрезается */
   .msg audio.audio-preview {
     display: block;
     width: 100%;
-    max-width: 320px;
-    min-width: 260px;
+    max-width: 280px;
+    min-width: 220px;
     height: auto;
     min-height: 54px;
     margin-top: 6px;
@@ -605,8 +633,8 @@ const CLIENT_HTML = `<!DOCTYPE html>
     box-sizing: border-box;
   }
   .msg.my audio.audio-preview { margin-left: auto; }
-  @media (max-width: 480px) {
-    .msg audio.audio-preview { width: 100%; max-width: 100%; min-width: 240px; }
+  @media (max-width: 400px) {
+    .msg audio.audio-preview { width: 100%; max-width: 100%; min-width: 200px; }
   }
 
   .media-loading{padding:8px 12px;background:var(--bg-input);border-radius:6px;margin-top:5px;font-size:12px;color:var(--text-muted);}
@@ -662,7 +690,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .modal-overlay.active{visibility:visible;opacity:1;pointer-events:auto;}
   .profile-card{background:var(--bg-sidebar);width:90%;max-width:380px;border-radius:16px;padding:25px;display:flex;flex-direction:column;align-items:center;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5);max-height:90dvh;overflow-y:auto;}
   .profile-name{font-size:20px;font-weight:bold;margin-bottom:5px;}
-  .profile-id{font-size:13px;color:var(--accent);margin-bottom:15px;text-align:center;line-height:1.4;}
+  .profile-id{font-size:13px;color:var(--text-muted);margin-bottom:15px;text-align:center;line-height:1.4;}
   .profile-actions{width:100%;display:flex;flex-direction:column;gap:10px;}
   .profile-link-btn{background:none;border:none;color:var(--accent);font-size:14px;cursor:pointer;padding:5px;text-align:center;}
   .member-row{display:flex;align-items:center;gap:10px;padding:6px 8px;cursor:pointer;border-radius:8px;position:relative;}
@@ -692,7 +720,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .call-remote-video{width:100%;height:100%;object-fit:contain;background:#000;}
   .call-local-video{position:absolute;top:70px;right:16px;width:110px;height:160px;object-fit:cover;border-radius:12px;background:#111;box-shadow:0 4px 12px rgba(0,0,0,.5);z-index:5;}
   .call-audio-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;}
-  .call-big-avatar{width:120px;height:120px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:bold;color:#fff;overflow:hidden;position:relative;}
+  .call-big-avatar{width:120px;height:120px;border-radius:50%;background:hsl(var(--avatar-hue, 210), 55%, 45%);display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:bold;color:#fff;overflow:hidden;position:relative;}
   .call-big-avatar img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;border-radius:50%;}
   .call-name{font-size:24px;font-weight:bold;}
   .call-status-text{font-size:14px;opacity:.7;}
@@ -739,7 +767,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             <div class="avatar-circle" id="my-avatar-circle" onclick="openMyProfile()"><div class="online-indicator visible"></div></div>
             <div class="user-info-brief" onclick="openMyProfile()">
               <b id="my-display-name">Имя</b>
-              <div style="font-size:11px;color:var(--accent);" id="my-display-id">ID</div>
+              <div style="font-size:11px;color:var(--text-muted);" id="my-display-device">ID</div>
             </div>
             <div class="header-actions">
               <button class="theme-toggle-btn" onclick="openCreateGroup()" title="Создать группу">👥</button>
@@ -747,7 +775,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             </div>
           </div>
           <div class="search-box">
-            <input type="text" id="search-input" placeholder="Поиск по имени или ID..." oninput="onSearchInput()">
+            <input type="text" id="search-input" placeholder="Поиск по имени..." oninput="onSearchInput()">
             <span class="clear-search" id="clear-search-btn" onclick="clearSearch()">✕</span>
           </div>
         </div>
@@ -799,7 +827,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
   <div class="modal-overlay" id="my-profile-modal">
     <div class="profile-card">
-      <div class="profile-avatar-big" id="my-profile-avatar-view"></div>
+      <div class="profile-avatar-big" id="my-profile-avatar-view"><div class="online-indicator visible"></div></div>
       <div class="profile-name" id="my-profile-name-view">Имя</div>
       <div class="profile-id" id="my-profile-id-view">ID</div>
       <div class="input-group" style="width:100%;"><input type="text" id="edit-my-name-input" placeholder="Ваше имя..."></div>
@@ -942,7 +970,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.3.1';
+var CLIENT_VERSION = '4.5.1';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -1004,6 +1032,48 @@ function getOrCreateDeviceId() {
   var num = String(Math.abs(h)).padStart(10, '0').substring(0, 10);
   localStorage.setItem('messenger_device_id', num);
   return num;
+}
+function getDeviceInfoString() {
+  var ua = navigator.userAgent || '';
+  var browser = 'Браузер';
+  if (/Edg\\//i.test(ua)) browser = 'Edge';
+  else if (/OPR\\//i.test(ua) || /Opera/i.test(ua)) browser = 'Opera';
+  else if (/YaBrowser/i.test(ua)) browser = 'Яндекс';
+  else if (/Firefox\\//i.test(ua)) browser = 'Firefox';
+  else if (/Chrome\\//i.test(ua)) browser = 'Chrome';
+  else if (/Safari\\//i.test(ua)) browser = 'Safari';
+  var os = 'ОС';
+  if (/Windows NT 10/i.test(ua)) os = 'Windows 10/11';
+  else if (/Windows/i.test(ua)) os = 'Windows';
+  else if (/Android/i.test(ua)) os = 'Android';
+  else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
+  else if (/Mac OS X/i.test(ua)) os = 'macOS';
+  else if (/Linux/i.test(ua)) os = 'Linux';
+  return os + ' · ' + browser;
+}
+function parseUserAgent(ua) {
+  if (!ua) return '';
+  var browser = 'Браузер';
+  if (/Edg\\//i.test(ua)) browser = 'Edge';
+  else if (/OPR\\//i.test(ua) || /Opera/i.test(ua)) browser = 'Opera';
+  else if (/YaBrowser/i.test(ua)) browser = 'Яндекс';
+  else if (/Firefox\\//i.test(ua)) browser = 'Firefox';
+  else if (/Chrome\\//i.test(ua)) browser = 'Chrome';
+  else if (/Safari\\//i.test(ua)) browser = 'Safari';
+  var os = 'ОС';
+  if (/Windows NT 10/i.test(ua)) os = 'Windows 10/11';
+  else if (/Windows/i.test(ua)) os = 'Windows';
+  else if (/Android/i.test(ua)) os = 'Android';
+  else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
+  else if (/Mac OS X/i.test(ua)) os = 'macOS';
+  else if (/Linux/i.test(ua)) os = 'Linux';
+  return os + ' · ' + browser;
+}
+function idToHue(id) {
+  var s = String(id || 'x');
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) & 0xffff;
+  return h % 360;
 }
 
 /* ==================== ШИФРОВАНИЕ ==================== */
@@ -1455,16 +1525,17 @@ document.addEventListener('click', function (e) {
 
 function renderAvatarIntoElement(el, userObj, isOnline) {
   if (!el) return;
-  var skipIndicator = el.id === 'my-profile-avatar-view';
-  var indicator = skipIndicator ? null : el.querySelector('.online-indicator');
-  if (!skipIndicator && !indicator) {
+  el.style.setProperty('--avatar-hue', idToHue(userObj && userObj.id));
+  var indicator = el.querySelector('.online-indicator');
+  if (!indicator) {
     indicator = document.createElement('div');
     indicator.className = 'online-indicator';
     el.appendChild(indicator);
   }
   var rk = (userObj && userObj.id ? userObj.id : '') + '|' + (userObj && userObj.avatar ? String(userObj.avatar).substring(0, 30) : '') + '|' + (userObj && userObj.name ? userObj.name : '');
   if (el.dataset.renderKey === rk) {
-    if (indicator) { indicator.classList.toggle('visible', !!isOnline); indicator.classList.toggle('offline', !isOnline); }
+    indicator.classList.toggle('visible', !!isOnline);
+    indicator.classList.toggle('offline', !isOnline);
     return;
   }
   el.dataset.renderKey = rk;
@@ -1477,19 +1548,21 @@ function renderAvatarIntoElement(el, userObj, isOnline) {
       this.remove();
       var s = document.createElement('span');
       s.innerText = ((userObj && userObj.name) ? userObj.name.charAt(0).toUpperCase() : '?');
-      if (indicator) el.insertBefore(s, indicator); else el.appendChild(s);
+      el.insertBefore(s, indicator);
     };
-    if (indicator) el.insertBefore(img, indicator); else el.appendChild(img);
+    el.insertBefore(img, indicator);
   } else {
     var s2 = document.createElement('span');
     s2.innerText = (userObj && userObj.name ? userObj.name.charAt(0).toUpperCase() : '?');
-    if (indicator) el.insertBefore(s2, indicator); else el.appendChild(s2);
+    el.insertBefore(s2, indicator);
   }
-  if (indicator) { indicator.classList.toggle('visible', !!isOnline); indicator.classList.toggle('offline', !isOnline); }
+  indicator.classList.toggle('visible', !!isOnline);
+  indicator.classList.toggle('offline', !isOnline);
 }
-function fillAvatarBox(el, avatar, fallback) {
+function fillAvatarBox(el, avatar, fallback, idForHue) {
   if (!el) return;
-  var rk = 'fill|' + (avatar ? String(avatar).substring(0, 30) : '') + '|' + (fallback || '?');
+  el.style.setProperty('--avatar-hue', idToHue(idForHue || fallback || 'grp'));
+  var rk = 'fill|' + (avatar ? String(avatar).substring(0, 30) : '') + '|' + (fallback || '?') + '|' + (idForHue || '');
   if (el.dataset.renderKey === rk) return;
   el.dataset.renderKey = rk;
   Array.from(el.childNodes).forEach(function (node) {
@@ -1507,7 +1580,7 @@ function fillAvatarBox(el, avatar, fallback) {
 }
 function cacheUser(user) {
   if (!user || !user.id || user.type === 'group') return;
-  localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar, pubKey: user.pubKey || '', updatedAt: Date.now() };
+  localKnownUsers[user.id] = { id: user.id, name: user.name, avatar: user.avatar, pubKey: user.pubKey || '', userAgent: user.userAgent || '', updatedAt: Date.now() };
   try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
 }
 function getUserName(id) {
@@ -1545,7 +1618,7 @@ function messagesHash(msgs) {
 }
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
-  document.getElementById('my-display-id').innerText = 'ID: ' + currentUser.id;
+  document.getElementById('my-display-device').innerText = getDeviceInfoString();
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
@@ -1561,7 +1634,7 @@ async function enterByName() {
     var deviceId = getOrCreateDeviceId();
     var res = await fetch('/api/enter', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, deviceId: deviceId, pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '' })
+      body: JSON.stringify({ name: name, deviceId: deviceId, pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '', userAgent: navigator.userAgent })
     });
     var data = await res.json();
     if (!data.success) { errBox.innerText = data.error || 'Ошибка'; errBox.style.display = 'block'; return; }
@@ -1673,7 +1746,9 @@ async function refreshChatListStatuses() {
       ind.classList.toggle('offline', !isOn);
       var sub = itemEl.querySelector('.chat-item-subtitle');
       if (sub) {
-        sub.innerHTML = (isOn ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>') + '<span style="color:var(--text-muted);font-size:10px;margin-left:6px;">ID: ' + escapeHtml(pid) + '</span>';
+        var kUser = localKnownUsers[pid];
+        var devStr = kUser && kUser.userAgent ? parseUserAgent(kUser.userAgent) : '';
+        sub.innerHTML = (isOn ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>') + ' <span style="color:var(--text-muted);font-size:10px;">ID: ' + escapeHtml(pid) + (devStr ? ' · ' + escapeHtml(devStr) : '') + '</span>';
       }
     });
   } catch (e) {}
@@ -1685,7 +1760,7 @@ async function sendPing() {
     for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) knownList.push(localKnownUsers[k]);
     var res = await fetch('/api/ping', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar || '', pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '', contacts: currentUser.contacts || [], knownUsers: knownList })
+      body: JSON.stringify({ id: currentUser.id, name: currentUser.name, avatar: currentUser.avatar || '', pubKey: myKeyPair ? myKeyPair.pubKeyB64 : '', contacts: currentUser.contacts || [], knownUsers: knownList, userAgent: navigator.userAgent })
     });
     var data = await res.json();
     pingFailCount = 0;
@@ -1717,6 +1792,7 @@ async function sendPing() {
       var serverUser = data.user; var changed = false;
       if (serverUser.name && serverUser.name !== currentUser.name) { currentUser.name = serverUser.name; changed = true; }
       if (serverUser.avatar !== undefined && serverUser.avatar !== currentUser.avatar) { currentUser.avatar = serverUser.avatar; changed = true; }
+      if (serverUser.userAgent) currentUser.userAgent = serverUser.userAgent;
       if (serverUser.contacts) { if (!currentUser.contacts) currentUser.contacts = []; serverUser.contacts.forEach(function (c) { if (currentUser.contacts.indexOf(c) === -1) currentUser.contacts.push(c); }); changed = true; }
       if (serverUser.blockedContacts) currentUser.blockedContacts = serverUser.blockedContacts;
       if (changed) { try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {} updateMyProfileUI(); }
@@ -1740,7 +1816,8 @@ async function refreshActivePeerStatus() {
     if (res.ok) {
       var info = await res.json();
       activePeer.isOnline = info.isOnline; activePeer.name = info.name; activePeer.avatar = info.avatar;
-      if (info.pubKey) { activePeer.pubKey = info.pubKey; }
+      if (info.pubKey) activePeer.pubKey = info.pubKey;
+      if (info.userAgent) activePeer.userAgent = info.userAgent;
       cacheUser(activePeer);
       var statusEl = document.getElementById('active-peer-status');
       if (info.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
@@ -1775,7 +1852,7 @@ function loadDialogs() {
         if (m.isDeleted || m.groupId) return;
         if ((m.senderId === currentUser.id && m.receiverId === pid) || (m.senderId === pid && m.receiverId === currentUser.id)) { if ((m.ts || 0) > last) last = m.ts || 0; }
       });
-      dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!onlineMap[pid], lastTs: last });
+      dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: !!onlineMap[pid], lastTs: last });
     });
     localGroups.forEach(function (g) {
       var last = 0;
@@ -1786,7 +1863,7 @@ function loadDialogs() {
     renderChatList(dialogs);
   }).catch(function () {
     var dialogs = [];
-    peers.forEach(function (pid) { var u = localKnownUsers[pid]; if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false, lastTs: 0 }); });
+    peers.forEach(function (pid) { var u = localKnownUsers[pid]; if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: false, lastTs: 0 }); });
     localGroups.forEach(function (g) { dialogs.push({ id: g.id, type: 'group', name: g.name, avatar: g.avatar || '', ownerId: g.ownerId, members: g.members, memberCount: (g.members || []).length, lastTs: 0 }); });
     renderChatList(dialogs);
   });
@@ -1807,7 +1884,10 @@ function renderChatList(list) {
     var avatarId = 'chat_av_' + (isGroup ? 'grp_' : 'usr_') + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     var subtitle;
     if (isGroup) subtitle = '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || 0) + '</span>';
-    else subtitle = (item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>') + '<span style="color:var(--text-muted);font-size:10px;margin-left:6px;">ID: ' + escapeHtml(item.id) + '</span>';
+    else {
+      var devStr = item.userAgent ? parseUserAgent(item.userAgent) : '';
+      subtitle = (item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>') + ' <span style="color:var(--text-muted);font-size:10px;">ID: ' + escapeHtml(item.id) + (devStr ? ' · ' + escapeHtml(devStr) : '') + '</span>';
+    }
     div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' + (isGroup ? '' : '<div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div>') + '</div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div class="chat-item-subtitle" style="font-size:11px;">' + subtitle + '</div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
@@ -1830,8 +1910,9 @@ function renderSearchResults(list) {
       openChat(copy);
     };
     var avatarId = 'ch_av_' + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
+    var devStr = item.userAgent ? parseUserAgent(item.userAgent) : '';
     var subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + ' <span style="color:var(--text-muted);font-family:monospace;font-size:10px;">ID: ' + escapeHtml(item.id) + '</span></div></div>';
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + ' <span style="color:var(--text-muted);font-family:monospace;font-size:10px;">ID: ' + escapeHtml(item.id) + (devStr ? ' · ' + escapeHtml(devStr) : '') + '</span></div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   }
@@ -1852,7 +1933,7 @@ async function doSearch() {
     var u = localKnownUsers[k];
     if (u.id === currentUser.id) continue;
     if (!q || (u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
-      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false };
+      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: false };
     }
   }
   if (q) clearBtn.style.display = 'block'; else clearBtn.style.display = 'none';
@@ -1863,8 +1944,8 @@ async function doSearch() {
     var users = await r.json();
     if (Array.isArray(users)) {
       users.forEach(function (u) {
-        if (map[u.id]) { map[u.id].isOnline = !!u.isOnline; map[u.id].name = u.name || map[u.id].name; map[u.id].avatar = u.avatar !== undefined ? u.avatar : map[u.id].avatar; }
-        else map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!u.isOnline };
+        if (map[u.id]) { map[u.id].isOnline = !!u.isOnline; map[u.id].name = u.name || map[u.id].name; map[u.id].avatar = u.avatar !== undefined ? u.avatar : map[u.id].avatar; map[u.id].userAgent = u.userAgent || map[u.id].userAgent; }
+        else map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: !!u.isOnline };
         cacheUser(u);
       });
     }
@@ -1952,6 +2033,7 @@ async function loadMessagesQuiet() {
 function openImageViewer(src) { if (document.getElementById('image-viewer-modal').classList.contains('active')) return; document.getElementById('full-screen-img').src = src; document.getElementById('image-viewer-modal').classList.add('active'); }
 function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
 
+/* ==== Полноэкранный видеоплеер ==== */
 function openVideoFS(url) {
   var m = document.getElementById('video-fs-modal');
   var v = document.getElementById('video-fs-player');
@@ -2480,7 +2562,9 @@ function openMyProfile() {
   document.getElementById('edit-my-name-input').value = currentUser.name;
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
-  document.getElementById('my-profile-id-view').innerHTML = 'ID: ' + escapeHtml(currentUser.id);
+  document.getElementById('my-profile-id-view').innerHTML =
+    'ID: ' + escapeHtml(currentUser.id) +
+    '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(getDeviceInfoString()) + '</span>';
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
   safeOpenModal('my-profile-modal');
 }
@@ -2517,9 +2601,20 @@ function openPeerProfile() {
   if (isModalOpen('peer-profile-modal')) return;
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, !!activePeer.isOnline);
   document.getElementById('peer-profile-name-view').innerText = activePeer.name;
-  document.getElementById('peer-profile-id-view').innerHTML = 'ID: ' + escapeHtml(activePeer.id);
+  document.getElementById('peer-profile-id-view').innerHTML =
+    'ID: ' + escapeHtml(activePeer.id) +
+    (activePeer.userAgent ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(parseUserAgent(activePeer.userAgent)) + '</span>' : '');
   updatePeerProfileButtons(activePeer);
   safeOpenModal('peer-profile-modal');
+  fetch('/api/users/' + activePeer.id).then(function (r) { return r.json(); }).then(function (info) {
+    if (info && info.userAgent) {
+      activePeer.userAgent = info.userAgent;
+      var el = document.getElementById('peer-profile-id-view');
+      if (el) el.innerHTML =
+        'ID: ' + escapeHtml(activePeer.id) +
+        '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(parseUserAgent(info.userAgent)) + '</span>';
+    }
+  }).catch(function () {});
 }
 function updatePeerProfileButtons(user) {
   var b = document.getElementById('block-peer-btn');
@@ -2536,7 +2631,9 @@ function openMemberProfile(member) {
   if (isModalOpen('peer-profile-modal')) return;
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, !!member.isOnline);
   document.getElementById('peer-profile-name-view').innerText = member.name;
-  document.getElementById('peer-profile-id-view').innerHTML = 'ID: ' + escapeHtml(member.id);
+  document.getElementById('peer-profile-id-view').innerHTML =
+    'ID: ' + escapeHtml(member.id) +
+    (member.userAgent ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(parseUserAgent(member.userAgent)) + '</span>' : '');
   updatePeerProfileButtons(member);
   safeOpenModal('peer-profile-modal');
 }
@@ -2595,41 +2692,14 @@ async function getContactUsers() {
   catch (e) { return []; }
 }
 function renderCheckList(containerId, users, excludeSet) {
-  var c = document.getElementById(containerId);
-  if (!c) return;
-  c.innerHTML = '';
+  var c = document.getElementById(containerId); c.innerHTML = '';
   var list = users.filter(function (u) { return !excludeSet.has(u.id); });
-  if (list.length === 0) {
-    c.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:12px;text-align:center;">Нет доступных контактов</div>';
-    return;
-  }
+  if (list.length === 0) { c.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:8px;">Нет доступных контактов</div>'; return; }
   list.forEach(function (u) {
     var row = document.createElement('label');
     row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px;cursor:pointer;border-bottom:1px solid var(--border);';
-
-    var cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.value = u.id;
-    cb.style.cssText = 'width:18px;height:18px;flex-shrink:0;';
-    row.appendChild(cb);
-
     var avatarId = 'chk_av_' + u.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
-    var avatar = document.createElement('div');
-    avatar.className = 'avatar-circle';
-    avatar.id = avatarId;
-    avatar.style.cssText = 'width:36px;height:36px;font-size:14px;';
-    row.appendChild(avatar);
-
-    var info = document.createElement('div');
-    info.style.cssText = 'flex:1;overflow:hidden;min-width:0;';
-    var status = u.isOnline
-      ? '<span style="color:#4cd964;">в сети</span>'
-      : '<span style="color:var(--text-muted);">не в сети</span>';
-    info.innerHTML =
-      '<div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(u.name) + '</div>' +
-      '<div style="font-size:11px;">' + status + ' <span style="color:var(--text-muted);font-family:monospace;font-size:10px;">ID: ' + escapeHtml(u.id) + '</span></div>';
-    row.appendChild(info);
-
+    row.innerHTML = '<input type="checkbox" value="' + u.id + '" style="width:18px;height:18px;"><div class="avatar-circle" id="' + avatarId + '" style="width:32px;height:32px;font-size:13px;"></div><span style="flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">' + escapeHtml(u.name) + '</span>';
     c.appendChild(row);
     renderAvatarIntoElement(document.getElementById(avatarId), u, !!u.isOnline);
   });
@@ -2639,7 +2709,7 @@ async function openCreateGroup() {
   if (isModalOpen('create-group-modal')) return;
   groupDraftAvatar = '';
   document.getElementById('create-group-name').value = '';
-  fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥');
+  fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥', 'grp_new');
   var cached = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
@@ -2655,7 +2725,7 @@ function closeCreateGroup() { safeCloseModal('create-group-modal'); }
 function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
 function handleGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
-  compressImage(file, 200, 0.85, function (c) { if (!c) return; groupDraftAvatar = c; fillAvatarBox(document.getElementById('create-group-avatar'), groupDraftAvatar, '👥'); });
+  compressImage(file, 200, 0.85, function (c) { if (!c) return; groupDraftAvatar = c; fillAvatarBox(document.getElementById('create-group-avatar'), groupDraftAvatar, '👥', 'grp_new'); });
 }
 async function submitCreateGroup() {
   var name = document.getElementById('create-group-name').value.trim();
@@ -2695,7 +2765,7 @@ async function openGroupProfile() {
   groupProfileLoading = true;
 
   editGroupDraftAvatar = '';
-  fillAvatarBox(document.getElementById('group-profile-avatar'), activePeer.avatar, '👥');
+  fillAvatarBox(document.getElementById('group-profile-avatar'), activePeer.avatar, '👥', activePeer.id);
   document.getElementById('group-profile-name').innerText = activePeer.name || 'Группа';
   document.getElementById('group-profile-count').innerText = ((activePeer.members || []).length) + ' участников';
   var isOwner = activePeer.ownerId === currentUser.id;
@@ -2708,7 +2778,7 @@ async function openGroupProfile() {
   try { await refreshGroupInfo(); } catch (e) {}
 
   var g = activePeer;
-  fillAvatarBox(document.getElementById('group-profile-avatar'), g.avatar, '👥');
+  fillAvatarBox(document.getElementById('group-profile-avatar'), g.avatar, '👥', g.id);
   document.getElementById('group-profile-name').innerText = g.name;
   document.getElementById('group-profile-count').innerText = (g.members ? g.members.length : 0) + ' участников';
   isOwner = g.ownerId === currentUser.id;
@@ -2788,7 +2858,7 @@ async function deleteGroup() {
 function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
 function handleEditGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
-  compressImage(file, 200, 0.85, function (c) { if (!c) return; editGroupDraftAvatar = c; fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥'); });
+  compressImage(file, 200, 0.85, function (c) { if (!c) return; editGroupDraftAvatar = c; fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥', activePeer.id); });
 }
 async function saveGroupChanges() {
   if (!activePeer || activePeer.type !== 'group') return;
@@ -2894,7 +2964,7 @@ function updateCallUI() {
   if (!currentCall) return;
   var a = document.getElementById('call-peer-avatar');
   if (currentCall.peerAvatar) a.innerHTML = '<img src="' + currentCall.peerAvatar + '">';
-  else a.innerText = (currentCall.peerName || '?').charAt(0).toUpperCase();
+  else { a.innerText = (currentCall.peerName || '?').charAt(0).toUpperCase(); a.style.setProperty('--avatar-hue', idToHue(currentCall.peerId)); }
   document.getElementById('call-peer-name').innerText = currentCall.peerName || 'Собеседник';
   var s = document.getElementById('call-status-text');
   if (currentCall.status === 'ringing') s.innerText = 'Вызов...';
@@ -3014,6 +3084,7 @@ async function handleSig(sig) {
     }
     incomingCall = { callId: sig.callId, fromId: sig.from, fromName: sig.payload.fromName || 'Пользователь', fromAvatar: sig.payload.fromAvatar || '', video: !!sig.payload.video };
     document.getElementById('incoming-avatar').innerHTML = incomingCall.fromAvatar ? '<img src="' + incomingCall.fromAvatar + '">' : (incomingCall.fromName.charAt(0).toUpperCase());
+    document.getElementById('incoming-avatar').style.setProperty('--avatar-hue', idToHue(sig.from));
     document.getElementById('incoming-name').innerText = incomingCall.fromName;
     document.getElementById('incoming-status-text').innerText = incomingCall.video ? 'Входящий видеозвонок...' : 'Входящий звонок...';
     document.getElementById('incoming-call-overlay').classList.add('active');
@@ -3156,6 +3227,20 @@ window.addEventListener('DOMContentLoaded', async function () {
   try { localGroups = JSON.parse(localStorage.getItem('messenger_groups') || '[]'); } catch (e) { localGroups = []; }
   localMessagesCache = localMessagesCache.filter(function (m) { return !deletedIds[m.id] && !m.isDeleted; });
   saveCache();
+  if (currentUser) {
+    var pairs = {};
+    localMessagesCache.forEach(function (m) {
+      if (m.isDeleted || deletedIds[m.id]) return;
+      if (m.groupId) return;
+      if (m.senderId === currentUser.id && m.receiverId) pairs[m.receiverId] = true;
+      if (m.receiverId === currentUser.id && m.senderId) pairs[m.senderId] = true;
+    });
+    if (!currentUser.contacts) currentUser.contacts = [];
+    Object.keys(pairs).forEach(function (pid) {
+      if (currentUser.contacts.indexOf(pid) === -1) currentUser.contacts.push(pid);
+    });
+    try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+  }
   updateVersionInfo();
   await checkServerHealth();
   if (!currentUser) { setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000); }
