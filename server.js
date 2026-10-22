@@ -1,17 +1,16 @@
 /* ============================================================
-   server.js — v4.3.0 (full)
-   - DOM обновление на месте (не дёргается скролл/аудио)
-   - Тёмные кнопки при записи + подсказка
-   - Группы: список участников + добавление
-   - Реальное устройство (userAgent) в профилях
-   - Удаление только реально удалённых
+   server.js — v4.4.0 (audio UI fix, device label, id migration)
+   - Аудио-плеер: фиксированный размер, preload=metadata
+   - В профилях: ОС · браузер + мелкий ID
+   - Миграция старых id_xxx → числовой ID
+   - displayDeviceId для отображения
    ============================================================ */
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.3.0';
+const SERVER_VERSION = '4.4.0';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -103,6 +102,12 @@ app.post('/api/enter/leave', function (req, res) {
 app.post('/api/ping', function (req, res) {
   const { id, name, avatar, pubKey, contacts, knownUsers, userAgent } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
+
+  // Миграция старых id (id_xxx) → стабильный числовой ID
+  if (!/^\d{6,15}$/.test(String(id))) {
+    const hashNum = String(Math.abs(crypto.createHash('sha256').update(String(id)).digest().readInt32BE(0)) || 1).padStart(10, '0');
+    return res.json({ success: false, migrateTo: hashNum });
+  }
 
   if (Array.isArray(knownUsers)) {
     knownUsers.forEach(function (ku) {
@@ -613,7 +618,24 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .media-preview{width:280px;height:180px;max-width:100%;border-radius:8px;margin-top:6px;object-fit:cover;display:block;background:#000;cursor:pointer;}
   .file-link{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg-input);border-radius:6px;color:var(--accent);text-decoration:none;margin-top:5px;font-size:13px;}
   .file-placeholder{padding:8px 12px;background:var(--bg-input);border-radius:6px;margin-top:5px;font-size:12px;color:var(--text-muted);}
-  .audio-preview{width:240px!important;max-width:240px!important;height:40px;margin-top:5px;display:block;}
+
+  /* Аудио-плеер: фиксированный размер, не сжимается */
+  .msg audio.audio-preview {
+    display: block;
+    width: 260px;
+    max-width: 100%;
+    height: 40px;
+    min-height: 40px;
+    margin-top: 6px;
+    background: transparent;
+    flex-shrink: 0;
+    box-sizing: border-box;
+  }
+  .msg.my audio.audio-preview { margin-left: auto; }
+  @media (max-width: 400px) {
+    .msg audio.audio-preview { width: 220px; min-width: 200px; }
+  }
+
   .media-loading{padding:8px 12px;background:var(--bg-input);border-radius:6px;margin-top:5px;font-size:12px;color:var(--text-muted);}
   .msg-footer{display:flex;align-items:center;justify-content:flex-end;gap:4px;font-size:9px;color:var(--text-muted);margin-top:3px;}
   .ticks{font-size:11px;letter-spacing:-3px;font-weight:bold;}
@@ -628,7 +650,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   #audio-attachment-preview.active{display:flex;}
   #audio-attachment-preview audio{height:36px;}
 
-  /* ==== Запись: панель и подсказка ==== */
   .record-panel{display:none;background:var(--bg-sidebar);border-top:1px solid var(--border);padding:6px 12px;align-items:center;justify-content:center;gap:10px;flex-shrink:0;height:40px;}
   .record-panel.active{display:flex;}
   .recording-indicator{display:none;align-items:center;gap:6px;font-size:13px;color:#e53935;}
@@ -644,7 +665,6 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .icon-btn{cursor:pointer;font-size:22px;border:none;background:transparent;color:var(--text-main);padding:4px;flex-shrink:0;transition:opacity .15s,filter .15s;}
   .icon-btn.recording{color:#e53935;}
 
-  /* Недоступные кнопки — тёмные/приглушённые */
   .input-bar.recording-mode .icon-btn,
   .input-bar.recording-mode #send-btn,
   .input-bar.recording-mode #msg-input {
@@ -938,7 +958,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.3.0';
+var CLIENT_VERSION = '4.4.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -1013,7 +1033,7 @@ function getDeviceInfo() {
 }
 function getDeviceInfoString() {
   var d = getDeviceInfo();
-  return d.type + ' · ' + d.os + ' · ' + d.browser;
+  return d.os + ' · ' + d.browser;
 }
 function parseUserAgent(ua) {
   if (!ua) return '';
@@ -1031,10 +1051,14 @@ function parseUserAgent(ua) {
   else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
   else if (/Mac OS X/i.test(ua)) os = 'macOS';
   else if (/Linux/i.test(ua)) os = 'Linux';
-  var type = 'ПК';
-  if (/Android/i.test(ua) || /iPhone/i.test(ua)) type = 'Телефон';
-  else if (/iPad|Tablet/i.test(ua)) type = 'Планшет';
-  return type + ' · ' + os + ' · ' + browser;
+  return os + ' · ' + browser;
+}
+function displayDeviceId(id) {
+  if (!id) return '—';
+  if (!/^\\d+$/.test(String(id))) {
+    return '№' + String(id).replace(/^id_/, '').substring(0, 6);
+  }
+  return '№' + id;
 }
 
 /* ==================== ШИФРОВАНИЕ ==================== */
@@ -1582,7 +1606,7 @@ function messagesHash(msgs) {
 }
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
-  document.getElementById('my-display-id').innerText = 'Устройство №' + currentUser.id;
+  document.getElementById('my-display-id').innerText = displayDeviceId(currentUser.id);
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
@@ -1719,6 +1743,25 @@ async function sendPing() {
     });
     var data = await res.json();
     pingFailCount = 0;
+    if (data && data.migrateTo) {
+      var oldId = currentUser.id;
+      currentUser.id = data.migrateTo;
+      try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+      try { localStorage.setItem('messenger_device_id', data.migrateTo); } catch (e) {}
+      if (localKnownUsers[oldId]) {
+        localKnownUsers[data.migrateTo] = Object.assign({}, localKnownUsers[oldId], { id: data.migrateTo });
+        delete localKnownUsers[oldId];
+        try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
+      }
+      for (var mi = 0; mi < localMessagesCache.length; mi++) {
+        if (localMessagesCache[mi].senderId === oldId) localMessagesCache[mi].senderId = data.migrateTo;
+        if (localMessagesCache[mi].receiverId === oldId) localMessagesCache[mi].receiverId = data.migrateTo;
+      }
+      saveCache();
+      updateMyProfileUI();
+      setTimeout(sendPing, 200);
+      return;
+    }
     if (connectionState !== 'online' && navigator.onLine) setConnectionState('online');
     if (data.success && data.user) {
       var serverUser = data.user; var changed = false;
@@ -1835,7 +1878,7 @@ function renderSearchResults(list) {
     div.onclick = function () { openChat(item); };
     var avatarId = 'ch_av_' + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
     var subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">№' + escapeHtml(item.id || '') + '</span></div></div>';
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">' + escapeHtml(displayDeviceId(item.id)) + '</span></div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   }
@@ -1953,7 +1996,7 @@ function isGroupMsgRead(m) {
   return others.length > 0 && rb.length >= others.length;
 }
 
-/* ==================== РЕНДЕР СООБЩЕНИЙ (обновление, не пересоздание) ==================== */
+/* ==================== РЕНДЕР СООБЩЕНИЙ ==================== */
 async function renderMessagesContainer(messages) {
   var container = document.getElementById('messages-container');
   if (!container) return;
@@ -2117,9 +2160,13 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
     newEl = document.createElement('audio');
     newEl.className = 'audio-preview';
     newEl.controls = true;
-    newEl.preload = 'auto';
+    newEl.preload = 'metadata';
     newEl.src = url;
     newEl.setAttribute('data-msg-audio-id', msg.id);
+    newEl.style.width = '260px';
+    newEl.style.maxWidth = '100%';
+    newEl.style.height = '40px';
+    newEl.style.display = 'block';
   } else {
     newEl = document.createElement('a');
     newEl.className = 'file-link'; newEl.href = url; newEl.download = msg.fileName || 'file'; newEl.target = '_blank';
@@ -2473,7 +2520,9 @@ function openMyProfile() {
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
   var devStr = getDeviceInfoString();
-  document.getElementById('my-profile-id-view').innerHTML = 'Устройство №' + escapeHtml(currentUser.id) + '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>';
+  document.getElementById('my-profile-id-view').innerHTML =
+    '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(devStr) + '</span>' +
+    '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(currentUser.id)) + '</span>';
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
   safeOpenModal('my-profile-modal');
 }
@@ -2511,7 +2560,9 @@ function openPeerProfile() {
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, !!activePeer.isOnline);
   document.getElementById('peer-profile-name-view').innerText = activePeer.name;
   var devStr = activePeer.userAgent ? parseUserAgent(activePeer.userAgent) : '';
-  document.getElementById('peer-profile-id-view').innerHTML = 'Устройство №' + escapeHtml(activePeer.id) + (devStr ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>' : '');
+  document.getElementById('peer-profile-id-view').innerHTML =
+    (devStr ? '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(devStr) + '</span><br>' : '') +
+    '<span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(activePeer.id)) + '</span>';
   updatePeerProfileButtons(activePeer);
   safeOpenModal('peer-profile-modal');
   fetch('/api/users/' + activePeer.id).then(function (r) { return r.json(); }).then(function (info) {
@@ -2519,7 +2570,9 @@ function openPeerProfile() {
       activePeer.userAgent = info.userAgent;
       var s = parseUserAgent(info.userAgent);
       var el = document.getElementById('peer-profile-id-view');
-      if (el) el.innerHTML = 'Устройство №' + escapeHtml(activePeer.id) + (s ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(s) + '</span>' : '');
+      if (el) el.innerHTML =
+        '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(s) + '</span><br>' +
+        '<span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(activePeer.id)) + '</span>';
     }
   }).catch(function () {});
 }
@@ -2539,7 +2592,9 @@ function openMemberProfile(member) {
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, !!member.isOnline);
   document.getElementById('peer-profile-name-view').innerText = member.name;
   var devStr = member.userAgent ? parseUserAgent(member.userAgent) : '';
-  document.getElementById('peer-profile-id-view').innerHTML = 'Устройство №' + escapeHtml(member.id) + (devStr ? '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(devStr) + '</span>' : '');
+  document.getElementById('peer-profile-id-view').innerHTML =
+    (devStr ? '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(devStr) + '</span><br>' : '') +
+    '<span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(member.id)) + '</span>';
   updatePeerProfileButtons(member);
   safeOpenModal('peer-profile-modal');
 }
@@ -3127,6 +3182,21 @@ window.addEventListener('DOMContentLoaded', async function () {
   try { localGroups = JSON.parse(localStorage.getItem('messenger_groups') || '[]'); } catch (e) { localGroups = []; }
   localMessagesCache = localMessagesCache.filter(function (m) { return !deletedIds[m.id] && !m.isDeleted; });
   saveCache();
+  // Миграция локального кеша: старые id_xxx → числовые
+  var migrated = false;
+  for (var uid in localKnownUsers) if (localKnownUsers.hasOwnProperty(uid)) {
+    if (!/^\\d+$/.test(uid)) {
+      var newId = String(Math.abs(uid.split('').reduce(function(a,c){return a + c.charCodeAt(0);},0)) || 1).padStart(10, '0');
+      if (!localKnownUsers[newId]) {
+        localKnownUsers[newId] = Object.assign({}, localKnownUsers[uid], { id: newId });
+        migrated = true;
+      }
+      delete localKnownUsers[uid];
+    }
+  }
+  if (migrated) {
+    try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
+  }
   updateVersionInfo();
   await checkServerHealth();
   if (!currentUser) { setInterval(async function () { await checkServerHealth(); updateLoadingScreen(); }, 3000); }
