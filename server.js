@@ -1,16 +1,20 @@
 /* ============================================================
-   server.js — v4.4.0 (audio UI fix, device label, id migration)
-   - Аудио-плеер: фиксированный размер, preload=metadata
-   - В профилях: ОС · браузер + мелкий ID
-   - Миграция старых id_xxx → числовой ID
-   - displayDeviceId для отображения
+   server.js — v4.5.0
+   - Поиск не добавляет в чаты
+   - Чаты восстановлены из кеша
+   - Название устройства вместо ID
+   - Уникальный цвет аватарки по ID
+   - Аудио-плеер: нативная высота, не обрезается
+   - Видео: своя полноэкранка с кнопкой ✕ и Esc
+   - Группы: список не пропадает
+   - Аватарки уникальны
    ============================================================ */
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SERVER_VERSION = '4.4.0';
+const SERVER_VERSION = '4.5.0';
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -103,7 +107,6 @@ app.post('/api/ping', function (req, res) {
   const { id, name, avatar, pubKey, contacts, knownUsers, userAgent } = req.body;
   if (!id) return res.status(400).json({ error: 'No id' });
 
-  // Миграция старых id (id_xxx) → стабильный числовой ID
   if (!/^\d{6,15}$/.test(String(id))) {
     const hashNum = String(Math.abs(crypto.createHash('sha256').update(String(id)).digest().readInt32BE(0)) || 1).padStart(10, '0');
     return res.json({ success: false, migrateTo: hashNum });
@@ -116,12 +119,13 @@ app.post('/api/ping', function (req, res) {
       if (!ex) {
         MEM.accounts.push({
           id: ku.id, name: ku.name || 'Пользователь', avatar: ku.avatar || '', pubKey: ku.pubKey || '',
-          userAgent: '', contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0
+          userAgent: ku.userAgent || '', contacts: [], blockedContacts: [], hiddenDialogs: [], updatedAt: 0
         });
       } else {
         if (ku.name) ex.name = ku.name;
         if (ku.avatar !== undefined) ex.avatar = ku.avatar;
         if (ku.pubKey) ex.pubKey = ku.pubKey;
+        if (ku.userAgent) ex.userAgent = ku.userAgent;
       }
     });
   }
@@ -572,14 +576,15 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .user-profile-bar{display:flex;align-items:center;justify-content:space-between;padding:4px;cursor:pointer;}
   .user-info-brief{display:flex;flex-direction:column;overflow:hidden;margin-left:10px;flex:1;}
 
-  .avatar-circle{width:40px;height:40px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:visible;}
+  /* ==== Аватарка с уникальным цветом по ID ==== */
+  .avatar-circle{width:40px;height:40px;border-radius:50%;background:hsl(var(--avatar-hue, 210), 55%, 45%);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:bold;flex-shrink:0;font-size:16px;position:relative;overflow:visible;}
   .avatar-circle img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:50%;display:block;z-index:1;}
   .avatar-circle > span{position:relative;z-index:1;}
   .avatar-circle .online-indicator{position:absolute;bottom:-2px;right:-2px;width:12px;height:12px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;display:none;z-index:10;box-sizing:content-box;}
   .avatar-circle .online-indicator.visible{display:block;}
   .avatar-circle .online-indicator.offline{background:#7f91a4;display:block;}
 
-  .profile-avatar-big{width:90px;height:90px;border-radius:50%;background:var(--accent);margin-bottom:15px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:32px;font-weight:bold;position:relative;overflow:hidden;flex-shrink:0;}
+  .profile-avatar-big{width:90px;height:90px;border-radius:50%;background:hsl(var(--avatar-hue, 210), 55%, 45%);margin-bottom:15px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:32px;font-weight:bold;position:relative;overflow:hidden;flex-shrink:0;}
   .profile-avatar-big img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:50%;display:block;}
   .profile-avatar-big > span{position:relative;z-index:1;}
   .profile-avatar-big .online-indicator{position:absolute;bottom:0;right:0;width:16px;height:16px;background:#4cd964;border:2px solid var(--bg-sidebar);border-radius:50%;z-index:5;box-sizing:content-box;display:none;}
@@ -619,13 +624,14 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .file-link{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg-input);border-radius:6px;color:var(--accent);text-decoration:none;margin-top:5px;font-size:13px;}
   .file-placeholder{padding:8px 12px;background:var(--bg-input);border-radius:6px;margin-top:5px;font-size:12px;color:var(--text-muted);}
 
-  /* Аудио-плеер: фиксированный размер, не сжимается */
+  /* ==== Аудио-плеер: нативная высота, не обрезается ==== */
   .msg audio.audio-preview {
     display: block;
-    width: 260px;
-    max-width: 100%;
-    height: 40px;
-    min-height: 40px;
+    width: 100%;
+    max-width: 280px;
+    min-width: 220px;
+    height: auto;
+    min-height: 54px;
     margin-top: 6px;
     background: transparent;
     flex-shrink: 0;
@@ -633,7 +639,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   }
   .msg.my audio.audio-preview { margin-left: auto; }
   @media (max-width: 400px) {
-    .msg audio.audio-preview { width: 220px; min-width: 200px; }
+    .msg audio.audio-preview { width: 100%; max-width: 100%; min-width: 200px; }
   }
 
   .media-loading{padding:8px 12px;background:var(--bg-input);border-radius:6px;margin-top:5px;font-size:12px;color:var(--text-muted);}
@@ -689,7 +695,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .modal-overlay.active{visibility:visible;opacity:1;pointer-events:auto;}
   .profile-card{background:var(--bg-sidebar);width:90%;max-width:380px;border-radius:16px;padding:25px;display:flex;flex-direction:column;align-items:center;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5);max-height:90dvh;overflow-y:auto;}
   .profile-name{font-size:20px;font-weight:bold;margin-bottom:5px;}
-  .profile-id{font-size:13px;color:var(--accent);margin-bottom:15px;text-align:center;line-height:1.4;}
+  .profile-id{font-size:13px;color:var(--text-muted);margin-bottom:15px;text-align:center;line-height:1.4;}
   .profile-actions{width:100%;display:flex;flex-direction:column;gap:10px;}
   .profile-link-btn{background:none;border:none;color:var(--accent);font-size:14px;cursor:pointer;padding:5px;text-align:center;}
   .member-row{display:flex;align-items:center;gap:10px;padding:6px 8px;cursor:pointer;border-radius:8px;position:relative;}
@@ -702,6 +708,13 @@ const CLIENT_HTML = `<!DOCTYPE html>
   #image-viewer-modal.active{visibility:visible;opacity:1;pointer-events:auto;}
   #image-viewer-modal img{max-width:95vw;max-height:95vh;border-radius:8px;}
   .viewer-close{position:absolute;top:20px;right:20px;color:#fff;font-size:30px;cursor:pointer;background:none;border:none;z-index:3100;}
+
+  /* Полноэкранный видеоплеер */
+  #video-fs-modal{display:none;position:fixed;inset:0;background:#000;z-index:4000;align-items:center;justify-content:center;}
+  #video-fs-modal.active{display:flex;}
+  #video-fs-player{width:100%;height:100%;object-fit:contain;background:#000;}
+  #video-fs-close{position:absolute;top:20px;right:20px;width:44px;height:44px;border-radius:50%;border:none;background:rgba(255,255,255,.25);color:#fff;font-size:24px;cursor:pointer;z-index:4100;display:flex;align-items:center;justify-content:center;}
+
   .msg-actions-sheet{position:fixed;bottom:0;left:0;right:0;background:var(--bg-sidebar);border-top-left-radius:16px;border-top-right-radius:16px;padding:20px;z-index:1001;display:flex;flex-direction:column;gap:10px;visibility:hidden;opacity:0;transform:translateY(20px);transition:.15s;pointer-events:none;}
   .msg-actions-sheet.active{visibility:visible;opacity:1;transform:translateY(0);pointer-events:auto;}
   .call-overlay{position:fixed;inset:0;background:rgba(0,0,0,.94);z-index:5000;display:none;flex-direction:column;align-items:center;justify-content:center;color:#fff;}
@@ -713,7 +726,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
   .call-remote-video{width:100%;height:100%;object-fit:contain;background:#000;}
   .call-local-video{position:absolute;top:70px;right:16px;width:110px;height:160px;object-fit:cover;border-radius:12px;background:#111;box-shadow:0 4px 12px rgba(0,0,0,.5);z-index:5;}
   .call-audio-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;}
-  .call-big-avatar{width:120px;height:120px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:bold;color:#fff;overflow:hidden;position:relative;}
+  .call-big-avatar{width:120px;height:120px;border-radius:50%;background:hsl(var(--avatar-hue, 210), 55%, 45%);display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:bold;color:#fff;overflow:hidden;position:relative;}
   .call-big-avatar img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;border-radius:50%;}
   .call-name{font-size:24px;font-weight:bold;}
   .call-status-text{font-size:14px;opacity:.7;}
@@ -760,7 +773,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             <div class="avatar-circle" id="my-avatar-circle" onclick="openMyProfile()"><div class="online-indicator visible"></div></div>
             <div class="user-info-brief" onclick="openMyProfile()">
               <b id="my-display-name">Имя</b>
-              <div style="font-size:11px;color:var(--accent);" id="my-display-id">Устройство</div>
+              <div style="font-size:11px;color:var(--text-muted);" id="my-display-device">Устройство</div>
             </div>
             <div class="header-actions">
               <button class="theme-toggle-btn" onclick="openCreateGroup()" title="Создать группу">👥</button>
@@ -768,7 +781,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
             </div>
           </div>
           <div class="search-box">
-            <input type="text" id="search-input" placeholder="Поиск по имени или номеру устройства..." oninput="onSearchInput()">
+            <input type="text" id="search-input" placeholder="Поиск по имени..." oninput="onSearchInput()">
             <span class="clear-search" id="clear-search-btn" onclick="clearSearch()">✕</span>
           </div>
         </div>
@@ -904,6 +917,11 @@ const CLIENT_HTML = `<!DOCTYPE html>
     <img id="full-screen-img" src="">
   </div>
 
+  <div id="video-fs-modal">
+    <video id="video-fs-player" controls playsinline></video>
+    <button id="video-fs-close">✕</button>
+  </div>
+
   <div class="msg-actions-sheet" id="msg-actions-sheet">
     <button class="btn" id="action-btn-copy" onclick="actionCopyText()" style="display:none;">Копировать</button>
     <button class="btn" id="action-btn-download" onclick="actionDownloadFile()" style="display:none;">Скачать</button>
@@ -958,7 +976,7 @@ const CLIENT_HTML = `<!DOCTYPE html>
 
 /* ==================== CLIENT JS ==================== */
 const CLIENT_JS = `
-var CLIENT_VERSION = '4.4.0';
+var CLIENT_VERSION = '4.5.0';
 var currentUser = null;
 var activePeer = null;
 var selectedFile = null;
@@ -1000,18 +1018,29 @@ var myKeyPair = null;
 var searchRequestSeq = 0;
 var unreadTitleCounter = 0;
 var originalTitle = document.title;
+var groupProfileLoading = false;
 
 /* ==================== DEVICE ==================== */
 function getOrCreateDeviceId() {
   var existing = localStorage.getItem('messenger_device_id');
   if (existing && /^\\d{6,15}$/.test(existing)) return existing;
-  var num = String(Math.floor(1000000000 + Math.random() * 9000000000));
+  var oldUser = null;
+  try { oldUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) {}
+  if (oldUser && oldUser.id) {
+    var hashed = String(Math.abs(String(oldUser.id).split('').reduce(function (a, c) { return (a * 31 + c.charCodeAt(0)) & 0xffffffff; }, 0)) || 1);
+    hashed = hashed.padStart(10, '0').substring(0, 10);
+    localStorage.setItem('messenger_device_id', hashed);
+    return hashed;
+  }
+  var fp = [navigator.userAgent || '', navigator.platform || '', screen.width + 'x' + screen.height, (navigator.language || ''), (new Date().getTimezoneOffset())].join('|');
+  var h = 0;
+  for (var i = 0; i < fp.length; i++) h = (h * 31 + fp.charCodeAt(i)) & 0xffffffff;
+  var num = String(Math.abs(h)).padStart(10, '0').substring(0, 10);
   localStorage.setItem('messenger_device_id', num);
   return num;
 }
-function getDeviceInfo() {
+function getDeviceInfoString() {
   var ua = navigator.userAgent || '';
-  var platform = navigator.platform || '';
   var browser = 'Браузер';
   if (/Edg\\//i.test(ua)) browser = 'Edge';
   else if (/OPR\\//i.test(ua) || /Opera/i.test(ua)) browser = 'Opera';
@@ -1026,14 +1055,7 @@ function getDeviceInfo() {
   else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
   else if (/Mac OS X/i.test(ua)) os = 'macOS';
   else if (/Linux/i.test(ua)) os = 'Linux';
-  var type = 'ПК';
-  if (/Android/i.test(ua) || /iPhone/i.test(ua)) type = 'Телефон';
-  else if (/iPad|Tablet/i.test(ua)) type = 'Планшет';
-  return { browser: browser, os: os, type: type, platform: platform };
-}
-function getDeviceInfoString() {
-  var d = getDeviceInfo();
-  return d.os + ' · ' + d.browser;
+  return os + ' · ' + browser;
 }
 function parseUserAgent(ua) {
   if (!ua) return '';
@@ -1053,12 +1075,11 @@ function parseUserAgent(ua) {
   else if (/Linux/i.test(ua)) os = 'Linux';
   return os + ' · ' + browser;
 }
-function displayDeviceId(id) {
-  if (!id) return '—';
-  if (!/^\\d+$/.test(String(id))) {
-    return '№' + String(id).replace(/^id_/, '').substring(0, 6);
-  }
-  return '№' + id;
+function idToHue(id) {
+  var s = String(id || 'x');
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) & 0xffff;
+  return h % 360;
 }
 
 /* ==================== ШИФРОВАНИЕ ==================== */
@@ -1103,10 +1124,7 @@ async function getDerivedSharedKey(peerPubKeyJwkStr) {
   if (derivedKeysCache[peerPubKeyJwkStr]) return derivedKeysCache[peerPubKeyJwkStr];
   try {
     var peerPub = await crypto.subtle.importKey('jwk', JSON.parse(peerPubKeyJwkStr), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
-    var sharedKey = await crypto.subtle.deriveKey(
-      { name: 'ECDH', public: peerPub }, myKeyPair.privateKey,
-      { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
-    );
+    var sharedKey = await crypto.subtle.deriveKey({ name: 'ECDH', public: peerPub }, myKeyPair.privateKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
     derivedKeysCache[peerPubKeyJwkStr] = sharedKey;
     return sharedKey;
   } catch (e) { return null; }
@@ -1467,7 +1485,6 @@ async function getFileUrl(msg) {
     if (encBlob) { try { await saveFileToIDB(msg.id, encBlob, { fileName: msg.fileName, fileType: msg.fileType, fileSize: encBlob.size }); } catch (e) {} }
   }
   if (!encBlob) return null;
-
   var mime = msg.fileType || '';
   if (!mime && msg.fileName) {
     var lower = String(msg.fileName).toLowerCase();
@@ -1482,7 +1499,6 @@ async function getFileUrl(msg) {
     else if (lower.endsWith('.mp4')) mime = 'video/mp4';
     else if (lower.endsWith('.webm')) mime = 'video/webm';
   }
-
   if (msg.fileKeyEncByUser && msg.fileIv) {
     try {
       var wrapped = msg.fileKeyEncByUser[currentUser.id];
@@ -1515,6 +1531,7 @@ document.addEventListener('click', function (e) {
 
 function renderAvatarIntoElement(el, userObj, isOnline) {
   if (!el) return;
+  el.style.setProperty('--avatar-hue', idToHue(userObj && userObj.id));
   var indicator = el.querySelector('.online-indicator');
   if (!indicator) {
     indicator = document.createElement('div');
@@ -1548,9 +1565,10 @@ function renderAvatarIntoElement(el, userObj, isOnline) {
   indicator.classList.toggle('visible', !!isOnline);
   indicator.classList.toggle('offline', !isOnline);
 }
-function fillAvatarBox(el, avatar, fallback) {
+function fillAvatarBox(el, avatar, fallback, idForHue) {
   if (!el) return;
-  var rk = 'fill|' + (avatar ? String(avatar).substring(0, 30) : '') + '|' + (fallback || '?');
+  el.style.setProperty('--avatar-hue', idToHue(idForHue || fallback || 'grp'));
+  var rk = 'fill|' + (avatar ? String(avatar).substring(0, 30) : '') + '|' + (fallback || '?') + '|' + (idForHue || '');
   if (el.dataset.renderKey === rk) return;
   el.dataset.renderKey = rk;
   Array.from(el.childNodes).forEach(function (node) {
@@ -1606,7 +1624,7 @@ function messagesHash(msgs) {
 }
 function updateMyProfileUI() {
   document.getElementById('my-display-name').innerText = currentUser.name;
-  document.getElementById('my-display-id').innerText = displayDeviceId(currentUser.id);
+  document.getElementById('my-display-device').innerText = getDeviceInfoString();
   renderAvatarIntoElement(document.getElementById('my-avatar-circle'), currentUser, true);
 }
 
@@ -1705,8 +1723,13 @@ function startApp() {
     refreshChatListStatuses();
     if (activePeer) {
       loadMessagesQuiet();
-      if (activePeer.type === 'group') refreshGroupInfo();
-      else refreshActivePeerStatus();
+      if (activePeer.type === 'group') {
+        await refreshGroupInfo();
+        if (isModalOpen('group-profile-modal') && activePeer.memberDetails && activePeer.memberDetails.length > 0) {
+          renderMembersList('group-members-list', activePeer.memberDetails, activePeer.ownerId);
+          document.getElementById('group-profile-count').innerText = (activePeer.members ? activePeer.members.length : 0) + ' участников';
+        }
+      } else refreshActivePeerStatus();
     }
   }, 2000);
 }
@@ -1728,7 +1751,12 @@ async function refreshChatListStatuses() {
       ind.classList.toggle('visible', isOn);
       ind.classList.toggle('offline', !isOn);
       var sub = itemEl.querySelector('.chat-item-subtitle');
-      if (sub) sub.innerHTML = isOn ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
+      if (sub) {
+        var devStr = '';
+        var kUser = localKnownUsers[pid];
+        if (kUser && kUser.userAgent) devStr = parseUserAgent(kUser.userAgent);
+        sub.innerHTML = (isOn ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>') + (devStr ? ' <span style="color:var(--text-muted);font-size:10px;">· ' + escapeHtml(devStr) + '</span>' : '');
+      }
     });
   } catch (e) {}
 }
@@ -1748,6 +1776,10 @@ async function sendPing() {
       currentUser.id = data.migrateTo;
       try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
       try { localStorage.setItem('messenger_device_id', data.migrateTo); } catch (e) {}
+      if (currentUser.contacts) {
+        currentUser.contacts = currentUser.contacts.map(function (c) { return c === oldId ? data.migrateTo : c; });
+        try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+      }
       if (localKnownUsers[oldId]) {
         localKnownUsers[data.migrateTo] = Object.assign({}, localKnownUsers[oldId], { id: data.migrateTo });
         delete localKnownUsers[oldId];
@@ -1791,7 +1823,7 @@ async function refreshActivePeerStatus() {
     if (res.ok) {
       var info = await res.json();
       activePeer.isOnline = info.isOnline; activePeer.name = info.name; activePeer.avatar = info.avatar;
-      if (info.pubKey) { activePeer.pubKey = info.pubKey; }
+      if (info.pubKey) activePeer.pubKey = info.pubKey;
       if (info.userAgent) activePeer.userAgent = info.userAgent;
       cacheUser(activePeer);
       var statusEl = document.getElementById('active-peer-status');
@@ -1827,7 +1859,7 @@ function loadDialogs() {
         if (m.isDeleted || m.groupId) return;
         if ((m.senderId === currentUser.id && m.receiverId === pid) || (m.senderId === pid && m.receiverId === currentUser.id)) { if ((m.ts || 0) > last) last = m.ts || 0; }
       });
-      dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!onlineMap[pid], lastTs: last });
+      dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: !!onlineMap[pid], lastTs: last });
     });
     localGroups.forEach(function (g) {
       var last = 0;
@@ -1838,7 +1870,7 @@ function loadDialogs() {
     renderChatList(dialogs);
   }).catch(function () {
     var dialogs = [];
-    peers.forEach(function (pid) { var u = localKnownUsers[pid]; if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false, lastTs: 0 }); });
+    peers.forEach(function (pid) { var u = localKnownUsers[pid]; if (u && u.name) dialogs.push({ id: pid, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: false, lastTs: 0 }); });
     localGroups.forEach(function (g) { dialogs.push({ id: g.id, type: 'group', name: g.name, avatar: g.avatar || '', ownerId: g.ownerId, members: g.members, memberCount: (g.members || []).length, lastTs: 0 }); });
     renderChatList(dialogs);
   });
@@ -1857,7 +1889,10 @@ function renderChatList(list) {
     div.className = 'chat-item ' + (isActive ? 'active' : '');
     div.onclick = function () { openChat(item); };
     var avatarId = 'chat_av_' + (isGroup ? 'grp_' : 'usr_') + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
-    var subtitle = isGroup ? '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || 0) + '</span>' : (item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>');
+    var devStr = !isGroup && item.userAgent ? parseUserAgent(item.userAgent) : '';
+    var subtitle;
+    if (isGroup) subtitle = '<span style="color:var(--text-muted);">👥 ' + (item.memberCount || 0) + '</span>';
+    else subtitle = (item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>') + (devStr ? ' <span style="color:var(--text-muted);font-size:10px;">· ' + escapeHtml(devStr) + '</span>' : '');
     div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '">' + (isGroup ? '' : '<div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div>') + '</div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div class="chat-item-subtitle" style="font-size:11px;">' + subtitle + '</div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
@@ -1875,10 +1910,14 @@ function renderSearchResults(list) {
     var div = document.createElement('div');
     var isActive = currentActiveId === item.id && currentActiveType === 'user';
     div.className = 'chat-item ' + (isActive ? 'active' : '');
-    div.onclick = function () { openChat(item); };
+    div.onclick = function () {
+      var copy = Object.assign({}, item, { _fromSearch: true });
+      openChat(copy);
+    };
     var avatarId = 'ch_av_' + item.id.replace(/[^a-zA-Z0-9_-]/g, '_') + '_' + Math.random().toString(36).substr(2, 4);
+    var devStr = item.userAgent ? parseUserAgent(item.userAgent) : '';
     var subtitle = item.isOnline ? '<span style="color:#4cd964;">в сети</span>' : '<span style="color:var(--text-muted);">не в сети</span>';
-    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + '<span style="color:var(--text-muted);margin-left:6px;font-family:monospace;font-size:10px;">' + escapeHtml(displayDeviceId(item.id)) + '</span></div></div>';
+    div.innerHTML = '<div class="avatar-circle" id="' + avatarId + '"><div class="online-indicator ' + (item.isOnline ? 'visible' : 'offline') + '"></div></div><div style="overflow:hidden;flex:1;"><div style="font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(item.name) + '</div><div style="font-size:11px;">' + subtitle + (devStr ? ' <span style="color:var(--text-muted);font-size:10px;">· ' + escapeHtml(devStr) + '</span>' : '') + '</div></div>';
     container.appendChild(div);
     renderAvatarIntoElement(document.getElementById(avatarId), { id: item.id, avatar: item.avatar, name: item.name }, item.isOnline || false);
   }
@@ -1899,7 +1938,7 @@ async function doSearch() {
     var u = localKnownUsers[k];
     if (u.id === currentUser.id) continue;
     if (!q || (u.id && u.id.toLowerCase().indexOf(ql) !== -1) || (u.name && u.name.toLowerCase().indexOf(ql) !== -1)) {
-      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: false };
+      map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: false };
     }
   }
   if (q) clearBtn.style.display = 'block'; else clearBtn.style.display = 'none';
@@ -1910,8 +1949,8 @@ async function doSearch() {
     var users = await r.json();
     if (Array.isArray(users)) {
       users.forEach(function (u) {
-        if (map[u.id]) { map[u.id].isOnline = !!u.isOnline; map[u.id].name = u.name || map[u.id].name; map[u.id].avatar = u.avatar !== undefined ? u.avatar : map[u.id].avatar; }
-        else map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', isOnline: !!u.isOnline };
+        if (map[u.id]) { map[u.id].isOnline = !!u.isOnline; map[u.id].name = u.name || map[u.id].name; map[u.id].avatar = u.avatar !== undefined ? u.avatar : map[u.id].avatar; map[u.id].userAgent = u.userAgent || map[u.id].userAgent; }
+        else map[u.id] = { id: u.id, type: 'user', name: u.name, avatar: u.avatar || '', pubKey: u.pubKey || '', userAgent: u.userAgent || '', isOnline: !!u.isOnline };
         cacheUser(u);
       });
     }
@@ -1927,18 +1966,27 @@ function clearSearch() { document.getElementById('search-input').value = ''; doc
 function openChat(peer) {
   cancelVoiceAttachment();
   if (!peer.type) peer.type = 'user';
+  var cameFromSearch = !!peer._fromSearch;
   activePeer = peer;
   cacheUser(peer);
   lastMessagesHash = '';
   document.getElementById('active-peer-name').innerText = peer.name;
   var statusEl = document.getElementById('active-peer-status');
-  if (peer.type === 'group') { statusEl.innerText = (peer.memberCount || 0) + ' участников'; statusEl.style.color = 'var(--text-muted)'; document.getElementById('call-btn').style.display = 'none'; }
-  else {
+  if (peer.type === 'group') {
+    statusEl.innerText = (peer.memberCount || 0) + ' участников';
+    statusEl.style.color = 'var(--text-muted)';
+    document.getElementById('call-btn').style.display = 'none';
+  } else {
     if (peer.isOnline) { statusEl.innerText = 'в сети'; statusEl.style.color = '#4cd964'; }
     else { statusEl.innerText = 'не в сети'; statusEl.style.color = 'var(--text-muted)'; }
     document.getElementById('call-btn').style.display = 'flex';
-    if (!currentUser.contacts) currentUser.contacts = [];
-    if (currentUser.contacts.indexOf(peer.id) === -1) { currentUser.contacts.push(peer.id); try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {} }
+    if (!cameFromSearch) {
+      if (!currentUser.contacts) currentUser.contacts = [];
+      if (currentUser.contacts.indexOf(peer.id) === -1) {
+        currentUser.contacts.push(peer.id);
+        try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
+      }
+    }
   }
   renderAvatarIntoElement(document.getElementById('peer-avatar-circle'), { id: peer.id, avatar: peer.avatar, name: peer.name }, peer.isOnline || false);
   document.getElementById('input-bar').style.display = 'flex';
@@ -1989,6 +2037,23 @@ async function loadMessagesQuiet() {
 }
 function openImageViewer(src) { if (document.getElementById('image-viewer-modal').classList.contains('active')) return; document.getElementById('full-screen-img').src = src; document.getElementById('image-viewer-modal').classList.add('active'); }
 function closeImageViewer() { document.getElementById('image-viewer-modal').classList.remove('active'); }
+
+/* ==== Полноэкранный видеоплеер ==== */
+function openVideoFS(url) {
+  var m = document.getElementById('video-fs-modal');
+  var v = document.getElementById('video-fs-player');
+  v.src = url;
+  m.classList.add('active');
+  v.play().catch(function () {});
+}
+function closeVideoFS() {
+  var m = document.getElementById('video-fs-modal');
+  var v = document.getElementById('video-fs-player');
+  if (!m || !m.classList.contains('active')) return;
+  v.pause(); v.removeAttribute('src'); try { v.load(); } catch (e) {}
+  m.classList.remove('active');
+}
+
 function isGroupMsgRead(m) {
   if (!activePeer || activePeer.type !== 'group') return m.isRead;
   var others = (activePeer.members || []).filter(function (x) { return x !== currentUser.id; });
@@ -2000,7 +2065,6 @@ function isGroupMsgRead(m) {
 async function renderMessagesContainer(messages) {
   var container = document.getElementById('messages-container');
   if (!container) return;
-
   if (!messages || messages.length === 0) {
     if (container.innerHTML !== '<div class="empty-state">Нет сообщений</div>') {
       container.innerHTML = '<div class="empty-state">Нет сообщений</div>';
@@ -2008,25 +2072,19 @@ async function renderMessagesContainer(messages) {
     }
     return;
   }
-
   var newHash = messagesHash(messages) + '|' + (activePeer ? activePeer.id : '');
-  if (newHash === lastMessagesHash && container.children.length > 0 && !container.querySelector('.empty-state')) {
-    return;
-  }
+  if (newHash === lastMessagesHash && container.children.length > 0 && !container.querySelector('.empty-state')) return;
   lastMessagesHash = newHash;
-
   var isGroup = activePeer && activePeer.type === 'group';
   var existingMap = {};
   Array.from(container.children).forEach(function (el) {
     var id = el.getAttribute && el.getAttribute('data-msg-id');
     if (id) existingMap[id] = el;
   });
-
   var seen = {};
   var prevScrollTop = container.scrollTop;
   var prevScrollHeight = container.scrollHeight;
   var wasAtBottom = (container.scrollHeight - container.scrollTop - container.clientHeight) <= 80;
-
   for (var idx = 0; idx < messages.length; idx++) {
     var m = messages[idx];
     if (deletedIds[m.id] || m.isDeleted) continue;
@@ -2040,20 +2098,17 @@ async function renderMessagesContainer(messages) {
       container.appendChild(div);
     }
   }
-
   Array.from(container.children).forEach(function (el) {
     var id = el.getAttribute && el.getAttribute('data-msg-id');
     if (id && !seen[id]) el.remove();
     else if (!id && !el.classList.contains('empty-state')) el.remove();
   });
-
   if (wasAtBottom) container.scrollTop = container.scrollHeight;
   else {
     var newScrollHeight = container.scrollHeight;
     container.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
   }
 }
-
 function createMessageElement(m, isGroup) {
   var div = document.createElement('div');
   div.setAttribute('data-msg-id', m.id);
@@ -2075,7 +2130,6 @@ function createMessageElement(m, isGroup) {
   updateMessageElement(div, m, isGroup);
   return div;
 }
-
 function buildMessageInnerHTML(m, isGroup) {
   var html = '';
   if (isGroup && m.senderId !== currentUser.id) html += '<div class="msg-sender">' + escapeHtml(getUserName(m.senderId)) + '</div>';
@@ -2091,11 +2145,9 @@ function buildMessageInnerHTML(m, isGroup) {
   html += '<div class="msg-footer"><span class="msg-time">' + escapeHtml(m.timestamp || '') + '</span><span class="msg-ticks"></span></div>';
   return html;
 }
-
 function updateMessageElement(el, m, isGroup) {
   var wantClass = 'msg ' + (m.senderId === currentUser.id ? 'my' : '') + (m.isPending ? ' pending' : (m.isWaiting ? ' waiting' : ''));
   if (el.className !== wantClass) el.className = wantClass;
-
   var textEl = el.querySelector('.msg-text');
   if (m.text) {
     if (!textEl) {
@@ -2105,12 +2157,10 @@ function updateMessageElement(el, m, isGroup) {
     }
     if (textEl.textContent !== m.text) textEl.textContent = m.text;
   }
-
   var placeholder = el.querySelector('[data-media-msg-id]');
   if (placeholder && (m.encFileData || m.fileData || m.fileUrl || (m.fileType && m.fileSize))) {
     loadMediaIntoPlaceholder(m, placeholder).catch(function () {});
   }
-
   var waitLabel = el.querySelector('.msg-wait-label');
   if (waitLabel) {
     if (m.isWaiting && m.senderId === currentUser.id) {
@@ -2122,10 +2172,8 @@ function updateMessageElement(el, m, isGroup) {
       waitLabel.style.cssText = '';
     }
   }
-
   var timeEl = el.querySelector('.msg-time');
   if (timeEl && timeEl.textContent !== (m.timestamp || '')) timeEl.textContent = m.timestamp || '';
-
   var ticksEl = el.querySelector('.msg-ticks');
   if (ticksEl && m.senderId === currentUser.id) {
     var read = isGroupMsgRead(m);
@@ -2135,7 +2183,6 @@ function updateMessageElement(el, m, isGroup) {
     if (ticksEl.className !== wantTickClass) ticksEl.className = wantTickClass;
   }
 }
-
 async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!placeholder || !placeholder.parentNode) return;
   if (deletedIds[msg.id] || msg.isDeleted) { if (placeholder.parentNode) placeholder.remove(); return; }
@@ -2151,11 +2198,18 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
   } else if (ft.indexOf('video/') === 0) {
     var wrapper = document.createElement('div');
     wrapper.className = 'vid-wrapper';
+    wrapper.style.position = 'relative';
     var video = document.createElement('video');
     video.src = url; video.controls = true; video.playsInline = true; video.preload = 'metadata';
     video.setAttribute('data-msg-video-id', msg.id);
     if (msg.thumbUrl) video.poster = msg.thumbUrl;
-    wrapper.appendChild(video); newEl = wrapper;
+    wrapper.appendChild(video);
+    var fsBtn = document.createElement('button');
+    fsBtn.textContent = '⛶';
+    fsBtn.style.cssText = 'position:absolute;top:6px;right:6px;width:32px;height:32px;border-radius:6px;background:rgba(0,0,0,.6);color:#fff;border:none;cursor:pointer;font-size:16px;z-index:2;';
+    fsBtn.onclick = function (e) { e.stopPropagation(); openVideoFS(url); };
+    wrapper.appendChild(fsBtn);
+    newEl = wrapper;
   } else if (ft.indexOf('audio/') === 0) {
     newEl = document.createElement('audio');
     newEl.className = 'audio-preview';
@@ -2163,10 +2217,6 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
     newEl.preload = 'metadata';
     newEl.src = url;
     newEl.setAttribute('data-msg-audio-id', msg.id);
-    newEl.style.width = '260px';
-    newEl.style.maxWidth = '100%';
-    newEl.style.height = '40px';
-    newEl.style.display = 'block';
   } else {
     newEl = document.createElement('a');
     newEl.className = 'file-link'; newEl.href = url; newEl.download = msg.fileName || 'file'; newEl.target = '_blank';
@@ -2175,7 +2225,6 @@ async function loadMediaIntoPlaceholder(msg, placeholder) {
   if (!newEl) { placeholder.outerHTML = '<div class="file-placeholder">⚠️ Файл недоступен</div>'; return; }
   placeholder.parentNode.replaceChild(newEl, placeholder);
 }
-
 function checkVisibleMessages() {
   setTimeout(function () {
     if (!activePeer) return;
@@ -2196,7 +2245,6 @@ function checkVisibleMessages() {
     if (unread.length > 0) { saveCache(); fetch('/api/messages/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msgIds: unread, userId: currentUser.id }) }).catch(function () {}); }
   }, 300);
 }
-
 function openMsgActions(msg, el) {
   if (document.getElementById('msg-actions-sheet').classList.contains('active')) return;
   selectedMsgId = msg.id; selectedMsgObj = msg;
@@ -2519,10 +2567,7 @@ function openMyProfile() {
   document.getElementById('edit-my-name-input').value = currentUser.name;
   renderAvatarIntoElement(document.getElementById('my-profile-avatar-view'), currentUser, true);
   document.getElementById('my-profile-name-view').innerText = currentUser.name;
-  var devStr = getDeviceInfoString();
-  document.getElementById('my-profile-id-view').innerHTML =
-    '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(devStr) + '</span>' +
-    '<br><span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(currentUser.id)) + '</span>';
+  document.getElementById('my-profile-id-view').innerHTML = escapeHtml(getDeviceInfoString());
   document.getElementById('remove-avatar-link-btn').style.display = currentUser.avatar ? 'block' : 'none';
   safeOpenModal('my-profile-modal');
 }
@@ -2559,20 +2604,14 @@ function openPeerProfile() {
   if (isModalOpen('peer-profile-modal')) return;
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), activePeer, !!activePeer.isOnline);
   document.getElementById('peer-profile-name-view').innerText = activePeer.name;
-  var devStr = activePeer.userAgent ? parseUserAgent(activePeer.userAgent) : '';
-  document.getElementById('peer-profile-id-view').innerHTML =
-    (devStr ? '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(devStr) + '</span><br>' : '') +
-    '<span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(activePeer.id)) + '</span>';
+  document.getElementById('peer-profile-id-view').innerHTML = escapeHtml(activePeer.userAgent ? parseUserAgent(activePeer.userAgent) : '');
   updatePeerProfileButtons(activePeer);
   safeOpenModal('peer-profile-modal');
   fetch('/api/users/' + activePeer.id).then(function (r) { return r.json(); }).then(function (info) {
     if (info && info.userAgent) {
       activePeer.userAgent = info.userAgent;
-      var s = parseUserAgent(info.userAgent);
       var el = document.getElementById('peer-profile-id-view');
-      if (el) el.innerHTML =
-        '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(s) + '</span><br>' +
-        '<span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(activePeer.id)) + '</span>';
+      if (el) el.innerHTML = escapeHtml(parseUserAgent(info.userAgent));
     }
   }).catch(function () {});
 }
@@ -2591,10 +2630,7 @@ function openMemberProfile(member) {
   if (isModalOpen('peer-profile-modal')) return;
   renderAvatarIntoElement(document.getElementById('peer-profile-avatar-view'), member, !!member.isOnline);
   document.getElementById('peer-profile-name-view').innerText = member.name;
-  var devStr = member.userAgent ? parseUserAgent(member.userAgent) : '';
-  document.getElementById('peer-profile-id-view').innerHTML =
-    (devStr ? '<span style="color:var(--text-main);font-size:14px;">' + escapeHtml(devStr) + '</span><br>' : '') +
-    '<span style="font-size:11px;color:var(--text-muted);">' + escapeHtml(displayDeviceId(member.id)) + '</span>';
+  document.getElementById('peer-profile-id-view').innerHTML = escapeHtml(member.userAgent ? parseUserAgent(member.userAgent) : '');
   updatePeerProfileButtons(member);
   safeOpenModal('peer-profile-modal');
 }
@@ -2670,7 +2706,7 @@ async function openCreateGroup() {
   if (isModalOpen('create-group-modal')) return;
   groupDraftAvatar = '';
   document.getElementById('create-group-name').value = '';
-  fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥');
+  fillAvatarBox(document.getElementById('create-group-avatar'), '', '👥', 'grp_new');
   var cached = [];
   for (var k in localKnownUsers) if (localKnownUsers.hasOwnProperty(k)) {
     var u = localKnownUsers[k];
@@ -2686,7 +2722,7 @@ function closeCreateGroup() { safeCloseModal('create-group-modal'); }
 function triggerGroupAvatarInput() { var i = document.getElementById('group-avatar-input'); i.value = ''; i.click(); }
 function handleGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
-  compressImage(file, 200, 0.85, function (c) { if (!c) return; groupDraftAvatar = c; fillAvatarBox(document.getElementById('create-group-avatar'), groupDraftAvatar, '👥'); });
+  compressImage(file, 200, 0.85, function (c) { if (!c) return; groupDraftAvatar = c; fillAvatarBox(document.getElementById('create-group-avatar'), groupDraftAvatar, '👥', 'grp_new'); });
 }
 async function submitCreateGroup() {
   var name = document.getElementById('create-group-name').value.trim();
@@ -2721,10 +2757,12 @@ async function refreshGroupInfo() {
 async function openGroupProfile() {
   closeChatDropdown();
   if (!activePeer || activePeer.type !== 'group') return;
+  if (groupProfileLoading) return;
   if (isModalOpen('group-profile-modal')) return;
+  groupProfileLoading = true;
 
   editGroupDraftAvatar = '';
-  fillAvatarBox(document.getElementById('group-profile-avatar'), activePeer.avatar, '👥');
+  fillAvatarBox(document.getElementById('group-profile-avatar'), activePeer.avatar, '👥', activePeer.id);
   document.getElementById('group-profile-name').innerText = activePeer.name || 'Группа';
   document.getElementById('group-profile-count').innerText = ((activePeer.members || []).length) + ' участников';
   var isOwner = activePeer.ownerId === currentUser.id;
@@ -2734,10 +2772,10 @@ async function openGroupProfile() {
   document.getElementById('group-members-list').innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:8px;">Загрузка участников…</div>';
   safeOpenModal('group-profile-modal');
 
-  await refreshGroupInfo();
+  try { await refreshGroupInfo(); } catch (e) {}
 
   var g = activePeer;
-  fillAvatarBox(document.getElementById('group-profile-avatar'), g.avatar, '👥');
+  fillAvatarBox(document.getElementById('group-profile-avatar'), g.avatar, '👥', g.id);
   document.getElementById('group-profile-name').innerText = g.name;
   document.getElementById('group-profile-count').innerText = (g.members ? g.members.length : 0) + ' участников';
   isOwner = g.ownerId === currentUser.id;
@@ -2749,6 +2787,7 @@ async function openGroupProfile() {
   } else {
     renderMembersList('group-members-list', g.memberDetails, g.ownerId);
   }
+  groupProfileLoading = false;
 }
 function closeGroupProfile() { editGroupDraftAvatar = ''; safeCloseModal('group-profile-modal'); closeMemberDropdown(); }
 function renderMembersList(containerId, memberDetails, ownerId) {
@@ -2816,7 +2855,7 @@ async function deleteGroup() {
 function triggerEditGroupAvatarInput() { var i = document.getElementById('edit-group-avatar-input'); i.value = ''; i.click(); }
 function handleEditGroupAvatarSelect(e) {
   var file = e.target.files[0]; if (!file) return;
-  compressImage(file, 200, 0.85, function (c) { if (!c) return; editGroupDraftAvatar = c; fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥'); });
+  compressImage(file, 200, 0.85, function (c) { if (!c) return; editGroupDraftAvatar = c; fillAvatarBox(document.getElementById('group-profile-avatar'), editGroupDraftAvatar, '👥', activePeer.id); });
 }
 async function saveGroupChanges() {
   if (!activePeer || activePeer.type !== 'group') return;
@@ -2922,7 +2961,7 @@ function updateCallUI() {
   if (!currentCall) return;
   var a = document.getElementById('call-peer-avatar');
   if (currentCall.peerAvatar) a.innerHTML = '<img src="' + currentCall.peerAvatar + '">';
-  else a.innerText = (currentCall.peerName || '?').charAt(0).toUpperCase();
+  else { a.innerText = (currentCall.peerName || '?').charAt(0).toUpperCase(); a.style.setProperty('--avatar-hue', idToHue(currentCall.peerId)); }
   document.getElementById('call-peer-name').innerText = currentCall.peerName || 'Собеседник';
   var s = document.getElementById('call-status-text');
   if (currentCall.status === 'ringing') s.innerText = 'Вызов...';
@@ -3042,6 +3081,7 @@ async function handleSig(sig) {
     }
     incomingCall = { callId: sig.callId, fromId: sig.from, fromName: sig.payload.fromName || 'Пользователь', fromAvatar: sig.payload.fromAvatar || '', video: !!sig.payload.video };
     document.getElementById('incoming-avatar').innerHTML = incomingCall.fromAvatar ? '<img src="' + incomingCall.fromAvatar + '">' : (incomingCall.fromName.charAt(0).toUpperCase());
+    document.getElementById('incoming-avatar').style.setProperty('--avatar-hue', idToHue(sig.from));
     document.getElementById('incoming-name').innerText = incomingCall.fromName;
     document.getElementById('incoming-status-text').innerText = incomingCall.video ? 'Входящий видеозвонок...' : 'Входящий звонок...';
     document.getElementById('incoming-call-overlay').classList.add('active');
@@ -3173,6 +3213,8 @@ async function endCurrentCall(silent) {
 window.addEventListener('DOMContentLoaded', async function () {
   updateThemeIcon(savedTheme);
   document.querySelectorAll('.modal-overlay').forEach(function (ov) { ov.addEventListener('click', function (e) { if (e.target === ov) ov.classList.remove('active'); }); });
+  document.getElementById('video-fs-close').addEventListener('click', closeVideoFS);
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeVideoFS(); });
   loadDeletedIds();
   await initMyKeyPair();
   try { currentUser = JSON.parse(localStorage.getItem('messenger_user') || 'null'); } catch (e) { currentUser = null; }
@@ -3182,20 +3224,20 @@ window.addEventListener('DOMContentLoaded', async function () {
   try { localGroups = JSON.parse(localStorage.getItem('messenger_groups') || '[]'); } catch (e) { localGroups = []; }
   localMessagesCache = localMessagesCache.filter(function (m) { return !deletedIds[m.id] && !m.isDeleted; });
   saveCache();
-  // Миграция локального кеша: старые id_xxx → числовые
-  var migrated = false;
-  for (var uid in localKnownUsers) if (localKnownUsers.hasOwnProperty(uid)) {
-    if (!/^\\d+$/.test(uid)) {
-      var newId = String(Math.abs(uid.split('').reduce(function(a,c){return a + c.charCodeAt(0);},0)) || 1).padStart(10, '0');
-      if (!localKnownUsers[newId]) {
-        localKnownUsers[newId] = Object.assign({}, localKnownUsers[uid], { id: newId });
-        migrated = true;
-      }
-      delete localKnownUsers[uid];
-    }
-  }
-  if (migrated) {
-    try { localStorage.setItem('messenger_known_users', JSON.stringify(localKnownUsers)); } catch (e) {}
+  // Восстановление чатов: если contacts потерялись, берём всех, с кем есть переписка
+  if (currentUser) {
+    var pairs = {};
+    localMessagesCache.forEach(function (m) {
+      if (m.isDeleted || deletedIds[m.id]) return;
+      if (m.groupId) return;
+      if (m.senderId === currentUser.id && m.receiverId) pairs[m.receiverId] = true;
+      if (m.receiverId === currentUser.id && m.senderId) pairs[m.senderId] = true;
+    });
+    if (!currentUser.contacts) currentUser.contacts = [];
+    Object.keys(pairs).forEach(function (pid) {
+      if (currentUser.contacts.indexOf(pid) === -1) currentUser.contacts.push(pid);
+    });
+    try { localStorage.setItem('messenger_user', JSON.stringify(currentUser)); } catch (e) {}
   }
   updateVersionInfo();
   await checkServerHealth();
